@@ -1,0 +1,9 @@
+// @mode: run
+// @expect: error
+// @contains: Rust provider support does not export a binding for extern function `missing_export`
+
+import pkg:host.host { missing_export };
+
+fn main() {
+    missing_export();
+}

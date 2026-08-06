@@ -6,12 +6,12 @@ use std::{
 };
 
 use anvyx_backend::rust::{
+    RustSource,
     cargo_job::{
         self, RustCargoCrateIdentity, RustCargoCrateIdentityInput, RustCargoDependency,
         RustCargoDependencySource, RustCargoError, RustCargoJob, RustCargoMode, RustCargoName,
         RustCargoOutput, RustCargoPackageMetadata, RustCargoPackageName, RustCargoProfile,
     },
-    emit::RustSource,
 };
 use anvyx_lang::LintConfig;
 use anvyx_runtime::{

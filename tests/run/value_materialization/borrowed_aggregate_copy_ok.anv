@@ -1,0 +1,25 @@
+// @mode: run
+// @expect: success
+// @match: ok
+
+struct LargeCopy {
+    a: int,
+    b: int,
+    c: int,
+    d: int,
+    e: int,
+}
+
+fn duplicate(value: LargeCopy) -> (LargeCopy, LargeCopy) {
+    (value, value)
+}
+
+fn main() {
+    var source = LargeCopy { a: 1, b: 2, c: 3, d: 4, e: 5 };
+    let copies = duplicate(source);
+    source.a = 9;
+    assert(copies.0.a == 1);
+    assert(copies.1.e == 5);
+    assert(source.a == 9);
+    println("ok");
+}

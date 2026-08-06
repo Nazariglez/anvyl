@@ -1,51 +1,8 @@
-use anvyx_frontend::air::{CallArg, ParamEscape, Program, TypeData};
-use anvyx_runtime::{RustExternAbi, RustParamAbi, RustWrapperCtx};
+use anvyx_runtime::{RustParamAbi, RustReturnAbi};
 
-use super::rir::{RirCallArg, RirExternParam, RirParamAbi, RirParamEscape, RirParamSemantic};
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum ProviderEntryPlan {
-    None,
-    SuspendRuntimeEntry(ProviderEntryReason),
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum ProviderEntryReason {
-    RetainedCallbacks,
-}
-
-impl ProviderEntryPlan {
-    pub(super) fn for_retained_callbacks(retained_callbacks: bool) -> Self {
-        if retained_callbacks {
-            Self::SuspendRuntimeEntry(ProviderEntryReason::RetainedCallbacks)
-        } else {
-            Self::None
-        }
-    }
-
-    pub(super) fn suspends_runtime_entry(self) -> bool {
-        matches!(self, Self::SuspendRuntimeEntry(_))
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum NativeHiddenCtxPlan {
-    None,
-    Runtime,
-}
-
-impl NativeHiddenCtxPlan {
-    pub(super) fn from_abi(ctx: RustWrapperCtx) -> Self {
-        match ctx {
-            RustWrapperCtx::None => Self::None,
-            RustWrapperCtx::HiddenRuntime => Self::Runtime,
-        }
-    }
-
-    pub(super) fn borrows_runtime(self) -> bool {
-        matches!(self, Self::Runtime)
-    }
-}
+use super::rir::{
+    RirCoreEnumKind, RirNativeReturn, RirParamEscape, RirPassMode, RirProgram, RirType, RirTypeId,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum NativeArgAction {
@@ -65,232 +22,100 @@ impl NativeArgAction {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum NativeArgMode {
-    Direct,
-    SharedBorrow,
-    MutBorrow,
-    Omitted,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct NativeArgFacts {
-    mode: NativeArgMode,
-    string: bool,
-    native_ref: bool,
-}
-
-impl NativeArgFacts {
-    pub(super) fn air(arg: &CallArg, string: bool, native_ref: bool) -> Self {
-        let mode = match arg {
-            CallArg::SharedBorrow(_) => NativeArgMode::SharedBorrow,
-            CallArg::MutBorrow(_) => NativeArgMode::MutBorrow,
-            CallArg::InitFieldOmitted => NativeArgMode::Omitted,
-            _ => NativeArgMode::Direct,
-        };
-        Self {
-            mode,
-            string,
-            native_ref,
-        }
-    }
-
-    pub(super) fn dynamic(semantic: RirParamSemantic, string: bool, native_ref: bool) -> Self {
-        let mode = match semantic {
-            RirParamSemantic::SharedBorrow => NativeArgMode::SharedBorrow,
-            RirParamSemantic::MutBorrow => NativeArgMode::MutBorrow,
-            _ => NativeArgMode::Direct,
-        };
-        Self {
-            mode,
-            string,
-            native_ref,
-        }
-    }
-
-    pub(super) fn rir(arg: &RirCallArg, string: bool, native_ref: bool) -> Self {
-        let mode = match arg {
-            RirCallArg::SharedBorrow(_) => NativeArgMode::SharedBorrow,
-            RirCallArg::MutBorrow(_) => NativeArgMode::MutBorrow,
-            RirCallArg::InitFieldOmitted => NativeArgMode::Omitted,
-            _ => NativeArgMode::Direct,
-        };
-        Self {
-            mode,
-            string,
-            native_ref,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum NativeReentryPolicy {
     Safe,
     SnapshotStringBorrow,
     UnsupportedLiveBoundary,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct NativeCallPlan {
-    params: Vec<NativeParamAbi>,
-    provider_entry: ProviderEntryPlan,
-}
-
-impl NativeCallPlan {
-    pub(super) fn for_abi(abi: &RustExternAbi, retained_callbacks: bool) -> Self {
-        Self {
-            params: abi.params.iter().map(classify_param).collect(),
-            provider_entry: ProviderEntryPlan::for_retained_callbacks(retained_callbacks),
-        }
-    }
-
-    pub(super) fn param_semantics(&self) -> Vec<RirParamSemantic> {
-        self.params.iter().map(|param| param.semantic).collect()
-    }
-
-    pub(super) fn arg_action(&self, index: usize, facts: NativeArgFacts) -> NativeArgAction {
-        self.params
-            .get(index)
-            .map_or(NativeArgAction::Direct, |param| {
-                param.arg_action(self.provider_entry.suspends_runtime_entry(), facts)
-            })
-    }
-
-    pub(super) fn rejects_reentry_arg(&self, index: usize, facts: NativeArgFacts) -> bool {
-        self.arg_action(index, facts) == NativeArgAction::RejectLiveBoundary
-    }
-
-    pub(super) fn provider_entry(&self) -> ProviderEntryPlan {
-        self.provider_entry
-    }
-
-    pub(super) fn matches_signature(&self, params: &[RirExternParam]) -> bool {
-        self.params.len() == params.len()
-            && params
-                .iter()
-                .zip(&self.params)
-                .all(|(param, planned)| planned.matches_rir_param(*param))
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct NativeParamAbi {
-    pub semantic: RirParamSemantic,
-    pub abi: RirParamAbi,
-    pub escape: RirParamEscape,
-    reentry: NativeReentryPolicy,
-}
-
-impl NativeParamAbi {
-    fn new(
-        semantic: RirParamSemantic,
-        abi: RirParamAbi,
-        escape: RirParamEscape,
-        reentry: NativeReentryPolicy,
-    ) -> Self {
-        Self {
-            semantic,
-            abi,
-            escape,
-            reentry,
-        }
-    }
-
-    pub(super) fn matches_rir_param(self, param: RirExternParam) -> bool {
-        param.semantic == self.semantic && param.abi == self.abi && param.escape == self.escape
-    }
-
-    fn arg_action(self, suspends_runtime_entry: bool, facts: NativeArgFacts) -> NativeArgAction {
-        if suspends_runtime_entry
-            && self.reentry == NativeReentryPolicy::SnapshotStringBorrow
-            && facts.string
-            && facts.mode == NativeArgMode::SharedBorrow
-        {
-            return NativeArgAction::SnapshotString;
-        }
-        match (self.abi, facts.native_ref) {
-            (RirParamAbi::SharedBorrow, true) if facts.mode == NativeArgMode::SharedBorrow => {
-                NativeArgAction::NativeRefBorrow { mutable: false }
-            }
-            (RirParamAbi::MutBorrow, true) if facts.mode == NativeArgMode::MutBorrow => {
-                NativeArgAction::NativeRefBorrow { mutable: true }
-            }
-            _ if suspends_runtime_entry && self.rejects_live_boundary(facts) => {
-                NativeArgAction::RejectLiveBoundary
-            }
-            _ => NativeArgAction::Direct,
-        }
-    }
-
-    fn rejects_live_boundary(self, facts: NativeArgFacts) -> bool {
-        match self.reentry {
-            NativeReentryPolicy::Safe => false,
-            NativeReentryPolicy::SnapshotStringBorrow => {
-                facts.mode == NativeArgMode::SharedBorrow && !facts.string
-            }
-            NativeReentryPolicy::UnsupportedLiveBoundary => facts.mode != NativeArgMode::Omitted,
-        }
-    }
-}
-
-pub(super) fn air_has_retained_callbacks(program: &Program) -> bool {
-    program.externs.iter().any(|ext| {
-        ext.params.iter().any(|param| {
-            param.escape == ParamEscape::Escaping
-                && matches!(program.type_arena.data(param.ty), TypeData::Function(_))
-        })
-    })
-}
-
-pub(super) fn classify_param(abi: &RustParamAbi) -> NativeParamAbi {
-    let reentry = reentry_policy(abi);
+pub(super) fn classify_param(abi: &RustParamAbi) -> (RirPassMode, RirParamEscape) {
     match abi {
         RustParamAbi::Value(_)
         | RustParamAbi::OwnedNamed(_)
         | RustParamAbi::InitField(_)
         | RustParamAbi::Option(_)
         | RustParamAbi::Result(_, _)
-        | RustParamAbi::Slice(_) => NativeParamAbi::new(
-            RirParamSemantic::Value,
-            RirParamAbi::Value,
-            RirParamEscape::NonEscaping,
-            reentry,
-        ),
-        RustParamAbi::Borrow(_) => NativeParamAbi::new(
-            RirParamSemantic::SharedBorrow,
-            RirParamAbi::SharedBorrow,
-            RirParamEscape::NonEscaping,
-            reentry,
-        ),
-        RustParamAbi::MutBorrow(_) => NativeParamAbi::new(
-            RirParamSemantic::MutBorrow,
-            RirParamAbi::MutBorrow,
-            RirParamEscape::NonEscaping,
-            reentry,
-        ),
-        RustParamAbi::MutPlace(_) => NativeParamAbi::new(
-            RirParamSemantic::MutPlace,
-            RirParamAbi::MutPlace,
-            RirParamEscape::NonEscaping,
-            reentry,
-        ),
-        RustParamAbi::ScopedLambda(_) => NativeParamAbi::new(
-            RirParamSemantic::ScopedLambda,
-            RirParamAbi::ScopedLambda,
-            RirParamEscape::NonEscaping,
-            reentry,
-        ),
-        RustParamAbi::EscapingLambda(_) => NativeParamAbi::new(
-            RirParamSemantic::EscapingLambda,
-            RirParamAbi::EscapingLambda,
-            RirParamEscape::Escaping,
-            reentry,
-        ),
-        RustParamAbi::AnvCallback(_) => NativeParamAbi::new(
-            RirParamSemantic::AnvCallback,
-            RirParamAbi::AnvCallback,
-            RirParamEscape::Escaping,
-            reentry,
-        ),
+        | RustParamAbi::Slice(_) => (RirPassMode::Value, RirParamEscape::NonEscaping),
+        RustParamAbi::Borrow(_) => (RirPassMode::SharedBorrow, RirParamEscape::NonEscaping),
+        RustParamAbi::MutBorrow(_) => (RirPassMode::MutBorrow, RirParamEscape::NonEscaping),
+        RustParamAbi::MutPlace(_) => (RirPassMode::MutPlace, RirParamEscape::NonEscaping),
+        RustParamAbi::ScopedLambda(_) => (RirPassMode::ScopedLambda, RirParamEscape::NonEscaping),
+        RustParamAbi::EscapingLambda(_) => (RirPassMode::EscapingLambda, RirParamEscape::Escaping),
+        RustParamAbi::AnvCallback(_) => (RirPassMode::AnvCallback, RirParamEscape::Escaping),
+    }
+}
+
+pub(super) fn classify_arg_action(
+    abi: &RustParamAbi,
+    mode: RirPassMode,
+    native_ref: bool,
+    suspends_runtime_entry: bool,
+) -> NativeArgAction {
+    match mode {
+        RirPassMode::SharedBorrow if native_ref => {
+            return NativeArgAction::NativeRefBorrow { mutable: false };
+        }
+        RirPassMode::MutBorrow if native_ref => {
+            return NativeArgAction::NativeRefBorrow { mutable: true };
+        }
+        _ => {}
+    }
+    if !suspends_runtime_entry {
+        return NativeArgAction::Direct;
+    }
+    match reentry_policy(abi) {
+        NativeReentryPolicy::Safe => NativeArgAction::Direct,
+        NativeReentryPolicy::SnapshotStringBorrow => NativeArgAction::SnapshotString,
+        NativeReentryPolicy::UnsupportedLiveBoundary => NativeArgAction::RejectLiveBoundary,
+    }
+}
+
+pub(super) fn classify_return(
+    program: &RirProgram,
+    ty: RirTypeId,
+    abi: &RustReturnAbi,
+) -> Option<RirNativeReturn> {
+    match abi {
+        RustReturnAbi::Void => matches!(program.types.get(ty.index()), Some(RirType::Void))
+            .then_some(RirNativeReturn::Void),
+        RustReturnAbi::Value(value) => Some(RirNativeReturn::Value(value.clone())),
+        RustReturnAbi::OwnedNamed(value) => Some(RirNativeReturn::OwnedNamed {
+            ty: value.clone(),
+            adopt: matches!(program.types.get(ty.index()), Some(RirType::Struct(id))
+                if program.structs[id.index()].native_ref),
+        }),
+        RustReturnAbi::Option(inner) => {
+            let Some(RirType::Option(payload_ty)) = program.types.get(ty.index()) else {
+                return None;
+            };
+            Some(RirNativeReturn::Option {
+                payload_ty: *payload_ty,
+                payload: Box::new(classify_return(program, *payload_ty, inner)?),
+            })
+        }
+        RustReturnAbi::Result(ok, err) => {
+            let Some(RirType::Enum(id)) = program.types.get(ty.index()) else {
+                return None;
+            };
+            let enm = &program.enums[id.index()];
+            let [ok_variant, err_variant] = enm.variants.as_slice() else {
+                return None;
+            };
+            let ([ok_field], [err_field]) =
+                (ok_variant.fields.as_slice(), err_variant.fields.as_slice())
+            else {
+                return None;
+            };
+            if enm.core != Some(RirCoreEnumKind::Result) {
+                return None;
+            }
+            Some(RirNativeReturn::Result {
+                ok_ty: ok_field.ty,
+                ok: Box::new(classify_return(program, ok_field.ty, ok)?),
+                err_ty: err_field.ty,
+                err: Box::new(classify_return(program, err_field.ty, err)?),
+            })
+        }
     }
 }
 

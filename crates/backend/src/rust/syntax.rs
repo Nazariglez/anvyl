@@ -1,42 +1,6 @@
 use std::fmt::Write;
 
-use anvyx_frontend::ast::{BinaryOp, UnaryOp};
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub(super) struct FormatSpec {
-    pub fill: char,
-    pub align: Option<FormatAlign>,
-    pub sign: FormatSign,
-    pub zero_pad: bool,
-    pub width: Option<u32>,
-    pub precision: Option<u32>,
-    pub kind: FormatKind,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum FormatAlign {
-    Left,
-    Right,
-    Center,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub(super) enum FormatSign {
-    #[default]
-    Default,
-    Always,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub(super) enum FormatKind {
-    #[default]
-    Default,
-    Hex,
-    HexUpper,
-    Binary,
-    Exp,
-    ExpUpper,
-}
+use anvyx_frontend::ast::{BinaryOp, FormatAlign, FormatKind, FormatSign, FormatSpec, UnaryOp};
 
 pub(super) fn comma(items: impl IntoIterator<Item = String>) -> String {
     items.into_iter().collect::<Vec<_>>().join(", ")

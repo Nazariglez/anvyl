@@ -1,0 +1,41 @@
+// @mode: run
+// @expect: success
+// @match-begin
+// rhs
+// left
+// right
+// 1
+// @match-end
+
+struct Item {
+    label: string,
+}
+
+struct Payload {
+    items: [Item; 2],
+    pair: (Item, Item),
+}
+
+fn pick(ref calls: int) -> int {
+    calls += 1;
+    println("rhs");
+    1
+}
+
+fn replace(ref payload: Payload, ref calls: int) {
+    let pad = 0;
+    assert(pad == 0);
+    payload.pair = (Item { label: "left" }, payload.items[pick(calls)]);
+    println(payload.pair.0.label);
+    println(payload.pair.1.label);
+}
+
+fn main() {
+    var calls = 0;
+    var payload = Payload {
+        items: [Item { label: "wrong" }, Item { label: "right" }],
+        pair: (Item { label: "old-left" }, Item { label: "old-right" }),
+    };
+    replace(payload, calls);
+    println(calls);
+}

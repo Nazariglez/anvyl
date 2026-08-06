@@ -1,0 +1,10 @@
+// @mode: run
+// @expect: error
+// @contains: Rust provider ABI for extern method `Counter.inspect` is unsupported
+
+import pkg:host.host { Counter, make_counter };
+
+fn main() {
+    let counter = make_counter(1);
+    println(counter.inspect());
+}

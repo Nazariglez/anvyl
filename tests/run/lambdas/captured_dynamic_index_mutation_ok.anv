@@ -1,0 +1,13 @@
+// @mode: run
+// @expect: success
+// @skip: captured dynamic-index mutation is not executable yet
+
+fn main() {
+    var values = [0];
+    let i = 0;
+    let set = || {
+        values[i] = 1;
+    };
+    set();
+    assert(values[0] == 1);
+}

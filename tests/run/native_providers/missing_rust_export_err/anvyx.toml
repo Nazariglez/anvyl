@@ -1,0 +1,6 @@
+[project]
+name = "missing_rust_export_game"
+entry = "src/main.anv"
+
+[dependencies]
+host = { path = "provider" }

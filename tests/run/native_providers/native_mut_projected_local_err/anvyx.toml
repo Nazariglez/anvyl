@@ -1,0 +1,6 @@
+[project]
+name = "native_mut_projected_local"
+entry = "src/main.anv"
+
+[dependencies]
+host = { path = "../final_abi_resource_ok/provider" }

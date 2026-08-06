@@ -1,0 +1,27 @@
+// @mode: run
+// @expect: success
+// @match: 3
+
+contract Measured {
+    fn measure(self) -> int;
+}
+
+struct FlagPayload {
+    value: bool,
+
+    fn measure(self) -> int {
+        if self.value { 1 } else { 0 }
+    }
+}
+
+struct ListPayload {
+    values: [int],
+
+    fn measure(self) -> int { 2 }
+}
+
+fn main() {
+    let flag: dyn Measured = FlagPayload { value: true };
+    let list: dyn Measured = ListPayload { values: [1, 2] };
+    println(flag.measure() + list.measure());
+}

@@ -1,7 +1,4 @@
-use super::{
-    rir::{RirCtxPlan, RirStringLiteralId},
-    syntax,
-};
+use super::{rir::RirStringLiteralId, syntax};
 
 const RT: &str = "anvyx_runtime";
 
@@ -186,6 +183,48 @@ pub(super) fn callback_slot_turbofish(root: &str) -> String {
     format!("{}::<{root}>", rt_path("CallbackSlot"))
 }
 
+pub(super) fn callback_slot_is_free(slot: &str) -> String {
+    format!("{slot}.is_free()")
+}
+
+pub(super) fn callback_slot_insert(slot: &str, handle: &str) -> String {
+    format!("{slot}.insert({handle})")
+}
+
+pub(super) fn callback_slot_begin_invocation(slot: &str, owner: &str, key: &str) -> String {
+    format!("unsafe {{ {slot}.begin_invocation({owner}, {key}) }}")
+}
+
+pub(super) fn callback_slot_close(slot: &str, key: &str) -> String {
+    format!("{slot}.close({key})")
+}
+
+pub(super) fn callback_key_owner_id(key: &str) -> String {
+    format!("{key}.owner_id()")
+}
+
+pub(super) fn callback_key_shutdown_generation(key: &str) -> String {
+    format!("{key}.shutdown_generation()")
+}
+
+pub(super) fn callback_key_index(key: &str) -> String {
+    format!("{key}.index()")
+}
+
+pub(super) fn callback_heap_try_with(heap: &str, handle: &str, record: &str, body: &str) -> String {
+    format!("{heap}.try_with({handle}, |{record}| {body})")
+}
+
+pub(super) fn callback_heap_try_with_erased(
+    heap: &str,
+    handle: &str,
+    heap_type: &str,
+    record: &str,
+    body: &str,
+) -> String {
+    format!("{heap}.try_with_erased({handle}, {heap_type}, |{record}| {body})")
+}
+
 pub(super) fn pin_box_ty(payload: &str) -> String {
     format!("std::pin::Pin<Box<{payload}>>")
 }
@@ -212,6 +251,14 @@ pub(super) fn runtime_owner_handle_new() -> String {
 
 pub(super) fn owner_attach(owner: &str, ptr: &str) -> String {
     format!("{owner}.__anvyx_attach_owner_ptr({ptr})")
+}
+
+pub(super) fn owner_id(owner: &str) -> String {
+    format!("{owner}.owner_id()")
+}
+
+pub(super) fn owner_shutdown_generation(owner: &str) -> String {
+    format!("{owner}.shutdown_generation()")
 }
 
 pub(super) fn owner_begin_shutdown(owner: &str) -> String {
@@ -287,8 +334,28 @@ pub(super) fn dataref_place_ops_ty(payload: &str) -> String {
     format!("{}<'cx, {payload}>", rt_path("DataRefPlaceOps"))
 }
 
+pub(super) fn dataref_place_symbol(index: usize) -> String {
+    format!("anvP{index}_place")
+}
+
 pub(super) fn projection_ops_ty(root: &str, payload: &str) -> String {
     format!("{}<'cx, {root}, {payload}>", rt_path("ProjectionOps"))
+}
+
+pub(super) fn projection_ops_impl(
+    ops: &str,
+    root: &str,
+    payload: &str,
+    access: &str,
+    mutate: &str,
+) -> String {
+    let trait_ty = projection_ops_ty(root, payload);
+    let rt_ty = runtime_ctx_ty_with_lifetimes("'cx", "'_");
+    let rt = runtime_param_name();
+    let result = result_ty("()");
+    format!(
+        "unsafe impl<'cx> {trait_ty} for {ops} {{ fn access(&self, {rt}: &mut {rt_ty}, root: &{root}, f: &mut dyn FnMut(&{payload}) -> {result}) -> {result} {{ {access} }} fn mutate(&self, {rt}: &mut {rt_ty}, root: &mut {root}, f: &mut dyn FnMut(&mut {payload}) -> {result}) -> {result} {{ {mutate} }} }}"
+    )
 }
 
 pub(super) fn optional_payload_ops_ty(payload: &str) -> String {
@@ -326,6 +393,10 @@ pub(super) fn lambda_cell_ctor(payload: &str) -> String {
     format!("{}::<{payload}>", rt_path("LambdaCell"))
 }
 
+pub(super) fn lambda_cell_new_with_safepoint(ctor: &str, value: &str, safepoint: &str) -> String {
+    format!("{ctor}::new_with_safepoint({value}, {safepoint})")
+}
+
 pub(super) fn lambda_cell_set(value: &str, replace_collection: bool) -> String {
     if replace_collection {
         format!("mutate(|slot| slot.replace_with({value}))")
@@ -353,24 +424,24 @@ pub(super) fn result_ty(ret: &str) -> String {
     format!("Result<{ret}, {}>", runtime_error_ty())
 }
 
-pub(super) fn generated_statics_symbol(ctx: &RirCtxPlan) -> &str {
-    ctx.statics_symbol.as_str()
+pub(super) fn generated_statics_symbol() -> &'static str {
+    "AnvStatics"
 }
 
-pub(super) fn generated_globals_symbol(ctx: &RirCtxPlan) -> &str {
-    ctx.globals_symbol.as_str()
+pub(super) fn generated_globals_symbol() -> &'static str {
+    "AnvGlobals"
 }
 
 pub(super) fn runtime_param_name() -> &'static str {
-    "rt"
+    "_rt"
 }
 
 pub(super) fn statics_param_name() -> &'static str {
-    "statics"
+    "_statics"
 }
 
 pub(super) fn globals_param_name() -> &'static str {
-    "globals"
+    "_globals"
 }
 
 pub(super) fn owner_param_name() -> &'static str {
@@ -379,18 +450,6 @@ pub(super) fn owner_param_name() -> &'static str {
 
 pub(super) fn callbacks_param_name() -> &'static str {
     "callbacks"
-}
-
-pub(super) fn runtime_param(used: bool) -> &'static str {
-    if used { "rt" } else { "_rt" }
-}
-
-pub(super) fn statics_param(used: bool) -> &'static str {
-    if used { "statics" } else { "_statics" }
-}
-
-pub(super) fn globals_param(used: bool) -> &'static str {
-    if used { "globals" } else { "_globals" }
 }
 
 pub(super) fn runtime_ctx_ty() -> String {
@@ -445,12 +504,12 @@ pub(super) fn runtime_ctx_from_raw_with_trace_roots_and_safepoint(
     )
 }
 
-pub(super) fn statics_ref_ty(symbol: &str) -> String {
-    format!("&{symbol}<'cx>")
+pub(super) fn statics_ref_ty() -> String {
+    format!("&{}<'cx>", generated_statics_symbol())
 }
 
-pub(super) fn globals_ref_ty(symbol: &str) -> String {
-    format!("&{symbol}<'cx>")
+pub(super) fn globals_ref_ty() -> String {
+    format!("&{}<'cx>", generated_globals_symbol())
 }
 
 pub(super) fn global_slot_ty(payload: &str) -> String {
@@ -462,6 +521,10 @@ pub(super) fn global_slot_new(name: &str, safepoint: &str) -> String {
         "{}::new_with_safepoint({name:?}, {safepoint}.clone())",
         rt_path("GlobalSlot")
     )
+}
+
+pub(super) fn global_validate_trace(slot: &str) -> String {
+    format!("{slot}.validate_trace()?")
 }
 
 pub(super) fn global_slot_field(globals: &str, field: &str) -> String {
@@ -647,12 +710,15 @@ pub(super) fn callable_share_from_ref(value: &str) -> String {
     format!("({value}).clone()")
 }
 
-pub(super) fn provider_materialize(path: &anvyx_runtime::RustPath, value: &str) -> String {
-    let path = std::iter::once(path.crate_name.as_str())
+pub(super) fn rust_path(path: &anvyx_runtime::RustPath) -> String {
+    std::iter::once(path.crate_name.as_str())
         .chain(path.segments.iter().map(String::as_str))
         .collect::<Vec<_>>()
-        .join("::");
-    format!("{path}({value})")
+        .join("::")
+}
+
+pub(super) fn provider_materialize(path: &anvyx_runtime::RustPath, value: &str) -> String {
+    format!("{}({value})", rust_path(path))
 }
 
 pub(super) fn materializer_symbol(id: crate::rust::rir::RirMaterializerId) -> String {
@@ -680,8 +746,9 @@ pub(super) fn dyn_borrow_materialize_decl(
     ret: &str,
 ) -> String {
     format!(
-        "fn materialize_{}(&mut self, rt: &mut {}) -> {}",
+        "fn materialize_{}(&mut self, {}: &mut {}) -> {}",
         id.index(),
+        runtime_param_name(),
         runtime_ctx_ty_with("'_"),
         result_ty(ret)
     )
@@ -943,7 +1010,8 @@ pub(super) fn anv_map_from_entries(rt: &str, storage_ty: &str, entries: &str) ->
 }
 
 pub(super) fn list_push_ctx_region(value: &str, materialize: &str) -> String {
-    format!("{{ unsafe {{ value.push_with(rt, {value}, {materialize}) }}?; Ok(()) }}")
+    let rt = runtime_param_name();
+    format!("{{ unsafe {{ value.push_with({rt}, {value}, {materialize}) }}?; Ok(()) }}")
 }
 
 pub(super) fn map_insert_region(
@@ -952,13 +1020,14 @@ pub(super) fn map_insert_region(
     materialize_key: &str,
     materialize_value: &str,
 ) -> String {
+    let rt = runtime_param_name();
     format!(
-        "{{ unsafe {{ value.insert_with(rt, {key}, {inserted}, {materialize_key}, {materialize_value}) }}?; Ok(()) }}"
+        "{{ unsafe {{ value.insert_with({rt}, {key}, {inserted}, {materialize_key}, {materialize_value}) }}?; Ok(()) }}"
     )
 }
 
 pub(super) fn map_contains_key_region(key: &str) -> String {
-    format!("value.contains_key(rt, &{key})")
+    format!("value.contains_key({}, &{key})", runtime_param_name())
 }
 
 pub(super) fn map_remove_region(
@@ -966,7 +1035,8 @@ pub(super) fn map_remove_region(
     materialize_key: &str,
     materialize_value: &str,
 ) -> String {
-    format!("unsafe {{ value.remove_with(rt, &{key}, {materialize_key}, {materialize_value}) }}")
+    let rt = runtime_param_name();
+    format!("unsafe {{ value.remove_with({rt}, &{key}, {materialize_key}, {materialize_value}) }}")
 }
 
 pub(super) fn collection_structural_version(collection: &str) -> String {
@@ -1147,10 +1217,6 @@ pub(super) fn rt_heap_with(rt: &str, object: &str, storage: &str, body: &str) ->
     format!("{rt}.heap().with({object}, |{storage}| {body})")
 }
 
-pub(super) fn rt_heap_with_mut(rt: &str, object: &str, storage: &str, body: &str) -> String {
-    format!("{rt}.heap().with_mut({object}, |{storage}| {{ {body} }})")
-}
-
 pub(super) fn heap_access_error() -> String {
     rt_path("heap_access_error")
 }
@@ -1236,7 +1302,11 @@ pub(super) fn mut_place_heap_cell(cell: &str) -> String {
 }
 
 pub(super) fn mut_place_global(slot: &str, init: &str) -> String {
-    format!("{}::global(&{slot}, &|rt| {init})", mut_place_ty())
+    format!(
+        "{}::global(&{slot}, &|{}| {init})",
+        mut_place_ty(),
+        runtime_param_name()
+    )
 }
 
 pub(super) fn mut_place_global_with_init(slot: &str, init: &str) -> String {
@@ -1294,11 +1364,13 @@ pub(super) fn mut_place_access(place: &str, runtime: &str, body: &str) -> String
 }
 
 pub(super) fn mut_place_access_ctx(place: &str, runtime: &str, body: &str) -> String {
-    format!("unsafe {{ {place}.access_with_ctx({runtime}, |rt, value| {body}) }}?")
+    let callback_rt = runtime_param_name();
+    format!("unsafe {{ {place}.access_with_ctx({runtime}, |{callback_rt}, value| {body}) }}?")
 }
 
 pub(super) fn mut_place_mutate_ctx(place: &str, runtime: &str, body: &str) -> String {
-    format!("unsafe {{ {place}.mutate_with_ctx({runtime}, |rt, value| {body}) }}?")
+    let callback_rt = runtime_param_name();
+    format!("unsafe {{ {place}.mutate_with_ctx({runtime}, |{callback_rt}, value| {body}) }}?")
 }
 
 pub(super) fn mut_place_get_copy(place: &str, runtime: &str) -> String {

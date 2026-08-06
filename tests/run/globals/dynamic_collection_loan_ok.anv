@@ -1,0 +1,12 @@
+// @mode: run
+// @expect: success
+// @skip: dynamic global collection-loan roots are not executable yet
+
+lazy var rows = [[1, 2]];
+
+fn main() {
+    let i = 0;
+    for value in rows[i] {
+        println(value);
+    }
+}

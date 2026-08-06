@@ -1,0 +1,16 @@
+// @mode: run
+// @expect: success
+// @match-begin
+// before
+// callback
+// @match-end
+
+import pkg:host.host { log_and_fire, retain, close };
+
+fn main() {
+    retain(|| {
+        println("callback");
+    });
+    log_and_fire("before");
+    close();
+}

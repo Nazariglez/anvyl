@@ -9,7 +9,10 @@ use super::{
         BinaryOp, ConstValue, ParamEscape, ParamMode, ParamType, ReturnMode, SignatureType, UnaryOp,
     },
 };
-use crate::ast::{ExprId, Ident};
+use crate::{
+    ast::{ExprId, Ident},
+    span::SourceSpan,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ContractSurfaceDecl {
@@ -438,6 +441,7 @@ pub enum VariantShape {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExternDecl {
     pub name: Ident,
+    pub span: Option<SourceSpan>,
     pub module: ModuleId,
     pub member: ExternMember,
     pub params: Vec<ExternParamDecl>,

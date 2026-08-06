@@ -1,0 +1,16 @@
+// @mode: run
+// @expect: error
+// @contains: extern function `alpha` has no Rust provider binding
+// @contains: extern function `beta` has no Rust provider binding
+// @contains: extern fn alpha();
+// @contains: extern fn beta();
+// @contains: declared here without a Rust provider binding
+// @contains: import this declaration from a Rust provider package
+
+extern fn alpha();
+extern fn beta();
+
+fn main() {
+    alpha();
+    beta();
+}

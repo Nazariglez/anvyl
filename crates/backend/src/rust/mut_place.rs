@@ -1,12 +1,12 @@
 use anvyx_frontend::air::{
-    self, FunctionId, LocalKind, Mutability, ParamMode, Place, PlaceRoot, Program,
+    FunctionId, LocalKind, Mutability, ParamMode, Place, PlaceRoot, Program,
 };
 
 use super::{
-    PlanCx, PlannedCallArg, PlannedMutPlaceArg, RustPlanError, RustTargetGapKind,
+    PlanCx, PlannedCallArg, PlannedMutPlaceArg, RustTargetGap, RustTargetGapKind,
     RustTargetGapSite,
     place_access::{PlaceAccessGapKind, PlaceAccessIntent, PlaceAccessPlan, PlaceAccessRoot},
-    rir::{RirCallArg, RirLocal, RirLocalId, RirMutPlaceArg, RirMutPlaceHandle, RirProjection},
+    rir::{RirCallArg, RirLocal, RirLocalId, RirMutPlaceArg, RirMutPlaceHandle, RirPlaceStep},
 };
 
 pub(super) fn direct_native_mut_borrow_supported(
@@ -39,7 +39,7 @@ impl PlanCx<'_> {
         function: FunctionId,
         place: &Place,
         locals: &mut Vec<RirLocal>,
-    ) -> Result<PlannedCallArg, RustPlanError> {
+    ) -> Result<PlannedCallArg, RustTargetGap> {
         let plan = self
             .access()
             .plan(function, PlaceAccessIntent::MutPlaceArg, place)
@@ -56,11 +56,11 @@ impl PlanCx<'_> {
         function: FunctionId,
         plan: &PlaceAccessPlan,
         locals: &mut Vec<RirLocal>,
-    ) -> Result<PlannedMutPlaceArg, RustPlanError> {
+    ) -> Result<PlannedMutPlaceArg, RustTargetGap> {
         if plan.dataref_plan().is_some() {
-            return Ok(self.plan_dataref_mut_place_arg(function, plan, locals));
+            return self.plan_dataref_mut_place_arg(function, plan, locals);
         }
-        if plan.projection.is_empty() {
+        if plan.steps().is_empty() {
             return self.plan_root_mut_place_arg(function, plan);
         }
         self.plan_projected_mut_place_arg(function, plan)
@@ -71,59 +71,45 @@ impl PlanCx<'_> {
         function: FunctionId,
         plan: &PlaceAccessPlan,
         locals: &mut Vec<RirLocal>,
-    ) -> PlannedMutPlaceArg {
+    ) -> Result<PlannedMutPlaceArg, RustTargetGap> {
         let mut stmts = vec![];
-        let mut segment = self.dataref_mut_place_segment(function, plan, locals, &mut stmts);
+        let segment = self.dataref_mut_place_segment(function, plan, locals, &mut stmts)?;
         let dataref = plan.dataref_plan().expect("dataref mutable-place plan");
-        segment.projections.extend(
-            dataref
-                .remaining
-                .iter()
-                .map(|projection| self.rir_place_projection(projection)),
-        );
         let arg = RirMutPlaceArg::dataref(
             segment.object,
-            segment.dataref,
-            segment.projections,
-            self.type_map[&plan.ty],
+            segment.place,
+            self.rir_place_steps(plan, dataref.remaining.clone()),
         );
-        PlannedMutPlaceArg { stmts, arg }
+        Ok(PlannedMutPlaceArg { stmts, arg })
     }
 
     fn plan_projected_mut_place_arg(
         &self,
         function: FunctionId,
         plan: &PlaceAccessPlan,
-    ) -> Result<PlannedMutPlaceArg, RustPlanError> {
-        let root_ty = plan.projection[0].source_ty;
-        let projections = plan
-            .projection
-            .iter()
-            .map(|projection| self.rir_place_projection(projection))
-            .collect();
-        self.plan_handle_mut_place_arg(function, plan.root, root_ty, projections, plan.ty)
+    ) -> Result<PlannedMutPlaceArg, RustTargetGap> {
+        let projections = self.rir_place_steps(plan, 0..plan.steps().len());
+        self.plan_handle_mut_place_arg(function, plan.root, projections)
     }
 
     fn plan_root_mut_place_arg(
         &self,
         function: FunctionId,
         plan: &PlaceAccessPlan,
-    ) -> Result<PlannedMutPlaceArg, RustPlanError> {
-        self.plan_handle_mut_place_arg(function, plan.root, plan.ty, vec![], plan.ty)
+    ) -> Result<PlannedMutPlaceArg, RustTargetGap> {
+        self.plan_handle_mut_place_arg(function, plan.root, vec![])
     }
 
     fn plan_handle_mut_place_arg(
         &self,
         function: FunctionId,
         root: PlaceAccessRoot,
-        root_ty: air::TypeId,
-        projections: Vec<RirProjection>,
-        ty: air::TypeId,
-    ) -> Result<PlannedMutPlaceArg, RustPlanError> {
-        let handle = self.mut_place_handle(function, root, root_ty)?;
+        projections: Vec<RirPlaceStep>,
+    ) -> Result<PlannedMutPlaceArg, RustTargetGap> {
+        let handle = self.mut_place_handle(function, root)?;
         Ok(PlannedMutPlaceArg {
             stmts: vec![],
-            arg: RirMutPlaceArg::from_handle(handle, projections, self.type_map[&ty]),
+            arg: RirMutPlaceArg::from_handle(handle, projections),
         })
     }
 
@@ -131,9 +117,7 @@ impl PlanCx<'_> {
         &self,
         function: FunctionId,
         root: PlaceAccessRoot,
-        ty: air::TypeId,
-    ) -> Result<RirMutPlaceHandle, RustPlanError> {
-        let rir_ty = self.type_map[&ty];
+    ) -> Result<RirMutPlaceHandle, RustTargetGap> {
         match root {
             PlaceAccessRoot::Local {
                 local,
@@ -141,32 +125,26 @@ impl PlanCx<'_> {
                 ..
             } => Ok(RirMutPlaceHandle::Param {
                 local: RirLocalId::from_index(local.index()),
-                ty: rir_ty,
             }),
             PlaceAccessRoot::Local { local, .. } => Ok(RirMutPlaceHandle::Local {
                 local: RirLocalId::from_index(local.index()),
-                ty: rir_ty,
             }),
             PlaceAccessRoot::CaptureCell(cell) => {
                 let cell_ref = self.capture_cell_ref(function, cell);
                 Ok(match self.classify_capture_cell_storage(cell) {
-                    super::rir::RirCellStorage::StackScoped => RirMutPlaceHandle::StackCell {
-                        cell: cell_ref,
-                        ty: rir_ty,
-                    },
-                    super::rir::RirCellStorage::Heap => RirMutPlaceHandle::HeapCell {
-                        cell: cell_ref,
-                        ty: rir_ty,
-                    },
+                    super::rir::RirCellStorage::StackScoped => {
+                        RirMutPlaceHandle::StackCell { cell: cell_ref }
+                    }
+                    super::rir::RirCellStorage::Heap => {
+                        RirMutPlaceHandle::HeapCell { cell: cell_ref }
+                    }
                 })
             }
             PlaceAccessRoot::ScopedPlaceCell(borrow) => Ok(RirMutPlaceHandle::ScopedPlaceCell {
                 cell: self.scoped_place_cell_ref(function, borrow),
-                ty: rir_ty,
             }),
             PlaceAccessRoot::Global(global) => Ok(RirMutPlaceHandle::Global {
                 global: self.global_map[&global],
-                ty: rir_ty,
             }),
             PlaceAccessRoot::LambdaCapture(_) => Self::unsupported_mut_place(
                 function,
@@ -179,31 +157,30 @@ impl PlanCx<'_> {
         &self,
         function: FunctionId,
         place: &Place,
-    ) -> Result<PlannedCallArg, RustPlanError> {
-        self.access()
+    ) -> Result<PlannedCallArg, RustTargetGap> {
+        let plan = self
+            .access()
             .plan(function, PlaceAccessIntent::NativeMutBorrow, place)
             .map_err(|gap| Self::access_gap(function, gap))?;
         Ok(PlannedCallArg::from_arg(RirCallArg::MutBorrow(
-            self.plan_place_in_function(function, place),
+            self.plan_place(function, &plan),
         )))
     }
 
     fn unsupported_mut_place<T>(
         function: FunctionId,
         kind: RustTargetGapKind,
-    ) -> Result<T, RustPlanError> {
+    ) -> Result<T, RustTargetGap> {
         Err(Self::gap(RustTargetGapSite::Function(function), kind))
     }
 
-    pub(super) fn access_gap(function: FunctionId, kind: PlaceAccessGapKind) -> RustPlanError {
+    pub(super) fn access_gap(function: FunctionId, kind: PlaceAccessGapKind) -> RustTargetGap {
         let kind = match kind {
             PlaceAccessGapKind::PlaceProjection => RustTargetGapKind::UnsupportedPlaceProjection,
             PlaceAccessGapKind::GlobalAccess => RustTargetGapKind::UnsupportedGlobalAccess,
-            PlaceAccessGapKind::GlobalBorrow => RustTargetGapKind::UnsupportedGlobalBorrow,
             PlaceAccessGapKind::GlobalProjection => RustTargetGapKind::UnsupportedGlobalProjection,
             PlaceAccessGapKind::GlobalValueRead => RustTargetGapKind::UnsupportedGlobalValueRead,
             PlaceAccessGapKind::GlobalRooting => RustTargetGapKind::UnsupportedGlobalRooting,
-            PlaceAccessGapKind::GlobalType => RustTargetGapKind::UnsupportedGlobalType,
             PlaceAccessGapKind::MutablePlace => RustTargetGapKind::UnsupportedMutablePlace,
             PlaceAccessGapKind::MutablePlaceProjection => {
                 RustTargetGapKind::UnsupportedMutablePlaceProjection
@@ -215,7 +192,6 @@ impl PlanCx<'_> {
                 RustTargetGapKind::UnsupportedMutablePlaceNativeBoundary
             }
             PlaceAccessGapKind::SliceView => RustTargetGapKind::UnsupportedSliceView,
-            PlaceAccessGapKind::ReturnPlace => RustTargetGapKind::UnsupportedReturnMode,
         };
         Self::gap(RustTargetGapSite::Function(function), kind)
     }

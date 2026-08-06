@@ -1,41 +1,26 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use anvyx_frontend::air::{
-    self, AggregateKind, ContractSurfaceId, ContractWitnessId, ContractWitnessTarget, ParamMode,
+    self, AggregateKind, ContractSurfaceId, ContractWitnessId, ContractWitnessTarget,
     Program as AirProgram, TypeData, TypeId, TypePassClass, TypePassClasses, VariantShape,
 };
 
 use super::{
     rir::{
-        RirCellDecl, RirCellStorage, RirCollectionStorageKind, RirDataRef, RirEnum, RirEnumId,
-        RirField, RirFunctionId, RirLambda, RirLambdaCapture, RirLambdaEnvField,
-        RirLambdaEnvFieldKind, RirLambdaEnvLayout, RirLambdaId, RirLambdaSigId, RirLambdaStorage,
-        RirParamAbi, RirParamEscape, RirParamSemantic, RirProgram, RirStruct, RirStructId,
-        RirTuple, RirTupleId, RirType, RirTypeId,
+        RirCellDecl, RirCellStorage, RirCollectionStorageKind, RirCopyEvidence, RirDataRef,
+        RirDynCarrierId, RirDynVariantId, RirEnum, RirEnumId, RirField, RirFunctionId, RirLambda,
+        RirLambdaCapture, RirLambdaEnvField, RirLambdaEnvFieldKind, RirLambdaEnvLayout,
+        RirLambdaId, RirLambdaSigId, RirLambdaStorage, RirMaterializer, RirMaterializerAction,
+        RirMaterializerId, RirParamEscape, RirPassMode, RirProgram, RirStruct, RirStructId,
+        RirSupportEvidence, RirTuple, RirTupleId, RirType, RirTypeId,
     },
     target,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RustValueRep {
-    InlineCopy,
-    InlineArray,
-    InlineStruct,
-    InlineEnum,
-    RawIntEnum,
-    RawStringEnum,
-    HeapHandle,
-    CowString,
-    CowList,
-    CowMap,
-    Opaque,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RustBorrowView {
     Ref,
     Str,
-    Slice,
     TargetGap,
 }
 
@@ -45,7 +30,6 @@ pub enum RustRecipePosition {
     StoredPayload(LambdaStorageFamily),
     MapKey,
     Global,
-    HeapEdge,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -58,64 +42,17 @@ pub enum RustRecipeGap {
     },
     UnsupportedMapKey(TypeId),
     UnsupportedGlobal(TypeId),
-    UnsupportedHeapEdge(TypeId),
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct RustMaterializerId(usize);
-
-impl RustMaterializerId {
-    pub fn index(self) -> usize {
-        self.0
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum RustMaterializerAction {
-    Copy,
-    ManagedShare,
-    IdentityShare,
-    CallableShare,
-    ProviderMaterialize {
-        binding: anvyx_runtime::RustMaterializerBinding,
-    },
-    Struct {
-        fields: Vec<RustMaterializerId>,
-    },
-    Tuple {
-        fields: Vec<RustMaterializerId>,
-    },
-    Array {
-        elem: RustMaterializerId,
-    },
-    Enum {
-        variants: Vec<Vec<RustMaterializerId>>,
-    },
-    Optional {
-        payload: RustMaterializerId,
-    },
-    DynamicMaterialize {
-        carrier: ContractSurfaceId,
-        variants: Vec<RustDynamicMaterializerVariant>,
-    },
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct RustDynamicMaterializerVariant {
-    pub witness: ContractWitnessId,
-    pub payload: RustMaterializerId,
 }
 
 #[derive(Debug, Clone)]
 enum RustMaterializerNode {
-    Planning,
-    Ready(RustMaterializerAction),
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RustCallableMaterializer {
-    Copy,
-    Share,
+    Reserved,
+    Filling,
+    Ready {
+        action: RirMaterializerAction,
+        copy: Option<RirCopyEvidence>,
+        support: Option<RirSupportEvidence>,
+    },
 }
 
 #[derive(Debug, Clone, Default)]
@@ -123,7 +60,8 @@ pub struct RustMaterializerGraph {
     nodes: Vec<RustMaterializerNode>,
     types: Vec<TypeId>,
     positions: Vec<RustRecipePosition>,
-    entries: BTreeMap<(TypeId, RustRecipePosition), RustMaterializerId>,
+    entries: BTreeMap<(TypeId, RustRecipePosition), RirMaterializerId>,
+    filled: bool,
     native_types: HashMap<
         (
             String,
@@ -132,7 +70,7 @@ pub struct RustMaterializerGraph {
         ),
         anvyx_runtime::RustTypeBinding,
     >,
-    callables: HashMap<TypeId, RustCallableMaterializer>,
+    callables: HashMap<TypeId, RirMaterializerAction>,
 }
 
 impl RustMaterializerGraph {
@@ -155,73 +93,189 @@ impl RustMaterializerGraph {
         graph
     }
 
+    pub fn native_type(
+        &self,
+        binding: &air::ExternTypeBindingDecl,
+    ) -> Option<&anvyx_runtime::RustTypeBinding> {
+        self.native_types.get(&(
+            binding.package.as_str().to_string(),
+            binding.provider.clone(),
+            binding.key.clone(),
+        ))
+    }
+
     pub fn set_callable_materializers(
         &mut self,
-        callables: impl IntoIterator<Item = (TypeId, RustCallableMaterializer)>,
+        callables: impl IntoIterator<Item = (TypeId, RirMaterializerAction)>,
     ) {
         self.nodes.clear();
         self.types.clear();
         self.positions.clear();
         self.entries.clear();
+        self.filled = false;
         self.callables.clear();
         self.callables.extend(callables);
     }
 
-    pub fn ty(&self, id: RustMaterializerId) -> TypeId {
-        self.types[id.index()]
-    }
-
-    pub fn position(&self, id: RustMaterializerId) -> RustRecipePosition {
-        self.positions[id.index()]
-    }
-
-    pub fn action(&self, id: RustMaterializerId) -> &RustMaterializerAction {
-        match &self.nodes[id.index()] {
-            RustMaterializerNode::Ready(action) => action,
-            RustMaterializerNode::Planning => panic!("materializer action is not executable"),
-        }
-    }
-
-    pub fn action_for(
+    pub fn reserve(
         &mut self,
         plan: RustRepresentationPlan<'_>,
         ty: TypeId,
         position: RustRecipePosition,
-    ) -> Result<RustMaterializerId, RustRecipeGap> {
-        plan.check_recipe_position(ty, position)?;
-        let key = (ty, position);
-        if let Some(id) = self.entries.get(&key).copied() {
-            return Ok(id);
-        }
-
-        let id = RustMaterializerId(self.nodes.len());
-        self.entries.insert(key, id);
-        self.nodes.push(RustMaterializerNode::Planning);
-        self.types.push(ty);
-        self.positions.push(position);
-        match self.build_action(plan, ty, position) {
-            Ok(action) => {
-                self.nodes[id.index()] = RustMaterializerNode::Ready(action);
-                Ok(id)
-            }
+        carriers: &HashMap<ContractSurfaceId, RirDynCarrierId>,
+        variants: &HashMap<ContractWitnessId, RirDynVariantId>,
+    ) -> Result<RirMaterializerId, RustRecipeGap> {
+        let start = self.nodes.len();
+        match self.visit(plan, ty, position, carriers, variants, false) {
+            Ok(id) => Ok(id),
             Err(gap) => {
-                self.nodes.truncate(id.index());
-                self.types.truncate(id.index());
-                self.positions.truncate(id.index());
-                self.entries.retain(|_, entry| entry.index() < id.index());
+                self.nodes.truncate(start);
+                self.types.truncate(start);
+                self.positions.truncate(start);
+                self.entries.retain(|_, id| id.index() < start);
                 Err(gap)
             }
         }
     }
 
-    fn build_action(
+    pub fn fill(
+        &mut self,
+        plan: RustRepresentationPlan<'_>,
+        carriers: &HashMap<ContractSurfaceId, RirDynCarrierId>,
+        variants: &HashMap<ContractWitnessId, RirDynVariantId>,
+    ) -> Result<(), RustRecipeGap> {
+        for index in 0..self.nodes.len() {
+            let ty = self.types[index];
+            let position = self.positions[index];
+            self.visit(plan, ty, position, carriers, variants, true)?;
+        }
+        self.filled = true;
+        Ok(())
+    }
+
+    pub fn get(&self, ty: TypeId, position: RustRecipePosition) -> Option<RirMaterializerId> {
+        debug_assert!(self.filled);
+        self.entries.get(&(ty, position)).copied()
+    }
+
+    pub fn freeze(&mut self, type_map: &HashMap<TypeId, RirTypeId>) -> Vec<RirMaterializer> {
+        let nodes = std::mem::take(&mut self.nodes);
+        let types = std::mem::take(&mut self.types);
+        let positions = std::mem::take(&mut self.positions);
+        nodes
+            .into_iter()
+            .zip(types)
+            .zip(positions)
+            .enumerate()
+            .map(|(index, ((node, ty), position))| {
+                let RustMaterializerNode::Ready {
+                    action,
+                    copy,
+                    support,
+                } = node
+                else {
+                    panic!("materializer table frozen before fill");
+                };
+                RirMaterializer {
+                    id: RirMaterializerId::from_index(index),
+                    ty: type_map[&ty],
+                    position,
+                    action,
+                    copy,
+                    support,
+                }
+            })
+            .collect()
+    }
+
+    fn check_position(
+        plan: RustRepresentationPlan<'_>,
+        ty: TypeId,
+        position: RustRecipePosition,
+    ) -> Result<(), RustRecipeGap> {
+        let supported = match position {
+            RustRecipePosition::Value => true,
+            RustRecipePosition::StoredPayload(family) => match plan.program.type_arena.data(ty) {
+                TypeData::Function(_) => family.allows_function_payload(),
+                TypeData::Dyn(_) => family.allows_dynamic_owned(),
+                TypeData::Void | TypeData::Any | TypeData::Slice(_) => false,
+                _ => true,
+            },
+            RustRecipePosition::MapKey => match plan.program.type_arena.data(ty) {
+                TypeData::Int
+                | TypeData::Flag(_)
+                | TypeData::Bool
+                | TypeData::Char
+                | TypeData::String
+                | TypeData::Tuple(_)
+                | TypeData::Enum(_) => true,
+                TypeData::Aggregate(id) => {
+                    plan.program.aggregate(*id).kind == AggregateKind::Struct
+                }
+                _ => false,
+            },
+            RustRecipePosition::Global => match plan.program.type_arena.data(ty) {
+                TypeData::Void | TypeData::Any | TypeData::Slice(_) => false,
+                TypeData::Extern(id) => {
+                    let ext = plan.program.extern_type(*id);
+                    ext.rep == air::ExternRep::Shared || ext.owns_heap_edges == Some(false)
+                }
+                TypeData::Function(_) => LambdaStorageFamily::GlobalRoot.allows_function_payload(),
+                _ => true,
+            },
+        };
+        if supported {
+            return Ok(());
+        }
+        Err(match position {
+            RustRecipePosition::StoredPayload(family) => {
+                RustRecipeGap::UnsupportedStorage { ty, family }
+            }
+            RustRecipePosition::MapKey => RustRecipeGap::UnsupportedMapKey(ty),
+            RustRecipePosition::Global => RustRecipeGap::UnsupportedGlobal(ty),
+            RustRecipePosition::Value => RustRecipeGap::UnsupportedType(ty),
+        })
+    }
+
+    fn visit(
         &mut self,
         plan: RustRepresentationPlan<'_>,
         ty: TypeId,
         position: RustRecipePosition,
-    ) -> Result<RustMaterializerAction, RustRecipeGap> {
-        if let TypeData::Extern(id) = plan.program.type_arena.data(ty) {
-            let decl = plan.program.extern_type(*id);
+        carriers: &HashMap<ContractSurfaceId, RirDynCarrierId>,
+        variants: &HashMap<ContractWitnessId, RirDynVariantId>,
+        fill: bool,
+    ) -> Result<RirMaterializerId, RustRecipeGap> {
+        Self::check_position(plan, ty, position)?;
+        let key = (ty, position);
+        let id = match self.entries.get(&key).copied() {
+            Some(id) => match (&self.nodes[id.index()], fill) {
+                (RustMaterializerNode::Ready { .. }, _)
+                | (RustMaterializerNode::Filling, true)
+                | (RustMaterializerNode::Reserved, false) => return Ok(id),
+                (RustMaterializerNode::Filling, false) => unreachable!(),
+                (RustMaterializerNode::Reserved, true) => {
+                    self.nodes[id.index()] = RustMaterializerNode::Filling;
+                    id
+                }
+            },
+            None => {
+                if fill || self.filled {
+                    return Err(RustRecipeGap::UnsupportedType(ty));
+                }
+                let id = RirMaterializerId::from_index(self.nodes.len());
+                self.entries.insert(key, id);
+                self.nodes.push(RustMaterializerNode::Reserved);
+                self.types.push(ty);
+                self.positions.push(position);
+                id
+            }
+        };
+
+        let (copyable, copy) = self.copy_evidence(plan, ty, position, carriers, variants, fill)?;
+        let support = self.support_evidence(plan, ty, position, carriers, variants, fill)?;
+        let action = if let TypeData::Extern(extern_id) = plan.program.type_arena.data(ty) {
+            let decl = plan.program.extern_type(*extern_id);
             let native = decl.binding.as_ref().and_then(|binding| {
                 self.native_types.get(&(
                     binding.package.as_str().to_string(),
@@ -229,120 +283,384 @@ impl RustMaterializerGraph {
                     binding.key.clone(),
                 ))
             });
-            return match (decl.rep, decl.materialization, native) {
+            match (decl.rep, decl.materialization, native) {
                 (
                     air::ExternRep::Inline,
                     Some(mode @ anvyx_runtime::ExternMaterialization::Copy),
                     Some(native),
                 ) if native.validated_materializer(mode).is_some() => {
-                    Ok(RustMaterializerAction::Copy)
+                    fill.then_some(RirMaterializerAction::Copy)
                 }
                 (
                     air::ExternRep::Inline,
                     Some(mode @ anvyx_runtime::ExternMaterialization::Materialize),
                     Some(native),
-                ) => native
-                    .validated_materializer(mode)
-                    .cloned()
-                    .map(|binding| RustMaterializerAction::ProviderMaterialize { binding })
-                    .ok_or(RustRecipeGap::UnsupportedType(ty)),
-                (air::ExternRep::Shared, None, Some(native)) if native.materializer.is_none() => {
-                    Ok(RustMaterializerAction::IdentityShare)
+                ) => {
+                    let binding = native
+                        .validated_materializer(mode)
+                        .ok_or(RustRecipeGap::UnsupportedType(ty))?;
+                    fill.then(|| RirMaterializerAction::ProviderMaterialize {
+                        binding: binding.clone(),
+                    })
                 }
-                _ => Err(RustRecipeGap::UnsupportedType(ty)),
-            };
-        }
-        if matches!(
+                (air::ExternRep::Shared, None, Some(native)) if native.materializer.is_none() => {
+                    fill.then_some(RirMaterializerAction::IdentityShare)
+                }
+                _ => return Err(RustRecipeGap::UnsupportedType(ty)),
+            }
+        } else if matches!(
             plan.program.type_arena.data(ty),
             TypeData::Void | TypeData::Any | TypeData::Slice(_)
         ) {
             return Err(RustRecipeGap::UnsupportedType(ty));
-        }
-        if matches!(plan.program.type_arena.data(ty), TypeData::Function(_)) {
-            return match self.callables.get(&ty) {
-                Some(RustCallableMaterializer::Copy) => Ok(RustMaterializerAction::Copy),
-                Some(RustCallableMaterializer::Share) => Ok(RustMaterializerAction::CallableShare),
-                None => Err(RustRecipeGap::FunctionCapabilityPending(ty)),
-            };
-        }
-        if let TypeData::Dyn(carrier) = plan.program.type_arena.data(ty) {
-            let mut variants = vec![];
+        } else if matches!(plan.program.type_arena.data(ty), TypeData::Function(_)) {
+            match self.callables.get(&ty) {
+                Some(
+                    action @ (RirMaterializerAction::Copy | RirMaterializerAction::CallableShare),
+                ) => fill.then(|| action.clone()),
+                Some(_) => unreachable!("callable materializer action"),
+                None => return Err(RustRecipeGap::FunctionCapabilityPending(ty)),
+            }
+        } else if let TypeData::Dyn(surface) = plan.program.type_arena.data(ty) {
+            let carrier = carriers
+                .get(surface)
+                .copied()
+                .ok_or(RustRecipeGap::UnsupportedType(ty))?;
+            let mut actions = vec![];
             for (index, witness) in plan.program.contract_witnesses.iter().enumerate() {
-                if witness.key.surface != *carrier {
+                if witness.key.surface != *surface {
                     continue;
                 }
-                let payload = self.action_for(
+                let witness = ContractWitnessId::from_index(index);
+                let payload = self.visit(
                     plan,
-                    witness.key.concrete_ty,
+                    plan.program.contract_witnesses[witness.index()]
+                        .key
+                        .concrete_ty,
                     child_recipe_position(position, LambdaStorageFamily::DynamicPayload),
+                    carriers,
+                    variants,
+                    fill,
                 )?;
-                variants.push(RustDynamicMaterializerVariant {
-                    witness: ContractWitnessId::from_index(index),
-                    payload,
-                });
+                if fill {
+                    actions.push((
+                        variants
+                            .get(&witness)
+                            .copied()
+                            .ok_or(RustRecipeGap::UnsupportedType(ty))?,
+                        payload,
+                    ));
+                }
             }
-            return Ok(RustMaterializerAction::DynamicMaterialize {
-                carrier: *carrier,
-                variants,
-            });
-        }
-        if Self::copy_action_supported(plan, ty, &mut BTreeSet::new()) {
-            return Ok(RustMaterializerAction::Copy);
-        }
-
-        match plan.program.type_arena.data(ty) {
-            TypeData::Int
-            | TypeData::Flag(_)
-            | TypeData::Float
-            | TypeData::Bool
-            | TypeData::Char => unreachable!("immediate values are reusable-copyable"),
-            TypeData::String | TypeData::List(_) | TypeData::Map { .. } => {
-                Ok(RustMaterializerAction::ManagedShare)
-            }
-            TypeData::DataRef(_) => Ok(RustMaterializerAction::IdentityShare),
-            TypeData::Optional(inner) => {
-                let payload = self.action_for(
-                    plan,
-                    *inner,
-                    child_recipe_position(position, LambdaStorageFamily::OptionalPayload),
-                )?;
-                Ok(RustMaterializerAction::Optional { payload })
-            }
-            TypeData::Array { elem, .. } => {
-                let elem = self.action_for(
-                    plan,
-                    *elem,
-                    child_recipe_position(position, LambdaStorageFamily::FixedArrayElement),
-                )?;
-                Ok(RustMaterializerAction::Array { elem })
-            }
-            TypeData::Tuple(fields) => Ok(RustMaterializerAction::Tuple {
-                fields: self.field_actions(
-                    plan,
-                    fields.iter().copied(),
-                    position,
-                    LambdaStorageFamily::TupleField,
-                )?,
-            }),
-            TypeData::Aggregate(id) => {
-                let decl = plan.program.aggregate(*id);
-                let family = match decl.kind {
-                    AggregateKind::Struct => LambdaStorageFamily::StructField,
-                    AggregateKind::DataRef => LambdaStorageFamily::DataRefProjection,
-                };
-                Ok(RustMaterializerAction::Struct {
-                    fields: self.field_actions(
+            actions.sort_by_key(|(variant, _)| variant.index());
+            fill.then_some(RirMaterializerAction::DynamicMaterialize {
+                carrier,
+                variants: actions.into_iter().map(|(_, payload)| payload).collect(),
+            })
+        } else if copyable {
+            fill.then_some(RirMaterializerAction::Copy)
+        } else {
+            match plan.program.type_arena.data(ty) {
+                TypeData::Int
+                | TypeData::Flag(_)
+                | TypeData::Float
+                | TypeData::Bool
+                | TypeData::Char => unreachable!("immediate values are reusable-copyable"),
+                TypeData::String | TypeData::List(_) | TypeData::Map { .. } => {
+                    fill.then_some(RirMaterializerAction::ManagedShare)
+                }
+                TypeData::DataRef(_) => fill.then_some(RirMaterializerAction::IdentityShare),
+                TypeData::Optional(inner) => {
+                    let payload = self.visit(
+                        plan,
+                        *inner,
+                        child_recipe_position(position, LambdaStorageFamily::OptionalPayload),
+                        carriers,
+                        variants,
+                        fill,
+                    )?;
+                    fill.then_some(RirMaterializerAction::Optional { payload })
+                }
+                TypeData::Array { elem, .. } => {
+                    let elem = self.visit(
+                        plan,
+                        *elem,
+                        child_recipe_position(position, LambdaStorageFamily::FixedArrayElement),
+                        carriers,
+                        variants,
+                        fill,
+                    )?;
+                    fill.then_some(RirMaterializerAction::Array { elem })
+                }
+                TypeData::Tuple(fields) => {
+                    let fields = self.field_actions(
+                        plan,
+                        fields.iter().copied(),
+                        position,
+                        LambdaStorageFamily::TupleField,
+                        carriers,
+                        variants,
+                        fill,
+                    )?;
+                    fill.then_some(RirMaterializerAction::Tuple { fields })
+                }
+                TypeData::Aggregate(aggregate) => {
+                    let decl = plan.program.aggregate(*aggregate);
+                    let family = match decl.kind {
+                        AggregateKind::Struct => LambdaStorageFamily::StructField,
+                        AggregateKind::DataRef => LambdaStorageFamily::DataRefProjection,
+                    };
+                    let fields = self.field_actions(
                         plan,
                         decl.fields.iter().map(|field| field.ty),
                         position,
                         family,
-                    )?,
+                        carriers,
+                        variants,
+                        fill,
+                    )?;
+                    fill.then_some(RirMaterializerAction::Struct { fields })
+                }
+                TypeData::Enum(enm) => {
+                    let actions = plan
+                        .program
+                        .enum_decl(*enm)
+                        .variants
+                        .iter()
+                        .map(|variant| {
+                            self.field_actions(
+                                plan,
+                                RustRepresentationPlan::variant_field_tys(variant),
+                                position,
+                                LambdaStorageFamily::EnumPayload,
+                                carriers,
+                                variants,
+                                fill,
+                            )
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+                    fill.then_some(RirMaterializerAction::Enum { variants: actions })
+                }
+                TypeData::Dyn(_) => unreachable!("dynamic materializers handled above"),
+                TypeData::Void
+                | TypeData::Any
+                | TypeData::Slice(_)
+                | TypeData::Extern(_)
+                | TypeData::Function(_) => return Err(RustRecipeGap::UnsupportedType(ty)),
+            }
+        };
+        if fill {
+            self.nodes[id.index()] = RustMaterializerNode::Ready {
+                action: action.expect("filled action"),
+                copy,
+                support,
+            };
+        }
+        Ok(id)
+    }
+
+    fn support_evidence(
+        &mut self,
+        plan: RustRepresentationPlan<'_>,
+        ty: TypeId,
+        position: RustRecipePosition,
+        carriers: &HashMap<ContractSurfaceId, RirDynCarrierId>,
+        variants: &HashMap<ContractWitnessId, RirDynVariantId>,
+        fill: bool,
+    ) -> Result<Option<RirSupportEvidence>, RustRecipeGap> {
+        let evidence = match plan.program.type_arena.data(ty) {
+            TypeData::List(elem) => {
+                let elem = self.visit(
+                    plan,
+                    *elem,
+                    child_recipe_position(position, LambdaStorageFamily::ListElement),
+                    carriers,
+                    variants,
+                    fill,
+                )?;
+                Some(RirSupportEvidence::List { elem })
+            }
+            TypeData::Map { key, value, .. } => {
+                let key_materializer = self.visit(
+                    plan,
+                    *key,
+                    child_recipe_position(position, LambdaStorageFamily::MapKey),
+                    carriers,
+                    variants,
+                    fill,
+                )?;
+                let key_contract = self.visit(
+                    plan,
+                    *key,
+                    RustRecipePosition::MapKey,
+                    carriers,
+                    variants,
+                    fill,
+                )?;
+                let value = self.visit(
+                    plan,
+                    *value,
+                    child_recipe_position(position, LambdaStorageFamily::MapValue),
+                    carriers,
+                    variants,
+                    fill,
+                )?;
+                Some(RirSupportEvidence::Map {
+                    key: key_materializer,
+                    key_contract,
+                    value,
                 })
             }
-            TypeData::Enum(id) => {
-                let variants = plan
+            TypeData::Extern(id) if plan.program.extern_type(*id).rep == air::ExternRep::Inline => {
+                let decl = plan.program.extern_type(*id);
+                if decl.variants.is_empty() {
+                    Some(RirSupportEvidence::ProviderStruct {
+                        fields: self.field_actions(
+                            plan,
+                            decl.fields
+                                .iter()
+                                .filter(|field| !field.computed)
+                                .map(|field| field.ty),
+                            position,
+                            LambdaStorageFamily::StructField,
+                            carriers,
+                            variants,
+                            fill,
+                        )?,
+                    })
+                } else {
+                    Some(RirSupportEvidence::ProviderEnum {
+                        variants: decl
+                            .variants
+                            .iter()
+                            .map(|variant| {
+                                self.field_actions(
+                                    plan,
+                                    RustRepresentationPlan::variant_field_tys(variant),
+                                    position,
+                                    LambdaStorageFamily::EnumPayload,
+                                    carriers,
+                                    variants,
+                                    fill,
+                                )
+                            })
+                            .collect::<Result<_, _>>()?,
+                    })
+                }
+            }
+            _ => None,
+        };
+        Ok(fill.then_some(evidence).flatten())
+    }
+
+    fn node_copyable(&self, id: RirMaterializerId) -> bool {
+        match &self.nodes[id.index()] {
+            RustMaterializerNode::Ready { copy, .. } => copy.is_some(),
+            RustMaterializerNode::Filling | RustMaterializerNode::Reserved => false,
+        }
+    }
+
+    fn copy_evidence(
+        &mut self,
+        plan: RustRepresentationPlan<'_>,
+        ty: TypeId,
+        position: RustRecipePosition,
+        carriers: &HashMap<ContractSurfaceId, RirDynCarrierId>,
+        variants: &HashMap<ContractWitnessId, RirDynVariantId>,
+        fill: bool,
+    ) -> Result<(bool, Option<RirCopyEvidence>), RustRecipeGap> {
+        let structural = plan.classes.get(ty).is_some_and(|class| {
+            matches!(
+                class,
+                TypePassClass::Immediate
+                    | TypePassClass::SmallCopyInline(_)
+                    | TypePassClass::LargeInline(_)
+            )
+        });
+        let evidence = match plan.program.type_arena.data(ty) {
+            TypeData::Int
+            | TypeData::Flag(_)
+            | TypeData::Float
+            | TypeData::Bool
+            | TypeData::Char => Some(RirCopyEvidence::Leaf),
+            TypeData::Extern(id)
+                if matches!(
+                    plan.program.extern_type(*id).materialization,
+                    Some(anvyx_runtime::ExternMaterialization::Copy)
+                ) =>
+            {
+                Some(RirCopyEvidence::Leaf)
+            }
+            TypeData::Function(_)
+                if matches!(self.callables.get(&ty), Some(RirMaterializerAction::Copy)) =>
+            {
+                Some(RirCopyEvidence::Leaf)
+            }
+            TypeData::Optional(inner) if structural => {
+                let payload = self.visit(
+                    plan,
+                    *inner,
+                    child_recipe_position(position, LambdaStorageFamily::OptionalPayload),
+                    carriers,
+                    variants,
+                    fill,
+                )?;
+                self.node_copyable(payload)
+                    .then_some(RirCopyEvidence::Optional { payload })
+            }
+            TypeData::Array { elem, .. } if structural => {
+                let elem = self.visit(
+                    plan,
+                    *elem,
+                    child_recipe_position(position, LambdaStorageFamily::FixedArrayElement),
+                    carriers,
+                    variants,
+                    fill,
+                )?;
+                self.node_copyable(elem)
+                    .then_some(RirCopyEvidence::Array { elem })
+            }
+            TypeData::Tuple(fields) if structural => {
+                let fields = self.field_actions(
+                    plan,
+                    fields.iter().copied(),
+                    position,
+                    LambdaStorageFamily::TupleField,
+                    carriers,
+                    variants,
+                    fill,
+                )?;
+                fields
+                    .iter()
+                    .all(|id| self.node_copyable(*id))
+                    .then_some(RirCopyEvidence::Tuple { fields })
+            }
+            TypeData::Aggregate(aggregate) if structural => {
+                let decl = plan.program.aggregate(*aggregate);
+                match (decl.kind, decl.cycle_capable) {
+                    (AggregateKind::DataRef, _) | (_, true) => None,
+                    (AggregateKind::Struct, false) => {
+                        let family = LambdaStorageFamily::StructField;
+                        let fields = self.field_actions(
+                            plan,
+                            decl.fields.iter().map(|field| field.ty),
+                            position,
+                            family,
+                            carriers,
+                            variants,
+                            fill,
+                        )?;
+                        fields
+                            .iter()
+                            .all(|id| self.node_copyable(*id))
+                            .then_some(RirCopyEvidence::Struct { family, fields })
+                    }
+                }
+            }
+            TypeData::Enum(enm) if structural => {
+                let entries = plan
                     .program
-                    .enum_decl(*id)
+                    .enum_decl(*enm)
                     .variants
                     .iter()
                     .map(|variant| {
@@ -351,61 +669,17 @@ impl RustMaterializerGraph {
                             RustRepresentationPlan::variant_field_tys(variant),
                             position,
                             LambdaStorageFamily::EnumPayload,
+                            carriers,
+                            variants,
+                            fill,
                         )
                     })
-                    .collect::<Result<_, _>>()?;
-                Ok(RustMaterializerAction::Enum { variants })
-            }
-            TypeData::Dyn(_) => {
-                unreachable!("dynamic materializers are handled before copyability")
-            }
-            TypeData::Void
-            | TypeData::Any
-            | TypeData::Slice(_)
-            | TypeData::Extern(_)
-            | TypeData::Function(_) => Err(RustRecipeGap::UnsupportedType(ty)),
-        }
-    }
-
-    fn copy_action_supported(
-        plan: RustRepresentationPlan<'_>,
-        ty: TypeId,
-        active: &mut BTreeSet<TypeId>,
-    ) -> bool {
-        if !active.insert(ty) {
-            return true;
-        }
-        let supported = match plan.program.type_arena.data(ty) {
-            TypeData::Int
-            | TypeData::Flag(_)
-            | TypeData::Float
-            | TypeData::Bool
-            | TypeData::Char => true,
-            TypeData::Extern(_) => plan.copyable(ty),
-            TypeData::Optional(inner) | TypeData::Array { elem: inner, .. } => {
-                plan.copyable(ty) && Self::copy_action_supported(plan, *inner, active)
-            }
-            TypeData::Tuple(fields) => {
-                plan.copyable(ty)
-                    && fields
-                        .iter()
-                        .all(|field| Self::copy_action_supported(plan, *field, active))
-            }
-            TypeData::Aggregate(id) => {
-                plan.copyable(ty)
-                    && plan
-                        .program
-                        .aggregate(*id)
-                        .fields
-                        .iter()
-                        .all(|field| Self::copy_action_supported(plan, field.ty, active))
-            }
-            TypeData::Enum(id) => {
-                plan.copyable(ty)
-                    && plan.program.enum_decl(*id).variants.iter().all(|variant| {
-                        RustRepresentationPlan::variant_field_tys(variant)
-                            .all(|field| Self::copy_action_supported(plan, field, active))
-                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                entries
+                    .iter()
+                    .flatten()
+                    .all(|id| self.node_copyable(*id))
+                    .then_some(RirCopyEvidence::Enum { variants: entries })
             }
             TypeData::Void
             | TypeData::Any
@@ -415,10 +689,15 @@ impl RustMaterializerGraph {
             | TypeData::List(_)
             | TypeData::Map { .. }
             | TypeData::DataRef(_)
-            | TypeData::Dyn(_) => false,
+            | TypeData::Dyn(_)
+            | TypeData::Extern(_)
+            | TypeData::Optional(_)
+            | TypeData::Array { .. }
+            | TypeData::Tuple(_)
+            | TypeData::Aggregate(_)
+            | TypeData::Enum(_) => None,
         };
-        active.remove(&ty);
-        supported
+        Ok((evidence.is_some(), fill.then_some(evidence).flatten()))
     }
 
     fn field_actions(
@@ -427,11 +706,14 @@ impl RustMaterializerGraph {
         fields: impl IntoIterator<Item = TypeId>,
         position: RustRecipePosition,
         family: LambdaStorageFamily,
-    ) -> Result<Vec<RustMaterializerId>, RustRecipeGap> {
+        carriers: &HashMap<ContractSurfaceId, RirDynCarrierId>,
+        variants: &HashMap<ContractWitnessId, RirDynVariantId>,
+        fill: bool,
+    ) -> Result<Vec<RirMaterializerId>, RustRecipeGap> {
         let position = child_recipe_position(position, family);
         fields
             .into_iter()
-            .map(|field| self.action_for(plan, field, position))
+            .map(|field| self.visit(plan, field, position, carriers, variants, fill))
             .collect()
     }
 }
@@ -447,7 +729,6 @@ pub(super) fn child_recipe_position(
         }
         RustRecipePosition::MapKey => RustRecipePosition::MapKey,
         RustRecipePosition::Global => RustRecipePosition::Global,
-        RustRecipePosition::HeapEdge => RustRecipePosition::HeapEdge,
     }
 }
 
@@ -472,8 +753,18 @@ pub struct RustDynamicCarrierVariant {
     pub concrete_ty: TypeId,
     pub storage: RustPayloadStorage,
     pub recursive: bool,
-    pub payload_layout: Result<RustApproxLayout, RustLayoutGap>,
+    pub inline_payload_layout: Result<RustApproxLayout, RustLayoutGap>,
+    pub box_reason: Option<RustDynamicBoxReason>,
     pub lifecycle: Result<RustLifecyclePlan, RustLifecycleGap>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RustDynamicBoxReason {
+    Function,
+    FunctionField,
+    Recursive,
+    Threshold,
+    WeakeningClass(ContractSurfaceId),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -486,6 +777,65 @@ pub enum RustPayloadStorage {
 pub struct RustApproxLayout {
     pub size: u64,
     pub align: u64,
+}
+
+pub(crate) mod layout {
+    use super::RustApproxLayout;
+
+    pub(crate) fn valid(layout: RustApproxLayout) -> bool {
+        layout.align != 0 && layout.align.is_power_of_two()
+    }
+
+    pub(crate) fn repeat(layout: RustApproxLayout, count: u64) -> Option<RustApproxLayout> {
+        if !valid(layout) {
+            return None;
+        }
+        Some(RustApproxLayout {
+            size: layout.size.checked_mul(count)?,
+            align: layout.align,
+        })
+    }
+
+    pub(crate) fn fields(
+        fields: impl IntoIterator<Item = RustApproxLayout>,
+    ) -> Option<RustApproxLayout> {
+        let mut layout = RustApproxLayout { size: 0, align: 1 };
+        for field in fields {
+            if !valid(field) {
+                return None;
+            }
+            layout.size = align_up(layout.size, field.align)?.checked_add(field.size)?;
+            layout.align = layout.align.max(field.align);
+        }
+        Some(RustApproxLayout {
+            size: align_up(layout.size, layout.align)?,
+            align: layout.align,
+        })
+    }
+
+    pub(crate) fn enum_layout(
+        discriminant: RustApproxLayout,
+        payload: RustApproxLayout,
+    ) -> Option<RustApproxLayout> {
+        if !valid(discriminant) || !valid(payload) {
+            return None;
+        }
+        let align = discriminant.align.max(payload.align);
+        let payload_offset = align_up(discriminant.size, payload.align)?;
+        let size = payload_offset.checked_add(payload.size)?;
+        Some(RustApproxLayout {
+            size: align_up(size, align)?,
+            align,
+        })
+    }
+
+    fn align_up(value: u64, align: u64) -> Option<u64> {
+        if !align.is_power_of_two() {
+            return None;
+        }
+        let mask = align - 1;
+        value.checked_add(mask).map(|value| value & !mask)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -531,48 +881,21 @@ pub enum LambdaStorageFamily {
     DynamicPayload,
     OptionalPayload,
     FixedArrayElement,
-    SliceView,
     ListElement,
     MapKey,
     MapValue,
     DataRefProjection,
     GlobalRoot,
-    GlobalProjection,
     UnknownOrigin,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LambdaStorageGap {
-    StorageImplementation,
-    ProvenanceOrigin,
     Lifetime,
-    Trace,
-    GlobalRooting,
-    MapKeyEqualityHash,
-    UnsupportedType,
 }
 
 impl LambdaStorageFamily {
-    fn lambda_gap(self) -> LambdaStorageGap {
-        match self {
-            LambdaStorageFamily::MapKey => LambdaStorageGap::MapKeyEqualityHash,
-            LambdaStorageFamily::GlobalProjection => LambdaStorageGap::GlobalRooting,
-            LambdaStorageFamily::UnknownOrigin => LambdaStorageGap::ProvenanceOrigin,
-            LambdaStorageFamily::SliceView => LambdaStorageGap::Lifetime,
-            LambdaStorageFamily::GlobalRoot
-            | LambdaStorageFamily::StructField
-            | LambdaStorageFamily::TupleField
-            | LambdaStorageFamily::EnumPayload
-            | LambdaStorageFamily::DynamicPayload
-            | LambdaStorageFamily::OptionalPayload
-            | LambdaStorageFamily::FixedArrayElement
-            | LambdaStorageFamily::ListElement
-            | LambdaStorageFamily::MapValue
-            | LambdaStorageFamily::DataRefProjection => LambdaStorageGap::StorageImplementation,
-        }
-    }
-
-    fn allows_dynamic_owned(self) -> bool {
+    pub(super) fn allows_dynamic_owned(self) -> bool {
         matches!(
             self,
             Self::StructField
@@ -588,7 +911,7 @@ impl LambdaStorageFamily {
         )
     }
 
-    fn allows_function_payload(self) -> bool {
+    pub(super) fn allows_function_payload(self) -> bool {
         matches!(
             self,
             Self::StructField
@@ -616,7 +939,6 @@ fn nested_storage_family(
         ) => LambdaStorageFamily::MapKey,
         (
             LambdaStorageFamily::GlobalRoot
-            | LambdaStorageFamily::GlobalProjection
             | LambdaStorageFamily::DataRefProjection
             | LambdaStorageFamily::MapKey
             | LambdaStorageFamily::MapValue,
@@ -681,6 +1003,14 @@ pub enum RustCarrierDiscriminant {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RustPrimitiveLayout {
+    Integer,
+    Bool,
+    Char,
+    Unit,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RustTargetProfile {
     pub pointer_size: u8,
     pub pointer_align: u8,
@@ -688,16 +1018,45 @@ pub struct RustTargetProfile {
 }
 
 impl RustTargetProfile {
-    pub const AOT_64: Self = Self {
+    pub(crate) const AOT_64: Self = Self {
         pointer_size: 8,
         pointer_align: 8,
         carrier_discriminant: RustCarrierDiscriminant::U32,
     };
+
+    pub(crate) fn pointer_layout(self) -> RustApproxLayout {
+        RustApproxLayout {
+            size: u64::from(self.pointer_size),
+            align: u64::from(self.pointer_align),
+        }
+    }
+
+    pub(crate) fn inline_payload_limit(self) -> u64 {
+        u64::from(self.pointer_size) * 3
+    }
+
+    pub(crate) fn pointer_align(self) -> u64 {
+        u64::from(self.pointer_align)
+    }
+
+    pub(crate) fn carrier_discriminant_layout(self) -> RustApproxLayout {
+        match self.carrier_discriminant {
+            RustCarrierDiscriminant::U32 => RustApproxLayout { size: 4, align: 4 },
+        }
+    }
+
+    pub(crate) fn primitive_layout(self, primitive: RustPrimitiveLayout) -> RustApproxLayout {
+        match primitive {
+            RustPrimitiveLayout::Integer => self.pointer_layout(),
+            RustPrimitiveLayout::Bool => RustApproxLayout { size: 1, align: 1 },
+            RustPrimitiveLayout::Char => RustApproxLayout { size: 4, align: 4 },
+            RustPrimitiveLayout::Unit => RustApproxLayout { size: 0, align: 1 },
+        }
+    }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RustRepresentationPlanError {
-    InvalidPointerLayout { size: u8, align: u8 },
+pub(crate) fn target_profile() -> RustTargetProfile {
+    RustTargetProfile::AOT_64
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -718,34 +1077,8 @@ impl<'a> RustRepresentationPlan<'a> {
         Self {
             program,
             classes,
-            target: RustTargetProfile::AOT_64,
+            target: target_profile(),
         }
-    }
-
-    pub fn for_target(
-        program: &'a AirProgram,
-        classes: &'a TypePassClasses,
-        target: RustTargetProfile,
-    ) -> Result<Self, RustRepresentationPlanError> {
-        let valid_pointer = target.pointer_size > 0
-            && target.pointer_align.is_power_of_two()
-            && target.pointer_align <= target.pointer_size
-            && target.pointer_size.is_multiple_of(target.pointer_align);
-        if !valid_pointer {
-            return Err(RustRepresentationPlanError::InvalidPointerLayout {
-                size: target.pointer_size,
-                align: target.pointer_align,
-            });
-        }
-        Ok(Self {
-            program,
-            classes,
-            target,
-        })
-    }
-
-    pub fn target(self) -> RustTargetProfile {
-        self.target
     }
 
     pub fn dynamic_layout_plan(self) -> Result<RustDynamicLayoutPlan, RustLayoutGap> {
@@ -753,40 +1086,83 @@ impl<'a> RustRepresentationPlan<'a> {
         let graph = self.layout_graph();
         let components = strongly_connected_components(&graph);
         let weakening_classes = self.weakening_classes();
-        let mut storage = BTreeMap::new();
+        let mut direct_reasons = BTreeMap::new();
         let mut recursive_variants = BTreeSet::new();
 
         for witness in &self.program.contract_witnesses {
             let carrier = RustLayoutNode::Carrier(witness.key.surface);
             let payload = RustLayoutNode::Type(witness.key.concrete_ty);
-            let recursive = components.get(&carrier) == components.get(&payload)
-                && component_is_cyclic(&graph, carrier, &components);
+            let mut contained_carriers = BTreeSet::new();
+            self.collect_type_carriers(
+                witness.key.concrete_ty,
+                &mut BTreeSet::new(),
+                &mut contained_carriers,
+            );
+            let recursive = contained_carriers.contains(&witness.key.surface)
+                || (components.get(&carrier) == components.get(&payload)
+                    && component_is_cyclic(&graph, carrier, &components));
             let key = (witness.key.surface, witness.key.concrete_ty);
             if recursive {
                 recursive_variants.insert(key);
             }
-            storage.insert(
-                key,
-                if recursive {
-                    RustPayloadStorage::Boxed
-                } else {
-                    RustPayloadStorage::Inline
-                },
-            );
+            let reason = if matches!(
+                self.program.type_arena.data(witness.key.concrete_ty),
+                TypeData::Function(_)
+            ) {
+                Some(RustDynamicBoxReason::Function)
+            } else if recursive {
+                Some(RustDynamicBoxReason::Recursive)
+            } else {
+                None
+            };
+            direct_reasons.insert(key, reason);
         }
-        propagate_weakening_storage(&mut storage, &weakening_classes);
-
-        let initial = self.compute_layouts(&storage);
+        let mut storage = direct_reasons
+            .iter()
+            .map(|(&key, reason)| {
+                (
+                    key,
+                    if reason.is_some() {
+                        RustPayloadStorage::Boxed
+                    } else {
+                        RustPayloadStorage::Inline
+                    },
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let mut inline_layouts = self.compute_layouts(&storage);
+        loop {
+            let mut changed = false;
+            for witness in &self.program.contract_witnesses {
+                let key = (witness.key.surface, witness.key.concrete_ty);
+                if direct_reasons[&key].is_none()
+                    && self.contains_function_payload(witness.key.concrete_ty)
+                    && matches!(
+                        inline_layouts.payloads[&key],
+                        Err(RustLayoutGap::FunctionLayoutUnknown(_))
+                    )
+                {
+                    direct_reasons.insert(key, Some(RustDynamicBoxReason::FunctionField));
+                    storage.insert(key, RustPayloadStorage::Boxed);
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+            inline_layouts = self.compute_layouts(&storage);
+        }
         for witness in &self.program.contract_witnesses {
             let key = (witness.key.surface, witness.key.concrete_ty);
-            if storage[&key] == RustPayloadStorage::Inline
-                && initial.payloads.get(&key).is_some_and(|layout| {
+            if direct_reasons[&key].is_none()
+                && inline_layouts.payloads.get(&key).is_some_and(|layout| {
                     layout.as_ref().is_ok_and(|layout| {
                         layout.size > self.inline_payload_limit()
-                            || layout.align > u64::from(self.target.pointer_align)
+                            || layout.align > self.target.pointer_align()
                     })
                 })
             {
+                direct_reasons.insert(key, Some(RustDynamicBoxReason::Threshold));
                 storage.insert(key, RustPayloadStorage::Boxed);
             }
         }
@@ -802,7 +1178,20 @@ impl<'a> RustRepresentationPlan<'a> {
                 let key = (carrier.surface, variant.concrete_ty);
                 variant.storage = storage[&key];
                 variant.recursive = recursive_variants.contains(&key);
-                variant.payload_layout = layouts.payloads[&key];
+                variant.inline_payload_layout = match direct_reasons[&key] {
+                    Some(RustDynamicBoxReason::Function | RustDynamicBoxReason::FunctionField) => {
+                        Err(RustLayoutGap::FunctionLayoutUnknown(variant.concrete_ty))
+                    }
+                    Some(RustDynamicBoxReason::Recursive) => {
+                        Err(RustLayoutGap::RecursiveInline(variant.concrete_ty))
+                    }
+                    _ => inline_layouts.payloads[&key],
+                };
+                variant.box_reason = direct_reasons[&key].or_else(|| {
+                    (storage[&key] == RustPayloadStorage::Boxed).then_some(
+                        RustDynamicBoxReason::WeakeningClass(weakening_classes[&carrier.surface]),
+                    )
+                });
                 variant.lifecycle = lifecycles.variants[&key];
             }
             carrier.lifecycle = lifecycles.carriers[&carrier.surface];
@@ -826,7 +1215,8 @@ impl<'a> RustRepresentationPlan<'a> {
                 concrete_ty: witness.key.concrete_ty,
                 storage: RustPayloadStorage::Inline,
                 recursive: false,
-                payload_layout: Err(RustLayoutGap::UnsupportedType(witness.key.concrete_ty)),
+                inline_payload_layout: Err(RustLayoutGap::UnsupportedType(witness.key.concrete_ty)),
+                box_reason: None,
                 lifecycle: Err(RustLifecycleGap::UnsupportedType(witness.key.concrete_ty)),
             };
             if let Some(variants) = by_surface.get_mut(&witness.key.surface.index()) {
@@ -1260,89 +1650,15 @@ impl<'a> RustRepresentationPlan<'a> {
     }
 
     fn pointer_layout(self) -> RustApproxLayout {
-        RustApproxLayout {
-            size: u64::from(self.target.pointer_size),
-            align: u64::from(self.target.pointer_align),
-        }
+        self.target.pointer_layout()
     }
 
     fn inline_payload_limit(self) -> u64 {
-        u64::from(self.target.pointer_size) * 3
+        self.target.inline_payload_limit()
     }
 
     fn discriminant_layout(self) -> RustApproxLayout {
-        match self.target.carrier_discriminant {
-            RustCarrierDiscriminant::U32 => RustApproxLayout { size: 4, align: 4 },
-        }
-    }
-
-    fn check_recipe_position(
-        self,
-        ty: TypeId,
-        position: RustRecipePosition,
-    ) -> Result<(), RustRecipeGap> {
-        match position {
-            RustRecipePosition::Value => Ok(()),
-            RustRecipePosition::StoredPayload(family) => self
-                .storage_supported(ty, family)
-                .map_err(|_| RustRecipeGap::UnsupportedStorage { ty, family }),
-            RustRecipePosition::MapKey if self.map_key_supported(ty) => Ok(()),
-            RustRecipePosition::MapKey => Err(RustRecipeGap::UnsupportedMapKey(ty)),
-            RustRecipePosition::Global if self.global_storage_supported(ty) => Ok(()),
-            RustRecipePosition::Global => Err(RustRecipeGap::UnsupportedGlobal(ty)),
-            RustRecipePosition::HeapEdge if self.stored_payload_supported(ty) => Ok(()),
-            RustRecipePosition::HeapEdge => Err(RustRecipeGap::UnsupportedHeapEdge(ty)),
-        }
-    }
-
-    pub fn global_storage_supported(self, ty: TypeId) -> bool {
-        self.global_storage_supported_inner(ty, &mut BTreeSet::new())
-    }
-
-    fn global_storage_supported_inner(self, ty: TypeId, active: &mut BTreeSet<TypeId>) -> bool {
-        if !active.insert(ty) {
-            return true;
-        }
-        let supported = match self.program.type_arena.data(ty) {
-            TypeData::Void | TypeData::Any | TypeData::Slice(_) => false,
-            TypeData::Extern(id) => {
-                let ext = self.program.extern_type(*id);
-                ext.rep == air::ExternRep::Shared || ext.owns_heap_edges == Some(false)
-            }
-            TypeData::Function(_) => self
-                .storage_supported(ty, LambdaStorageFamily::GlobalRoot)
-                .is_ok(),
-            TypeData::List(elem) => self.global_storage_supported_inner(*elem, active),
-            TypeData::Map { key, value, .. } => {
-                self.map_key_supported(*key) && self.global_storage_supported_inner(*value, active)
-            }
-            TypeData::Optional(inner) | TypeData::Array { elem: inner, .. } => {
-                self.global_storage_supported_inner(*inner, active)
-            }
-            TypeData::Tuple(fields) => fields
-                .iter()
-                .all(|field| self.global_storage_supported_inner(*field, active)),
-            TypeData::Aggregate(id) => self
-                .program
-                .aggregate(*id)
-                .fields
-                .iter()
-                .all(|field| self.global_storage_supported_inner(field.ty, active)),
-            TypeData::Enum(id) => self.program.enum_decl(*id).variants.iter().all(|variant| {
-                Self::variant_field_tys(variant)
-                    .all(|field| self.global_storage_supported_inner(field, active))
-            }),
-            TypeData::Int
-            | TypeData::Flag(_)
-            | TypeData::Float
-            | TypeData::Bool
-            | TypeData::Char
-            | TypeData::String
-            | TypeData::DataRef(_)
-            | TypeData::Dyn(_) => true,
-        };
-        active.remove(&ty);
-        supported
+        self.target.carrier_discriminant_layout()
     }
 
     pub fn copyable(self, ty: TypeId) -> bool {
@@ -1441,287 +1757,11 @@ impl<'a> RustRepresentationPlan<'a> {
         contains
     }
 
-    pub fn storage_supported(
-        self,
-        ty: TypeId,
-        family: LambdaStorageFamily,
-    ) -> Result<(), LambdaStorageGap> {
-        self.storage_supported_inner(ty, family, false, &mut BTreeSet::new())
-    }
-
-    fn stored_payload_supported(self, ty: TypeId) -> bool {
-        self.storage_supported(ty, LambdaStorageFamily::UnknownOrigin)
-            .is_ok()
-    }
-
-    fn storage_supported_inner(
-        self,
-        ty: TypeId,
-        family: LambdaStorageFamily,
-        cycle_broken: bool,
-        active: &mut BTreeSet<TypeId>,
-    ) -> Result<(), LambdaStorageGap> {
-        if !active.insert(ty) {
-            return cycle_broken
-                .then_some(())
-                .ok_or(LambdaStorageGap::UnsupportedType);
-        }
-        let result = match self.program.type_arena.data(ty) {
-            TypeData::Int
-            | TypeData::Flag(_)
-            | TypeData::Float
-            | TypeData::Bool
-            | TypeData::Char
-            | TypeData::String
-            | TypeData::DataRef(_) => Ok(()),
-            TypeData::List(elem) => self.storage_supported_inner(
-                *elem,
-                nested_storage_family(family, LambdaStorageFamily::ListElement),
-                true,
-                active,
-            ),
-            TypeData::Map { key, value, .. } => self
-                .storage_supported_inner(
-                    *key,
-                    nested_storage_family(family, LambdaStorageFamily::MapKey),
-                    true,
-                    active,
-                )
-                .and_then(|()| {
-                    self.map_key_supported(*key)
-                        .then_some(())
-                        .ok_or(LambdaStorageGap::MapKeyEqualityHash)
-                })
-                .and_then(|()| {
-                    self.storage_supported_inner(
-                        *value,
-                        nested_storage_family(family, LambdaStorageFamily::MapValue),
-                        true,
-                        active,
-                    )
-                }),
-            TypeData::Optional(inner) => self.storage_supported_inner(
-                *inner,
-                nested_storage_family(family, LambdaStorageFamily::OptionalPayload),
-                cycle_broken,
-                active,
-            ),
-            TypeData::Array { elem, .. } => self.storage_supported_inner(
-                *elem,
-                nested_storage_family(family, LambdaStorageFamily::FixedArrayElement),
-                cycle_broken,
-                active,
-            ),
-            TypeData::Tuple(elems) => elems.iter().try_for_each(|elem| {
-                self.storage_supported_inner(
-                    *elem,
-                    nested_storage_family(family, LambdaStorageFamily::TupleField),
-                    cycle_broken,
-                    active,
-                )
-            }),
-            TypeData::Aggregate(id) => {
-                self.program
-                    .aggregate(*id)
-                    .fields
-                    .iter()
-                    .try_for_each(|field| {
-                        let field_family = match self.program.aggregate(*id).kind {
-                            AggregateKind::Struct => LambdaStorageFamily::StructField,
-                            AggregateKind::DataRef => LambdaStorageFamily::DataRefProjection,
-                        };
-                        self.storage_supported_inner(
-                            field.ty,
-                            nested_storage_family(family, field_family),
-                            cycle_broken,
-                            active,
-                        )
-                    })
-            }
-            TypeData::Enum(id) => {
-                self.program
-                    .enum_decl(*id)
-                    .variants
-                    .iter()
-                    .try_for_each(|variant| {
-                        Self::variant_field_tys(variant).try_for_each(|ty| {
-                            self.storage_supported_inner(
-                                ty,
-                                nested_storage_family(family, LambdaStorageFamily::EnumPayload),
-                                cycle_broken,
-                                active,
-                            )
-                        })
-                    })
-            }
-            TypeData::Function(_) if family.allows_function_payload() => Ok(()),
-            TypeData::Function(_) => Err(family.lambda_gap()),
-            TypeData::Slice(_) => Err(LambdaStorageGap::Lifetime),
-            TypeData::Extern(id) if self.program.extern_type(*id).rep == air::ExternRep::Shared => {
-                Ok(())
-            }
-            TypeData::Extern(id) => {
-                let decl = self.program.extern_type(*id);
-                decl.fields
-                    .iter()
-                    .map(|field| field.ty)
-                    .chain(decl.variants.iter().flat_map(Self::variant_field_tys))
-                    .try_for_each(|ty| {
-                        self.storage_supported_inner(
-                            ty,
-                            nested_storage_family(family, LambdaStorageFamily::StructField),
-                            cycle_broken,
-                            active,
-                        )
-                    })
-            }
-            TypeData::Dyn(_) if family.allows_dynamic_owned() => Ok(()),
-            TypeData::Void | TypeData::Any | TypeData::Dyn(_) => {
-                Err(LambdaStorageGap::UnsupportedType)
-            }
-        };
-        active.remove(&ty);
-        result
-    }
-
-    pub fn list_supported(self, ty: TypeId) -> bool {
-        matches!(self.program.type_arena.data(ty), TypeData::List(_))
-            && self
-                .storage_supported(ty, LambdaStorageFamily::UnknownOrigin)
-                .is_ok()
-    }
-
     fn variant_field_tys(variant: &air::VariantDecl) -> Box<dyn Iterator<Item = TypeId> + '_> {
         match &variant.shape {
             VariantShape::Unit => Box::new(std::iter::empty()),
             VariantShape::Tuple(fields) => Box::new(fields.iter().copied()),
             VariantShape::Struct(fields) => Box::new(fields.iter().map(|field| field.ty)),
-        }
-    }
-
-    pub fn map_supported(self, ty: TypeId) -> bool {
-        let TypeData::Map { key, value, .. } = self.program.type_arena.data(ty) else {
-            return false;
-        };
-        self.map_key_supported(*key) && self.map_value_supported(*value)
-    }
-
-    pub fn map_key_supported(self, ty: TypeId) -> bool {
-        self.map_key_supported_inner(ty, &mut BTreeSet::new())
-    }
-
-    fn map_key_supported_inner(self, ty: TypeId, active: &mut BTreeSet<TypeId>) -> bool {
-        if !active.insert(ty) {
-            return false;
-        }
-        let supported = match self.program.type_arena.data(ty) {
-            TypeData::Int
-            | TypeData::Flag(_)
-            | TypeData::Bool
-            | TypeData::String
-            | TypeData::Char => true,
-            TypeData::Tuple(elems) => elems
-                .iter()
-                .all(|elem| self.map_key_supported_inner(*elem, active)),
-            TypeData::Aggregate(id) => {
-                let aggregate = self.program.aggregate(*id);
-                aggregate.kind == AggregateKind::Struct
-                    && aggregate
-                        .fields
-                        .iter()
-                        .all(|field| self.map_key_supported_inner(field.ty, active))
-            }
-            TypeData::Enum(id) => self.program.enum_decl(*id).variants.iter().all(|variant| {
-                Self::variant_field_tys(variant).all(|ty| self.map_key_supported_inner(ty, active))
-            }),
-            TypeData::Float
-            | TypeData::List(_)
-            | TypeData::Map { .. }
-            | TypeData::Slice(_)
-            | TypeData::Optional(_)
-            | TypeData::Array { .. }
-            | TypeData::DataRef(_)
-            | TypeData::Extern(_)
-            | TypeData::Function(_)
-            | TypeData::Dyn(_)
-            | TypeData::Any
-            | TypeData::Void => false,
-        };
-        active.remove(&ty);
-        supported
-    }
-
-    pub fn map_value_supported(self, ty: TypeId) -> bool {
-        self.storage_supported(ty, LambdaStorageFamily::MapValue)
-            .is_ok()
-    }
-
-    pub fn supports_param_mode(self, ty: TypeId, mode: ParamMode) -> bool {
-        match mode {
-            ParamMode::Value => match self.program.type_arena.data(ty) {
-                TypeData::Optional(inner) => self.supports_param_mode(*inner, mode),
-                TypeData::Tuple(elems) => elems
-                    .iter()
-                    .all(|elem| self.supports_param_mode(*elem, mode)),
-                TypeData::Int
-                | TypeData::Flag(_)
-                | TypeData::Float
-                | TypeData::Bool
-                | TypeData::Char
-                | TypeData::Void
-                | TypeData::String
-                | TypeData::Aggregate(_)
-                | TypeData::DataRef(_)
-                | TypeData::Enum(_)
-                | TypeData::Extern(_)
-                | TypeData::Array { .. }
-                | TypeData::List(_)
-                | TypeData::Map { .. }
-                | TypeData::Slice(_)
-                | TypeData::Function(_) => true,
-                TypeData::Any | TypeData::Dyn(_) => false,
-            },
-            ParamMode::SharedBorrow => match self.program.type_arena.data(ty) {
-                TypeData::Optional(inner) => self.supports_param_mode(*inner, mode),
-                TypeData::Tuple(_)
-                | TypeData::String
-                | TypeData::Aggregate(_)
-                | TypeData::DataRef(_)
-                | TypeData::Enum(_)
-                | TypeData::Extern(_)
-                | TypeData::Array { .. }
-                | TypeData::List(_)
-                | TypeData::Map { .. }
-                | TypeData::Slice(_) => true,
-                TypeData::Int
-                | TypeData::Flag(_)
-                | TypeData::Float
-                | TypeData::Bool
-                | TypeData::Char
-                | TypeData::Void
-                | TypeData::Any
-                | TypeData::Function(_)
-                | TypeData::Dyn(_) => false,
-            },
-            ParamMode::MutBorrow => match self.program.type_arena.data(ty) {
-                TypeData::Optional(inner) => self.supports_param_mode(*inner, mode),
-                TypeData::Tuple(_)
-                | TypeData::Int
-                | TypeData::Flag(_)
-                | TypeData::Float
-                | TypeData::Bool
-                | TypeData::Char
-                | TypeData::String
-                | TypeData::Aggregate(_)
-                | TypeData::DataRef(_)
-                | TypeData::Enum(_)
-                | TypeData::Extern(_)
-                | TypeData::Array { .. }
-                | TypeData::List(_)
-                | TypeData::Map { .. }
-                | TypeData::Slice(_) => true,
-                TypeData::Void | TypeData::Any | TypeData::Function(_) | TypeData::Dyn(_) => false,
-            },
         }
     }
 }
@@ -2149,7 +2189,7 @@ impl ApproxLayoutCx<'_> {
             .map(|witness| witness.key.concrete_ty)
             .collect::<Vec<_>>();
         let layout = (|| {
-            let mut payload = RustApproxLayout { size: 0, align: 1 };
+            let mut payload = target_profile().primitive_layout(RustPrimitiveLayout::Unit);
             for ty in payloads {
                 let key = (surface, ty);
                 let layout = match self.storage[&key] {
@@ -2172,11 +2212,11 @@ impl ApproxLayoutCx<'_> {
         }
         let layout = (|| match self.plan.program.type_arena.data(ty) {
             TypeData::Int | TypeData::Flag(_) | TypeData::Float => {
-                Ok(RustApproxLayout { size: 8, align: 8 })
+                Ok(target_profile().primitive_layout(RustPrimitiveLayout::Integer))
             }
-            TypeData::Bool => Ok(RustApproxLayout { size: 1, align: 1 }),
-            TypeData::Char => Ok(RustApproxLayout { size: 4, align: 4 }),
-            TypeData::Void => Ok(RustApproxLayout { size: 0, align: 1 }),
+            TypeData::Bool => Ok(target_profile().primitive_layout(RustPrimitiveLayout::Bool)),
+            TypeData::Char => Ok(target_profile().primitive_layout(RustPrimitiveLayout::Char)),
+            TypeData::Void => Ok(target_profile().primitive_layout(RustPrimitiveLayout::Unit)),
             TypeData::String => repeat_layout(self.plan.pointer_layout(), 3),
             TypeData::List(_) | TypeData::Map { .. } | TypeData::DataRef(_) => {
                 Ok(self.plan.pointer_layout())
@@ -2185,7 +2225,10 @@ impl ApproxLayoutCx<'_> {
             TypeData::Function(_) => Err(RustLayoutGap::FunctionLayoutUnknown(ty)),
             TypeData::Optional(inner) => {
                 let payload = self.type_layout(*inner)?;
-                enum_layout(RustApproxLayout { size: 1, align: 1 }, payload)
+                enum_layout(
+                    target_profile().primitive_layout(RustPrimitiveLayout::Bool),
+                    payload,
+                )
             }
             TypeData::Array { elem, len } => {
                 let elem = self.type_layout(*elem)?;
@@ -2204,7 +2247,7 @@ impl ApproxLayoutCx<'_> {
                     .map(|field| field.ty),
             ),
             TypeData::Enum(id) => {
-                let mut payload = RustApproxLayout { size: 0, align: 1 };
+                let mut payload = target_profile().primitive_layout(RustPrimitiveLayout::Unit);
                 for variant in &self.plan.program.enum_decl(*id).variants {
                     let layout =
                         self.fields_layout(RustRepresentationPlan::variant_field_tys(variant))?;
@@ -2239,16 +2282,11 @@ impl ApproxLayoutCx<'_> {
         &mut self,
         fields: impl IntoIterator<Item = TypeId>,
     ) -> Result<RustApproxLayout, RustLayoutGap> {
-        let mut layout = RustApproxLayout { size: 0, align: 1 };
+        let mut layouts = vec![];
         for field in fields {
-            let field = self.type_layout(field)?;
-            layout.size = align_up(layout.size, field.align)?
-                .checked_add(field.size)
-                .ok_or(RustLayoutGap::ArithmeticOverflow)?;
-            layout.align = layout.align.max(field.align);
+            layouts.push(self.type_layout(field)?);
         }
-        layout.size = align_up(layout.size, layout.align)?;
-        Ok(layout)
+        layout::fields(layouts).ok_or(RustLayoutGap::ArithmeticOverflow)
     }
 }
 
@@ -2285,37 +2323,14 @@ fn merge_lifecycles(
 }
 
 fn repeat_layout(layout: RustApproxLayout, count: u64) -> Result<RustApproxLayout, RustLayoutGap> {
-    Ok(RustApproxLayout {
-        size: layout
-            .size
-            .checked_mul(count)
-            .ok_or(RustLayoutGap::ArithmeticOverflow)?,
-        align: layout.align,
-    })
+    layout::repeat(layout, count).ok_or(RustLayoutGap::ArithmeticOverflow)
 }
 
 fn enum_layout(
     discriminant: RustApproxLayout,
     payload: RustApproxLayout,
 ) -> Result<RustApproxLayout, RustLayoutGap> {
-    let align = discriminant.align.max(payload.align);
-    let payload_offset = align_up(discriminant.size, payload.align)?;
-    let size = payload_offset
-        .checked_add(payload.size)
-        .ok_or(RustLayoutGap::ArithmeticOverflow)?;
-    Ok(RustApproxLayout {
-        size: align_up(size, align)?,
-        align,
-    })
-}
-
-fn align_up(value: u64, align: u64) -> Result<u64, RustLayoutGap> {
-    debug_assert!(align.is_power_of_two());
-    let mask = align - 1;
-    value
-        .checked_add(mask)
-        .map(|value| value & !mask)
-        .ok_or(RustLayoutGap::ArithmeticOverflow)
+    layout::enum_layout(discriminant, payload).ok_or(RustLayoutGap::ArithmeticOverflow)
 }
 
 fn strongly_connected_components(
@@ -2455,88 +2470,42 @@ impl<'a> RirRustRepPolicy<'a> {
         Self { program }
     }
 
-    pub fn value_rep(self, ty: RirTypeId) -> RustValueRep {
-        match self.ty(ty) {
-            RirType::Int
-            | RirType::Flag(_)
-            | RirType::Float
-            | RirType::Bool
-            | RirType::Char
-            | RirType::Void => RustValueRep::InlineCopy,
-            RirType::String => RustValueRep::CowString,
-            RirType::Array { .. } => RustValueRep::InlineArray,
-            RirType::List(_) => RustValueRep::CowList,
-            RirType::Map { .. } => RustValueRep::CowMap,
-            RirType::Slice(_) => RustValueRep::Opaque,
-            RirType::Lambda(sig) if self.lambda_sig_copyable(sig) => RustValueRep::InlineCopy,
-            RirType::Option(_) | RirType::Lambda(_) => RustValueRep::InlineEnum,
-            RirType::Struct(_) | RirType::Tuple(_) => RustValueRep::InlineStruct,
-            RirType::DataRef(_) => RustValueRep::HeapHandle,
-            RirType::Enum(id) => self.enum_rep(id),
-        }
-    }
-
-    pub fn cow_value(self, ty: RirTypeId) -> bool {
-        matches!(
-            self.value_rep(ty),
-            RustValueRep::CowString | RustValueRep::CowList | RustValueRep::CowMap
-        )
-    }
-
-    pub fn param_abi(self, semantic: RirParamSemantic) -> RirParamAbi {
-        match semantic {
-            RirParamSemantic::Value => RirParamAbi::Value,
-            RirParamSemantic::SharedBorrow => RirParamAbi::SharedBorrow,
-            RirParamSemantic::MutBorrow => RirParamAbi::MutBorrow,
-            RirParamSemantic::MutPlace => RirParamAbi::MutPlace,
-            RirParamSemantic::DynBorrow => RirParamAbi::DynBorrow,
-            RirParamSemantic::ScopedLambda => RirParamAbi::ScopedLambda,
-            RirParamSemantic::EscapingLambda => RirParamAbi::EscapingLambda,
-            RirParamSemantic::AnvCallback => RirParamAbi::AnvCallback,
-            RirParamSemantic::StackCell => RirParamAbi::StackCell,
-            RirParamSemantic::HeapCell => RirParamAbi::HeapCell,
-            RirParamSemantic::ScopedPlaceCell => RirParamAbi::ScopedPlaceCell,
-        }
-    }
-
-    pub fn supports_param(self, ty: RirTypeId, semantic: RirParamSemantic) -> bool {
+    pub fn supports_param(self, ty: RirTypeId, mode: RirPassMode) -> bool {
         self.ty_opt(ty)
-            .is_some_and(|ty_data| self.supports_type_semantic(ty_data, semantic))
+            .is_some_and(|ty_data| self.supports_type_pass_mode(ty_data, mode))
     }
 
-    pub fn call_arg_abi(self, ty: RirTypeId, semantic: RirParamSemantic) -> Option<RirParamAbi> {
-        self.supports_param(ty, semantic)
-            .then(|| self.param_abi(semantic))
-    }
-
-    pub fn capture_shareable(self, ty: RirTypeId) -> bool {
-        self.copyable(ty)
+    pub fn capture_shareable_with(
+        self,
+        ty: RirTypeId,
+        copyable: impl Fn(RirTypeId) -> bool + Copy,
+    ) -> bool {
+        copyable(ty)
             || match self.ty(ty) {
                 RirType::String | RirType::DataRef(_) | RirType::List(_) | RirType::Map { .. } => {
                     true
                 }
                 RirType::Option(inner) | RirType::Array { elem: inner, .. } => {
-                    self.embedded_capture_shareable(inner)
+                    self.embedded_capture_shareable_with(inner, copyable)
                 }
-                RirType::Lambda(sig) => self.lambda_sig_cloneable(sig),
+                RirType::Lambda(sig) => self.lambda_sig_cloneable_with(sig, copyable),
                 RirType::Struct(id) => self.program.structs[id.index()]
                     .fields
                     .iter()
-                    .all(|field| self.embedded_capture_shareable(field.ty)),
+                    .all(|field| self.embedded_capture_shareable_with(field.ty, copyable)),
                 RirType::Tuple(id) => self.program.tuples[id.index()]
                     .fields
                     .iter()
-                    .all(|field| self.embedded_capture_shareable(field.ty)),
+                    .all(|field| self.embedded_capture_shareable_with(field.ty, copyable)),
                 RirType::Enum(id) if self.program.dyn_carrier_for_enum(id).is_some() => true,
                 RirType::Enum(id) => {
                     self.program.enums[id.index()]
                         .variants
                         .iter()
                         .all(|variant| {
-                            variant
-                                .fields
-                                .iter()
-                                .all(|field| self.embedded_capture_shareable(field.ty))
+                            variant.fields.iter().all(|field| {
+                                self.embedded_capture_shareable_with(field.ty, copyable)
+                            })
                         })
                 }
                 RirType::Slice(_)
@@ -2549,8 +2518,12 @@ impl<'a> RirRustRepPolicy<'a> {
             }
     }
 
-    fn embedded_capture_shareable(self, ty: RirTypeId) -> bool {
-        !matches!(self.ty(ty), RirType::Slice(_)) && self.capture_shareable(ty)
+    fn embedded_capture_shareable_with(
+        self,
+        ty: RirTypeId,
+        copyable: impl Fn(RirTypeId) -> bool + Copy,
+    ) -> bool {
+        !matches!(self.ty(ty), RirType::Slice(_)) && self.capture_shareable_with(ty, copyable)
     }
 
     pub fn value_from_ref_supported(self, ty: RirTypeId) -> bool {
@@ -2560,123 +2533,35 @@ impl<'a> RirRustRepPolicy<'a> {
             .is_some_and(Option::is_some)
     }
 
-    pub(super) fn map_key_supported(self, ty: RirTypeId) -> bool {
-        self.map_key_supported_inner(ty, &mut BTreeSet::new())
-    }
-
-    fn map_key_supported_inner(self, ty: RirTypeId, active: &mut BTreeSet<RirTypeId>) -> bool {
-        if !active.insert(ty) {
-            return false;
-        }
-        let supported = match self.ty_opt(ty) {
-            Some(
-                RirType::Int | RirType::Bool | RirType::String | RirType::Char | RirType::Flag(_),
-            ) => true,
-            Some(RirType::Struct(id)) => {
-                self.program.structs.get(id.index()).is_some_and(|strukt| {
-                    strukt.native_path.is_none()
-                        && self.record_key_supported(&strukt.fields, active)
-                })
-            }
-            Some(RirType::Tuple(id)) => self
-                .program
-                .tuples
-                .get(id.index())
-                .is_some_and(|tuple| self.record_key_supported(&tuple.fields, active)),
-            Some(RirType::Enum(id)) => self
-                .program
-                .enums
-                .get(id.index())
-                .is_some_and(|enm| self.enum_key_supported(enm, active)),
-            Some(
-                RirType::Float
-                | RirType::List(_)
-                | RirType::Map { .. }
-                | RirType::Slice(_)
-                | RirType::Option(_)
-                | RirType::Array { .. }
-                | RirType::DataRef(_)
-                | RirType::Lambda(_)
-                | RirType::Void,
-            )
-            | None => false,
-        };
-        active.remove(&ty);
-        supported
-    }
-
-    fn record_key_supported(self, fields: &[RirField], active: &mut BTreeSet<RirTypeId>) -> bool {
-        fields
+    fn declaration_ty(self, expected: RirType) -> RirTypeId {
+        self.program
+            .types
             .iter()
-            .all(|field| self.map_key_supported_inner(field.ty, active))
+            .position(|ty| *ty == expected)
+            .map(RirTypeId::from_index)
+            .expect("verified declaration type")
     }
 
-    fn enum_key_supported(self, enm: &RirEnum, active: &mut BTreeSet<RirTypeId>) -> bool {
-        enm.variants
+    fn has_materializer(self, ty: RirTypeId, position: RustRecipePosition) -> bool {
+        self.program
+            .materializers
             .iter()
-            .all(|variant| self.record_key_supported(&variant.fields, active))
+            .any(|entry| entry.ty == ty && entry.position == position)
     }
 
-    fn contains_dynamic(self, ty: RirTypeId, active: &mut BTreeSet<RirTypeId>) -> bool {
-        if !active.insert(ty) {
-            return false;
-        }
-        let contains = match self.ty_opt(ty) {
-            Some(RirType::Enum(id)) if self.program.dyn_carrier_for_enum(id).is_some() => true,
-            Some(
-                RirType::List(inner)
-                | RirType::Slice(inner)
-                | RirType::Option(inner)
-                | RirType::Array { elem: inner, .. },
-            ) => self.contains_dynamic(inner, active),
-            Some(RirType::Map { key, value }) => {
-                self.contains_dynamic(key, active) || self.contains_dynamic(value, active)
-            }
-            Some(RirType::Struct(id)) => self.program.structs[id.index()]
-                .fields
-                .iter()
-                .any(|field| self.contains_dynamic(field.ty, active)),
-            Some(RirType::Tuple(id)) => self.program.tuples[id.index()]
-                .fields
-                .iter()
-                .any(|field| self.contains_dynamic(field.ty, active)),
-            Some(RirType::Enum(id)) => {
-                self.program.enums[id.index()]
-                    .variants
-                    .iter()
-                    .any(|variant| {
-                        variant
-                            .fields
-                            .iter()
-                            .any(|field| self.contains_dynamic(field.ty, active))
-                    })
-            }
-            _ => false,
-        };
-        active.remove(&ty);
-        contains
-    }
-
-    pub fn type_contains_dynamic(self, ty: RirTypeId) -> bool {
-        self.contains_dynamic(ty, &mut BTreeSet::new())
-    }
-
-    pub fn record_derives(self, fields: &[RirField], copyable: bool) -> Vec<&'static str> {
-        let mut derives = if copyable {
+    pub fn record_derives(self, ty: RirTypeId) -> Vec<&'static str> {
+        let mut derives = if self.copyable(ty) {
             vec!["Clone", "Copy"]
         } else {
             vec![]
         };
-        let contains_dynamic = fields
-            .iter()
-            .any(|field| self.type_contains_dynamic(field.ty));
-        if !contains_dynamic && self.record_key_supported(fields, &mut BTreeSet::new()) {
+        if self.has_materializer(ty, RustRecipePosition::MapKey) {
             derives.extend(["PartialEq", "Eq", "Hash"]);
         }
         derives
     }
 
-    pub fn flag_derives(self) -> Vec<&'static str> {
+    pub fn flag_derives() -> Vec<&'static str> {
         vec!["Clone", "Copy", "PartialEq", "Eq", "Hash"]
     }
 
@@ -2684,18 +2569,13 @@ impl<'a> RirRustRepPolicy<'a> {
         if self.program.dyn_carrier_for_enum(enm.id).is_some() {
             return vec![];
         }
-        let mut derives = if enm.copyable {
+        let ty = self.declaration_ty(RirType::Enum(enm.id));
+        let mut derives = if self.copyable(ty) {
             vec!["Clone", "Copy"]
         } else {
             vec![]
         };
-        let contains_dynamic = enm.variants.iter().any(|variant| {
-            variant
-                .fields
-                .iter()
-                .any(|field| self.type_contains_dynamic(field.ty))
-        });
-        let key_supported = !contains_dynamic && self.enum_key_supported(enm, &mut BTreeSet::new());
+        let key_supported = self.has_materializer(ty, RustRecipePosition::MapKey);
         if enm.is_unit_only() || key_supported {
             derives.extend(["PartialEq", "Eq"]);
         }
@@ -2705,201 +2585,12 @@ impl<'a> RirRustRepPolicy<'a> {
         derives
     }
 
-    pub fn contains_function_payload(self, ty: RirTypeId) -> bool {
-        self.contains_function_payload_inner(ty, &mut BTreeSet::new())
+    pub fn struct_ty(self, id: RirStructId) -> RirTypeId {
+        self.declaration_ty(RirType::Struct(id))
     }
 
-    fn contains_function_payload_inner(
-        self,
-        ty: RirTypeId,
-        active: &mut BTreeSet<RirTypeId>,
-    ) -> bool {
-        if !active.insert(ty) {
-            return false;
-        }
-        let contains = match self.ty_opt(ty) {
-            Some(RirType::Lambda(_)) => true,
-            Some(
-                RirType::List(elem)
-                | RirType::Slice(elem)
-                | RirType::Option(elem)
-                | RirType::Array { elem, .. },
-            ) => self.contains_function_payload_inner(elem, active),
-            Some(RirType::Map { key, value }) => {
-                self.contains_function_payload_inner(key, active)
-                    || self.contains_function_payload_inner(value, active)
-            }
-            Some(RirType::Struct(id)) => {
-                self.program.structs.get(id.index()).is_some_and(|strukt| {
-                    strukt
-                        .fields
-                        .iter()
-                        .any(|field| self.contains_function_payload_inner(field.ty, active))
-                })
-            }
-            Some(RirType::DataRef(id)) => {
-                self.program
-                    .datarefs
-                    .get(id.index())
-                    .is_some_and(|dataref| {
-                        dataref
-                            .fields
-                            .iter()
-                            .any(|field| self.contains_function_payload_inner(field.ty, active))
-                    })
-            }
-            Some(RirType::Tuple(id)) => self.program.tuples.get(id.index()).is_some_and(|tuple| {
-                tuple
-                    .fields
-                    .iter()
-                    .any(|field| self.contains_function_payload_inner(field.ty, active))
-            }),
-            Some(RirType::Enum(id)) => self.program.enums.get(id.index()).is_some_and(|enm| {
-                enm.variants.iter().any(|variant| {
-                    variant
-                        .fields
-                        .iter()
-                        .any(|field| self.contains_function_payload_inner(field.ty, active))
-                })
-            }),
-            Some(
-                RirType::Int
-                | RirType::Flag(_)
-                | RirType::Float
-                | RirType::Bool
-                | RirType::Char
-                | RirType::Void
-                | RirType::String,
-            )
-            | None => false,
-        };
-        active.remove(&ty);
-        contains
-    }
-
-    pub fn storage_supported(
-        self,
-        ty: RirTypeId,
-        family: LambdaStorageFamily,
-    ) -> Result<(), LambdaStorageGap> {
-        self.storage_supported_inner(ty, family, false, &mut BTreeSet::new())
-    }
-
-    fn storage_supported_inner(
-        self,
-        ty: RirTypeId,
-        family: LambdaStorageFamily,
-        cycle_broken: bool,
-        active: &mut BTreeSet<RirTypeId>,
-    ) -> Result<(), LambdaStorageGap> {
-        if !active.insert(ty) {
-            return cycle_broken
-                .then_some(())
-                .ok_or(LambdaStorageGap::UnsupportedType);
-        }
-        let result = match self.ty_opt(ty) {
-            Some(
-                RirType::Int
-                | RirType::Flag(_)
-                | RirType::Float
-                | RirType::Bool
-                | RirType::Char
-                | RirType::String
-                | RirType::DataRef(_),
-            ) => Ok(()),
-            Some(RirType::List(elem)) => self.storage_supported_inner(
-                elem,
-                nested_storage_family(family, LambdaStorageFamily::ListElement),
-                true,
-                active,
-            ),
-            Some(RirType::Map { key, value }) => self
-                .storage_supported_inner(
-                    key,
-                    nested_storage_family(family, LambdaStorageFamily::MapKey),
-                    true,
-                    active,
-                )
-                .and_then(|()| {
-                    self.map_key_supported(key)
-                        .then_some(())
-                        .ok_or(LambdaStorageGap::MapKeyEqualityHash)
-                })
-                .and_then(|()| {
-                    self.storage_supported_inner(
-                        value,
-                        nested_storage_family(family, LambdaStorageFamily::MapValue),
-                        true,
-                        active,
-                    )
-                }),
-            Some(RirType::Option(inner)) => self.storage_supported_inner(
-                inner,
-                nested_storage_family(family, LambdaStorageFamily::OptionalPayload),
-                cycle_broken,
-                active,
-            ),
-            Some(RirType::Array { elem, .. }) => self.storage_supported_inner(
-                elem,
-                nested_storage_family(family, LambdaStorageFamily::FixedArrayElement),
-                cycle_broken,
-                active,
-            ),
-            Some(RirType::Struct(id)) => self
-                .program
-                .structs
-                .get(id.index())
-                .ok_or(LambdaStorageGap::UnsupportedType)
-                .and_then(|strukt| {
-                    strukt.fields.iter().try_for_each(|field| {
-                        self.storage_supported_inner(
-                            field.ty,
-                            nested_storage_family(family, LambdaStorageFamily::StructField),
-                            cycle_broken,
-                            active,
-                        )
-                    })
-                }),
-            Some(RirType::Tuple(id)) => self
-                .program
-                .tuples
-                .get(id.index())
-                .ok_or(LambdaStorageGap::UnsupportedType)
-                .and_then(|tuple| {
-                    tuple.fields.iter().try_for_each(|field| {
-                        self.storage_supported_inner(
-                            field.ty,
-                            nested_storage_family(family, LambdaStorageFamily::TupleField),
-                            cycle_broken,
-                            active,
-                        )
-                    })
-                }),
-            Some(RirType::Enum(id)) if self.program.dyn_carrier_for_enum(id).is_some() => Ok(()),
-            Some(RirType::Enum(id)) => self
-                .program
-                .enums
-                .get(id.index())
-                .ok_or(LambdaStorageGap::UnsupportedType)
-                .and_then(|enm| {
-                    enm.variants.iter().try_for_each(|variant| {
-                        variant.fields.iter().try_for_each(|field| {
-                            self.storage_supported_inner(
-                                field.ty,
-                                nested_storage_family(family, LambdaStorageFamily::EnumPayload),
-                                cycle_broken,
-                                active,
-                            )
-                        })
-                    })
-                }),
-            Some(RirType::Lambda(_)) if family.allows_function_payload() => Ok(()),
-            Some(RirType::Lambda(_)) => Err(family.lambda_gap()),
-            Some(RirType::Slice(_)) => Err(LambdaStorageGap::Lifetime),
-            Some(RirType::Void) | None => Err(LambdaStorageGap::UnsupportedType),
-        };
-        active.remove(&ty);
-        result
+    pub fn tuple_ty(self, id: RirTupleId) -> RirTypeId {
+        self.declaration_ty(RirType::Tuple(id))
     }
 
     pub fn borrow_view(self, ty: RirTypeId) -> RustBorrowView {
@@ -2910,52 +2601,52 @@ impl<'a> RirRustRepPolicy<'a> {
         }
     }
 
-    pub fn param_ty(self, ty: RirTypeId, abi: RirParamAbi) -> String {
-        self.param_ty_with_lifetime(ty, abi, None)
+    pub fn param_ty(self, ty: RirTypeId, mode: RirPassMode) -> String {
+        self.param_ty_with_lifetime(ty, mode, None)
     }
 
     pub fn callable_param_ty(
         self,
         ty: RirTypeId,
-        abi: RirParamAbi,
+        mode: RirPassMode,
         escape: RirParamEscape,
     ) -> String {
-        if abi == RirParamAbi::Value && escape == RirParamEscape::Escaping {
+        if mode == RirPassMode::Value && escape == RirParamEscape::Escaping {
             self.escaping_value_ty(ty)
         } else {
-            self.param_ty(ty, abi)
+            self.param_ty(ty, mode)
         }
     }
 
-    pub fn capture_field_ty(self, ty: RirTypeId, abi: RirParamAbi) -> String {
-        self.param_ty_with_lifetime(ty, abi, Some("'env"))
+    pub fn capture_field_ty(self, ty: RirTypeId, mode: RirPassMode) -> String {
+        self.param_ty_with_lifetime(ty, mode, Some("'env"))
     }
 
     fn param_ty_with_lifetime(
         self,
         ty: RirTypeId,
-        abi: RirParamAbi,
+        mode: RirPassMode,
         lifetime: Option<&str>,
     ) -> String {
         let reference_lifetime = lifetime.map_or(String::new(), |lifetime| format!("{lifetime} "));
-        match abi {
-            RirParamAbi::Value => self.rust_ty(ty),
-            RirParamAbi::SharedBorrow => match self.borrow_view(ty) {
+        match mode {
+            RirPassMode::Value => self.rust_ty(ty),
+            RirPassMode::SharedBorrow => match self.borrow_view(ty) {
                 RustBorrowView::Str => format!("&{reference_lifetime}str"),
                 _ => format!(
                     "&{reference_lifetime}{}",
                     self.rust_ty_with_env_lifetime(ty, lifetime)
                 ),
             },
-            RirParamAbi::MutBorrow => format!(
+            RirPassMode::MutBorrow => format!(
                 "&{reference_lifetime}mut {}",
                 self.rust_ty_with_env_lifetime(ty, lifetime)
             ),
-            RirParamAbi::MutPlace => {
+            RirPassMode::MutPlace => {
                 let payload = self.rust_ty(ty);
                 format!("{}<'_, 'cx, {payload}>", target::mut_place_ty())
             }
-            RirParamAbi::DynBorrow => {
+            RirPassMode::DynBorrow => {
                 let Some(RirType::Enum(id)) = self.program.types.get(ty.index()) else {
                     unreachable!("verified dynamic borrow carrier type")
                 };
@@ -2965,21 +2656,21 @@ impl<'a> RirRustRepPolicy<'a> {
                     .expect("verified dynamic borrow carrier");
                 format!("{}<'_, 'cx>", self.program.dyn_borrow_symbol(carrier.id))
             }
-            RirParamAbi::ScopedLambda => self.scoped_lambda_ty(ty),
-            RirParamAbi::EscapingLambda => self.escaping_lambda_ty(ty),
-            RirParamAbi::AnvCallback => self.anv_callback_ty(ty),
-            RirParamAbi::StackCell => {
+            RirPassMode::ScopedLambda => self.scoped_lambda_ty(ty),
+            RirPassMode::EscapingLambda => self.escaping_lambda_ty(ty),
+            RirPassMode::AnvCallback => self.anv_callback_ty(ty),
+            RirPassMode::StackCell => {
                 let payload = self.rust_ty(ty);
                 format!(
                     "&{reference_lifetime}{}",
                     target::stack_lambda_cell_ty(&payload)
                 )
             }
-            RirParamAbi::HeapCell => {
+            RirPassMode::HeapCell => {
                 let payload = self.rust_ty(ty);
                 target::handle_ty(&target::lambda_cell_ty(&payload))
             }
-            RirParamAbi::ScopedPlaceCell => {
+            RirPassMode::ScopedPlaceCell => {
                 let payload = self.rust_ty(ty);
                 let source_lifetime = lifetime.unwrap_or("'_");
                 format!(
@@ -3010,7 +2701,7 @@ impl<'a> RirRustRepPolicy<'a> {
             variant
                 .captures
                 .iter()
-                .any(|capture| capture.semantic == RirParamSemantic::MutBorrow)
+                .any(|capture| capture.mode == RirPassMode::MutBorrow)
         });
         LambdaSigLayout {
             variants,
@@ -3073,7 +2764,7 @@ impl<'a> RirRustRepPolicy<'a> {
     pub fn lambda_sig_ty(self, id: RirLambdaSigId) -> String {
         format!(
             "{}{}",
-            self.lambda_sig_symbol(id),
+            Self::lambda_sig_symbol(id),
             self.lambda_sig_ty_generics(id)
         )
     }
@@ -3093,7 +2784,7 @@ impl<'a> RirRustRepPolicy<'a> {
     pub fn lambda_sig_assoc_path(self, id: RirLambdaSigId) -> String {
         format!(
             "{}{}",
-            self.lambda_sig_symbol(id),
+            Self::lambda_sig_symbol(id),
             self.lambda_sig_assoc_generics(id)
         )
     }
@@ -3122,7 +2813,7 @@ impl<'a> RirRustRepPolicy<'a> {
         }
     }
 
-    pub fn lambda_sig_symbol(self, id: RirLambdaSigId) -> String {
+    pub fn lambda_sig_symbol(id: RirLambdaSigId) -> String {
         format!("LambdaSig{}", id.index())
     }
 
@@ -3131,7 +2822,7 @@ impl<'a> RirRustRepPolicy<'a> {
             (RirType::Lambda(sig), Some(lifetime)) => {
                 format!(
                     "{}{}",
-                    self.lambda_sig_symbol(sig),
+                    Self::lambda_sig_symbol(sig),
                     self.lambda_sig_ty_generics_with_lifetime(sig, lifetime)
                 )
             }
@@ -3216,7 +2907,7 @@ impl<'a> RirRustRepPolicy<'a> {
             has_mut_borrow |= lambda
                 .captures
                 .iter()
-                .any(|capture| capture.abi == RirParamAbi::MutBorrow);
+                .any(|capture| capture.mode == RirPassMode::MutBorrow);
         }
         has_cell && has_mut_borrow
     }
@@ -3232,21 +2923,21 @@ impl<'a> RirRustRepPolicy<'a> {
         lambda: &RirLambda,
         capture: &RirLambdaCapture,
     ) -> LambdaCaptureLayoutEdge {
-        match capture.abi {
-            RirParamAbi::Value if matches!(lambda.storage, RirLambdaStorage::HeapEnv { .. }) => {
+        match capture.mode {
+            RirPassMode::Value if matches!(lambda.storage, RirLambdaStorage::HeapEnv { .. }) => {
                 LambdaCaptureLayoutEdge::HeapEnvField
             }
-            RirParamAbi::Value => LambdaCaptureLayoutEdge::InlineValue,
-            RirParamAbi::SharedBorrow => LambdaCaptureLayoutEdge::SharedBorrow,
-            RirParamAbi::MutBorrow => LambdaCaptureLayoutEdge::MutBorrow,
-            RirParamAbi::StackCell => LambdaCaptureLayoutEdge::StackCell,
-            RirParamAbi::HeapCell => LambdaCaptureLayoutEdge::HeapCell,
-            RirParamAbi::ScopedPlaceCell => LambdaCaptureLayoutEdge::ScopedPlaceCell,
-            RirParamAbi::MutPlace
-            | RirParamAbi::DynBorrow
-            | RirParamAbi::ScopedLambda
-            | RirParamAbi::EscapingLambda
-            | RirParamAbi::AnvCallback => LambdaCaptureLayoutEdge::Unsupported,
+            RirPassMode::Value => LambdaCaptureLayoutEdge::InlineValue,
+            RirPassMode::SharedBorrow => LambdaCaptureLayoutEdge::SharedBorrow,
+            RirPassMode::MutBorrow => LambdaCaptureLayoutEdge::MutBorrow,
+            RirPassMode::StackCell => LambdaCaptureLayoutEdge::StackCell,
+            RirPassMode::HeapCell => LambdaCaptureLayoutEdge::HeapCell,
+            RirPassMode::ScopedPlaceCell => LambdaCaptureLayoutEdge::ScopedPlaceCell,
+            RirPassMode::MutPlace
+            | RirPassMode::DynBorrow
+            | RirPassMode::ScopedLambda
+            | RirPassMode::EscapingLambda
+            | RirPassMode::AnvCallback => LambdaCaptureLayoutEdge::Unsupported,
         }
     }
 
@@ -3304,60 +2995,71 @@ impl<'a> RirRustRepPolicy<'a> {
     }
 
     pub fn lambda_sig_copyable(self, id: RirLambdaSigId) -> bool {
-        !self.lambda_sig_has_heap_env(id)
-            && self.program.lambdas_for_sig(id).all(|lambda| {
-                lambda
-                    .captures
-                    .iter()
-                    .all(|capture| capture.abi != RirParamAbi::HeapCell)
-            })
-            && self.lambda_sig_copyable_inner(id, &mut BTreeSet::new())
+        self.lambda_sig_copyable_with(id, |ty| self.copyable(ty))
     }
 
-    pub fn lambda_sig_cloneable(self, id: RirLambdaSigId) -> bool {
-        self.lambda_sig_has_heap_env(id)
-            || self.program.lambdas_for_sig(id).all(|lambda| {
-                lambda.captures.iter().all(|capture| match capture.abi {
-                    RirParamAbi::Value => self.copyable(capture.ty),
-                    RirParamAbi::SharedBorrow
-                    | RirParamAbi::StackCell
-                    | RirParamAbi::HeapCell
-                    | RirParamAbi::ScopedPlaceCell => true,
-                    RirParamAbi::MutBorrow
-                    | RirParamAbi::MutPlace
-                    | RirParamAbi::DynBorrow
-                    | RirParamAbi::ScopedLambda
-                    | RirParamAbi::EscapingLambda
-                    | RirParamAbi::AnvCallback => false,
+    pub fn lambda_sig_copyable_with(
+        self,
+        id: RirLambdaSigId,
+        copyable: impl Fn(RirTypeId) -> bool,
+    ) -> bool {
+        !self.lambda_sig_has_heap_env(id)
+            && self.program.lambdas_for_sig(id).all(|lambda| {
+                lambda.captures.iter().all(|capture| match capture.mode {
+                    RirPassMode::Value => copyable(capture.ty),
+                    RirPassMode::SharedBorrow
+                    | RirPassMode::StackCell
+                    | RirPassMode::ScopedPlaceCell => true,
+                    RirPassMode::MutBorrow
+                    | RirPassMode::MutPlace
+                    | RirPassMode::DynBorrow
+                    | RirPassMode::ScopedLambda
+                    | RirPassMode::EscapingLambda
+                    | RirPassMode::AnvCallback
+                    | RirPassMode::HeapCell => false,
                 })
             })
     }
 
-    fn lambda_sig_copyable_inner(
+    pub fn lambda_sig_cloneable(self, id: RirLambdaSigId) -> bool {
+        self.lambda_sig_cloneable_with(id, |ty| self.copyable(ty))
+    }
+
+    pub fn lambda_sig_derives(self, id: RirLambdaSigId) -> &'static [&'static str] {
+        let ty = self.declaration_ty(RirType::Lambda(id));
+        let materializer = self.program.value_materializers[ty.index()]
+            .and_then(|id| self.program.materializers.get(id.index()))
+            .expect("verified lambda materializer");
+        if materializer.is_copy() {
+            &["Clone", "Copy"]
+        } else if matches!(materializer.action, RirMaterializerAction::CallableShare) {
+            &["Clone"]
+        } else {
+            &[]
+        }
+    }
+
+    pub fn lambda_sig_cloneable_with(
         self,
         id: RirLambdaSigId,
-        active: &mut BTreeSet<RirLambdaSigId>,
+        copyable: impl Fn(RirTypeId) -> bool,
     ) -> bool {
-        if !active.insert(id) {
-            return false;
-        }
-        let copyable = self.program.lambdas_for_sig(id).all(|lambda| {
-            lambda.captures.iter().all(|capture| match capture.abi {
-                RirParamAbi::Value => self.copyable_inner(capture.ty, active),
-                RirParamAbi::SharedBorrow
-                | RirParamAbi::StackCell
-                | RirParamAbi::HeapCell
-                | RirParamAbi::ScopedPlaceCell => true,
-                RirParamAbi::MutBorrow
-                | RirParamAbi::MutPlace
-                | RirParamAbi::DynBorrow
-                | RirParamAbi::ScopedLambda
-                | RirParamAbi::EscapingLambda
-                | RirParamAbi::AnvCallback => false,
+        self.lambda_sig_has_heap_env(id)
+            || self.program.lambdas_for_sig(id).all(|lambda| {
+                lambda.captures.iter().all(|capture| match capture.mode {
+                    RirPassMode::Value => copyable(capture.ty),
+                    RirPassMode::SharedBorrow
+                    | RirPassMode::StackCell
+                    | RirPassMode::HeapCell
+                    | RirPassMode::ScopedPlaceCell => true,
+                    RirPassMode::MutBorrow
+                    | RirPassMode::MutPlace
+                    | RirPassMode::DynBorrow
+                    | RirPassMode::ScopedLambda
+                    | RirPassMode::EscapingLambda
+                    | RirPassMode::AnvCallback => false,
+                })
             })
-        });
-        active.remove(&id);
-        copyable
     }
 
     pub fn fields_cx_dependent(self, fields: &[RirField]) -> bool {
@@ -3450,7 +3152,7 @@ impl<'a> RirRustRepPolicy<'a> {
             (true, false) | (false, true) => "<'cx>",
             (false, false) => "",
         };
-        format!("{}{generics}", self.lambda_sig_symbol(id))
+        format!("{}{generics}", Self::lambda_sig_symbol(id))
     }
 
     pub fn dataref_cx_dependent(self, dataref: &RirDataRef) -> bool {
@@ -3523,7 +3225,7 @@ impl<'a> RirRustRepPolicy<'a> {
                 lambda
                     .captures
                     .iter()
-                    .any(|capture| capture.abi == RirParamAbi::HeapCell)
+                    .any(|capture| capture.mode == RirPassMode::HeapCell)
             })
     }
 
@@ -3535,7 +3237,7 @@ impl<'a> RirRustRepPolicy<'a> {
             .captures
             .iter()
             .enumerate()
-            .filter_map(|(index, capture)| (capture.abi == RirParamAbi::HeapCell).then_some(index))
+            .filter_map(|(index, capture)| (capture.mode == RirPassMode::HeapCell).then_some(index))
             .collect::<Vec<_>>();
         if cells.is_empty() {
             LambdaTraceAction::Noop
@@ -3667,37 +3369,21 @@ impl<'a> RirRustRepPolicy<'a> {
     }
 
     pub fn copyable(self, ty: RirTypeId) -> bool {
-        self.copyable_inner(ty, &mut BTreeSet::new())
+        matches!(self.ty(ty), RirType::Void)
+            || self
+                .program
+                .value_materializers
+                .get(ty.index())
+                .copied()
+                .flatten()
+                .and_then(|id| self.program.materializers.get(id.index()))
+                .is_some_and(RirMaterializer::is_copy)
     }
 
-    fn copyable_inner(self, ty: RirTypeId, active: &mut BTreeSet<RirLambdaSigId>) -> bool {
-        match self.ty(ty) {
-            RirType::Int
-            | RirType::Flag(_)
-            | RirType::Float
-            | RirType::Bool
-            | RirType::Char
-            | RirType::Void => true,
-            RirType::String
-            | RirType::DataRef(_)
-            | RirType::List(_)
-            | RirType::Map { .. }
-            | RirType::Slice(_) => false,
-            RirType::Lambda(id) => {
-                !self.lambda_sig_has_heap_env(id) && self.lambda_sig_copyable_inner(id, active)
-            }
-            RirType::Option(inner) => self.copyable_inner(inner, active),
-            RirType::Array { elem, .. } => self.copyable_inner(elem, active),
-            RirType::Struct(id) => self.program.structs[id.index()].copyable,
-            RirType::Enum(id) => self.program.enums[id.index()].copyable,
-            RirType::Tuple(id) => self.program.tuples[id.index()].copyable,
-        }
-    }
-
-    fn supports_type_semantic(self, ty: RirType, semantic: RirParamSemantic) -> bool {
-        match semantic {
-            RirParamSemantic::Value => match ty {
-                RirType::Option(inner) => self.supports_param(inner, semantic),
+    fn supports_type_pass_mode(self, ty: RirType, mode: RirPassMode) -> bool {
+        match mode {
+            RirPassMode::Value => match ty {
+                RirType::Option(inner) => self.supports_param(inner, mode),
                 RirType::Int
                 | RirType::Flag(_)
                 | RirType::Float
@@ -3716,10 +3402,10 @@ impl<'a> RirRustRepPolicy<'a> {
                 RirType::Tuple(id) => self.program.tuples[id.index()]
                     .fields
                     .iter()
-                    .all(|field| self.supports_param(field.ty, semantic)),
+                    .all(|field| self.supports_param(field.ty, mode)),
             },
-            RirParamSemantic::SharedBorrow => match ty {
-                RirType::Option(inner) => self.supports_param(inner, semantic),
+            RirPassMode::SharedBorrow => match ty {
+                RirType::Option(inner) => self.supports_param(inner, mode),
                 RirType::String
                 | RirType::Struct(_)
                 | RirType::Tuple(_)
@@ -3737,8 +3423,8 @@ impl<'a> RirRustRepPolicy<'a> {
                 | RirType::Char
                 | RirType::Void => false,
             },
-            RirParamSemantic::MutBorrow => match ty {
-                RirType::Option(inner) => self.supports_param(inner, semantic),
+            RirPassMode::MutBorrow => match ty {
+                RirType::Option(inner) => self.supports_param(inner, mode),
                 RirType::Int
                 | RirType::Flag(_)
                 | RirType::Float
@@ -3754,28 +3440,17 @@ impl<'a> RirRustRepPolicy<'a> {
                 | RirType::Map { .. } => true,
                 RirType::Void | RirType::Slice(_) | RirType::Lambda(_) => false,
             },
-            RirParamSemantic::ScopedLambda
-            | RirParamSemantic::EscapingLambda
-            | RirParamSemantic::AnvCallback => matches!(ty, RirType::Lambda(_)),
-            RirParamSemantic::DynBorrow => match ty {
+            RirPassMode::ScopedLambda | RirPassMode::EscapingLambda | RirPassMode::AnvCallback => {
+                matches!(ty, RirType::Lambda(_))
+            }
+            RirPassMode::DynBorrow => match ty {
                 RirType::Enum(id) => self.program.dyn_carrier_for_enum(id).is_some(),
                 _ => false,
             },
-            RirParamSemantic::MutPlace
-            | RirParamSemantic::StackCell
-            | RirParamSemantic::HeapCell
-            | RirParamSemantic::ScopedPlaceCell => !matches!(ty, RirType::Void),
-        }
-    }
-
-    fn enum_rep(self, id: RirEnumId) -> RustValueRep {
-        let enum_ = &self.program.enums[id.index()];
-        match enum_.raw_type {
-            Some(ty) => match self.ty(ty) {
-                RirType::String => RustValueRep::RawStringEnum,
-                _ => RustValueRep::RawIntEnum,
-            },
-            None => RustValueRep::InlineEnum,
+            RirPassMode::MutPlace
+            | RirPassMode::StackCell
+            | RirPassMode::HeapCell
+            | RirPassMode::ScopedPlaceCell => !matches!(ty, RirType::Void),
         }
     }
 
@@ -3798,7 +3473,7 @@ pub struct RustTracePlan {
 }
 
 impl RustTracePlan {
-    pub fn build(program: &RirProgram) -> Self {
+    pub fn build(program: &RirProgram, retained_callback_sigs: &[RirLambdaSigId]) -> Self {
         let mut plan = Self::default();
         let policy = RirRustRepPolicy::new(program);
         for (index, ty) in program.types.iter().enumerate() {
@@ -3851,7 +3526,7 @@ impl RustTracePlan {
                 plan.mark_type(program, global.ty);
             }
         }
-        for sig in program.retained_callback_sigs() {
+        for &sig in retained_callback_sigs {
             plan.mark_lambda_sig(program, sig);
         }
         plan
@@ -3887,7 +3562,7 @@ impl RustTracePlan {
             RirType::Option(inner) => self.mark_type(program, inner),
             RirType::Struct(id) => {
                 let strukt = &program.structs[id.index()];
-                if strukt.native_path.is_some() {
+                if strukt.native.is_some() {
                     return;
                 }
                 self.structs.insert(id);

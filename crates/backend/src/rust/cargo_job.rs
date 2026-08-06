@@ -12,7 +12,7 @@ use std::{
 
 use sha2::{Digest, Sha256};
 
-use super::emit::RustSource;
+use super::RustSource;
 
 pub const RUST_CARGO_FINGERPRINT_SCHEMA: &str = "anvyx-cargo-v1";
 pub const RUST_CARGO_IDENTITY_SCHEMA: &str = "anvyx-cargo-id-v1";

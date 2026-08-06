@@ -1,9 +1,7 @@
 use super::{
-    dataref_place::{self as dataref_paths},
     rir::{
-        RirDataRefId, RirField, RirFunction, RirLocalId, RirMutPlaceArg, RirOptionPayloadBinding,
-        RirOptionSubject, RirParamAbi, RirPlace, RirPlaceModel, RirPlaceRoot, RirProgram,
-        RirProjection, RirStmt, RirStructuredBlock, RirType, RirTypeId, stmt_child_blocks_any,
+        RirFunction, RirLocalBinding, RirPassMode, RirPlace, RirPlaceRoot, RirPlaceStep,
+        RirPlaceStepKind, RirProgram, RirType, RirTypeId,
     },
     syntax::comma,
     target,
@@ -13,6 +11,45 @@ use super::{
 struct RenderedPlace {
     expr: String,
     ty: RirTypeId,
+}
+
+pub(super) fn dataref_storage_path(program: &RirProgram, storage: &[RirPlaceStep]) -> String {
+    let fields = storage
+        .iter()
+        .map(|step| field_step_symbol(program, step))
+        .collect::<Vec<_>>()
+        .join(".");
+    format!("storage.{fields}")
+}
+
+pub(super) fn field_step_symbol<'a>(program: &'a RirProgram, step: &RirPlaceStep) -> &'a str {
+    match step.kind {
+        RirPlaceStepKind::DataRefField(field) => {
+            let RirType::DataRef(dataref) = program.types[step.source_ty.index()] else {
+                unreachable!("verified dataref field projection")
+            };
+            program.datarefs[dataref.index()].fields[field.index()]
+                .symbol
+                .as_str()
+        }
+        RirPlaceStepKind::StructField(field) | RirPlaceStepKind::ExternField(field) => {
+            let RirType::Struct(strukt) = program.types[step.source_ty.index()] else {
+                unreachable!("verified struct field projection")
+            };
+            program.structs[strukt.index()].fields[field.index()]
+                .symbol
+                .as_str()
+        }
+        RirPlaceStepKind::TupleField(field) => {
+            let RirType::Tuple(tuple) = program.types[step.source_ty.index()] else {
+                unreachable!("verified tuple field projection")
+            };
+            program.tuples[tuple.index()].fields[field.index()]
+                .symbol
+                .as_str()
+        }
+        _ => unreachable!("verified field projection"),
+    }
 }
 
 pub(super) struct SliceIndexAccess {
@@ -46,44 +83,6 @@ pub(super) enum MutPlaceProjectionStep {
     SliceIndex {
         index: String,
     },
-}
-
-pub(super) struct ProjectionFacts {
-    pub(super) fallible_projection: bool,
-}
-
-pub(super) fn place_dynamic_facts(
-    program: &RirProgram,
-    function: &RirFunction,
-    place: &RirPlace,
-) -> Option<ProjectionFacts> {
-    let RirPlaceRoot::Local(local) = place.root else {
-        return None;
-    };
-    dynamic_facts_from(
-        program,
-        function.locals.get(local.index())?.ty,
-        &place.projections,
-    )
-}
-
-pub(super) fn mut_place_dynamic_facts(
-    program: &RirProgram,
-    arg: &RirMutPlaceArg,
-) -> Option<ProjectionFacts> {
-    dynamic_facts_from(program, arg.access.ty()?, &arg.projections)
-}
-
-fn dynamic_facts_from(
-    program: &RirProgram,
-    ty: RirTypeId,
-    projections: &[RirProjection],
-) -> Option<ProjectionFacts> {
-    let fallible_projection =
-        RirPlaceModel::new(program).projection_dynamic_facts(ty, projections)?;
-    Some(ProjectionFacts {
-        fallible_projection,
-    })
 }
 
 pub(super) fn projected_ops_ctor(ops: &str, inits: &[(String, String)]) -> String {
@@ -131,20 +130,12 @@ impl<'a> RustPlaces<'a> {
         rendered
     }
 
-    pub(super) fn storage_path(
-        &self,
-        dataref: RirDataRefId,
-        projections: &[RirProjection],
-    ) -> String {
-        dataref_paths::storage_path(self.program, dataref, projections)
-    }
-
     pub(super) fn projected_expr(
         &self,
         root_ty: RirTypeId,
         root: &str,
         slot_ty: RirTypeId,
-        projections: &[RirProjection],
+        projections: &[RirPlaceStep],
     ) -> Option<String> {
         let mut rendered = RenderedPlace {
             expr: root.to_string(),
@@ -154,24 +145,18 @@ impl<'a> RustPlaces<'a> {
         (rendered.ty == slot_ty).then_some(rendered.expr)
     }
 
-    pub(super) fn record_field_place(&self, place: &RirPlace, field: &RirField) -> RirPlace {
-        let projection = match self.program.types[place.ty.index()] {
-            RirType::Struct(_) => RirProjection::Field(field.id),
-            RirType::Tuple(_) => RirProjection::TupleField(field.id),
-            _ => unreachable!("verified record field place"),
-        };
-        let mut child = place.clone();
-        child.projections.push(projection);
-        child.ty = field.ty;
-        child
-    }
-
     pub(super) fn shared_borrow_root_param(&self, place: &RirPlace) -> bool {
         let RirPlaceRoot::Local(local) = place.root else {
             unreachable!("expected a local RIR place")
         };
         place.projections.is_empty()
-            && self.param_abi_for_local(local) == Some(RirParamAbi::SharedBorrow)
+            && matches!(
+                self.function.locals[local.index()].binding,
+                RirLocalBinding::Parameter {
+                    mode: RirPassMode::SharedBorrow,
+                    ..
+                }
+            )
     }
 
     pub(super) fn physical_ref_root(&self, place: &RirPlace) -> bool {
@@ -179,8 +164,13 @@ impl<'a> RustPlaces<'a> {
             return false;
         };
         place.projections.is_empty()
-            && (self.param_abi_for_local(local) == Some(RirParamAbi::SharedBorrow)
-                || self.payload_ref_cell_local(local))
+            && matches!(
+                self.function.locals[local.index()].binding,
+                RirLocalBinding::Parameter {
+                    mode: RirPassMode::SharedBorrow,
+                    ..
+                } | RirLocalBinding::ScopedPlacePayload
+            )
     }
 
     pub(super) fn mut_place_root_param(&self, place: &RirPlace) -> bool {
@@ -188,7 +178,13 @@ impl<'a> RustPlaces<'a> {
             unreachable!("expected a local RIR place")
         };
         place.projections.is_empty()
-            && (self.local_is_mut_place_param(local) || self.payload_ref_cell_local(local))
+            && matches!(
+                self.function.locals[local.index()].binding,
+                RirLocalBinding::Parameter {
+                    mode: RirPassMode::MutPlace,
+                    ..
+                } | RirLocalBinding::ScopedPlacePayload
+            )
     }
 
     pub(super) fn mut_place_projection(&self, place: &RirPlace) -> Option<MutPlaceProjection> {
@@ -196,19 +192,29 @@ impl<'a> RustPlaces<'a> {
             unreachable!("expected a local RIR place")
         };
         if place.projections.is_empty()
-            || !(self.local_is_mut_place_param(root) || self.payload_ref_cell_local(root))
+            || !matches!(
+                self.function.locals[root.index()].binding,
+                RirLocalBinding::Parameter {
+                    mode: RirPassMode::MutPlace,
+                    ..
+                } | RirLocalBinding::ScopedPlacePayload
+            )
         {
             return None;
         }
         let local = &self.function.locals[root.index()];
-        let payload_ref_root = self.payload_ref_cell_local(root);
+        let payload_ref_root = matches!(local.binding, RirLocalBinding::ScopedPlacePayload);
         let root_expr = if payload_ref_root {
             target::mut_place_scoped_cell(&format!("&{}", local.symbol.as_str()))
         } else {
             local.symbol.as_str().to_string()
         };
-        let mut projection =
-            self.projected_mut_place(local.ty, &root_expr, place.ty, &place.projections)?;
+        let mut projection = self.projected_mut_place(
+            local.ty,
+            &root_expr,
+            self.program.verified_place_ty(self.function, place),
+            &place.projections,
+        )?;
         projection.root_owned = payload_ref_root;
         Some(projection)
     }
@@ -218,7 +224,7 @@ impl<'a> RustPlaces<'a> {
         root_ty: RirTypeId,
         root: &str,
         slot_ty: RirTypeId,
-        projections: &[RirProjection],
+        projections: &[RirPlaceStep],
     ) -> Option<MutPlaceProjection> {
         self.projected_place_impl(root_ty, root, slot_ty, projections, false)
     }
@@ -228,7 +234,7 @@ impl<'a> RustPlaces<'a> {
         root_ty: RirTypeId,
         root: &str,
         slot_ty: RirTypeId,
-        projections: &[RirProjection],
+        projections: &[RirPlaceStep],
     ) -> Option<MutPlaceProjection> {
         self.projected_place_impl(root_ty, root, slot_ty, projections, true)
     }
@@ -238,11 +244,10 @@ impl<'a> RustPlaces<'a> {
         root_ty: RirTypeId,
         root: &str,
         slot_ty: RirTypeId,
-        projections: &[RirProjection],
+        projections: &[RirPlaceStep],
         root_is_mut_place: bool,
     ) -> Option<MutPlaceProjection> {
-        let path = RirPlaceModel::new(self.program).projection_path(root_ty, projections)?;
-        if path.ty() != slot_ty {
+        if projections.last().map_or(root_ty, |step| step.target_ty) != slot_ty {
             return None;
         }
         let mut ty = root_ty;
@@ -250,8 +255,12 @@ impl<'a> RustPlaces<'a> {
         let mut inits = vec![];
         let mut steps = vec![];
         for projection in projections {
-            match projection {
-                RirProjection::Field(field_id) => {
+            if projection.source_ty != ty {
+                return None;
+            }
+            match projection.kind {
+                RirPlaceStepKind::StructField(field_id)
+                | RirPlaceStepKind::ExternField(field_id) => {
                     let RirType::Struct(struct_id) = self.program.types[ty.index()] else {
                         return None;
                     };
@@ -259,9 +268,8 @@ impl<'a> RustPlaces<'a> {
                     steps.push(MutPlaceProjectionStep::Field(
                         field.symbol.as_str().to_string(),
                     ));
-                    ty = field.ty;
                 }
-                RirProjection::TupleField(field_id) => {
+                RirPlaceStepKind::TupleField(field_id) => {
                     let RirType::Tuple(tuple_id) = self.program.types[ty.index()] else {
                         return None;
                     };
@@ -269,46 +277,47 @@ impl<'a> RustPlaces<'a> {
                     steps.push(MutPlaceProjectionStep::Field(
                         field.symbol.as_str().to_string(),
                     ));
-                    ty = field.ty;
                 }
-                RirProjection::Index(index) => {
+                RirPlaceStepKind::ArrayIndex { index, len, .. } => {
                     let local = self.function.locals[index.index()].symbol.as_str();
                     let field = format!("__i{}", fields.len());
                     fields.push(format!("{field}: i64"));
                     inits.push((field.clone(), local.to_string()));
-                    match self.program.types[ty.index()] {
-                        RirType::Array { elem, len } => {
-                            steps.push(MutPlaceProjectionStep::ArrayIndex { index: field, len });
-                            ty = elem;
-                        }
-                        RirType::List(elem) => {
-                            let version = format!("__v{}", fields.len());
-                            let body = if root_is_mut_place {
-                                target::mut_place_access_ctx(
-                                    root,
-                                    target::runtime_param_name(),
-                                    &Self::projection_version_body(&steps)?,
-                                )
-                            } else {
-                                format!("{}?", Self::projection_version_body_from(root, &steps)?)
-                            };
-                            fields.push(format!("{version}: u64"));
-                            inits.push((version.clone(), body));
-                            steps.push(MutPlaceProjectionStep::ListIndex {
-                                index: field,
-                                version,
-                                ty,
-                            });
-                            ty = elem;
-                        }
-                        RirType::Slice(elem) => {
-                            steps.push(MutPlaceProjectionStep::SliceIndex { index: field });
-                            ty = elem;
-                        }
-                        _ => return None,
-                    }
+                    steps.push(MutPlaceProjectionStep::ArrayIndex { index: field, len });
                 }
+                RirPlaceStepKind::ListIndex { index, .. } => {
+                    let local = self.function.locals[index.index()].symbol.as_str();
+                    let field = format!("__i{}", fields.len());
+                    fields.push(format!("{field}: i64"));
+                    inits.push((field.clone(), local.to_string()));
+                    let version = format!("__v{}", fields.len());
+                    let body = if root_is_mut_place {
+                        target::mut_place_access_ctx(
+                            root,
+                            target::runtime_param_name(),
+                            &Self::projection_version_body(&steps)?,
+                        )
+                    } else {
+                        format!("{}?", Self::projection_version_body_from(root, &steps)?)
+                    };
+                    fields.push(format!("{version}: u64"));
+                    inits.push((version.clone(), body));
+                    steps.push(MutPlaceProjectionStep::ListIndex {
+                        index: field,
+                        version,
+                        ty,
+                    });
+                }
+                RirPlaceStepKind::SliceIndex { index, .. } => {
+                    let local = self.function.locals[index.index()].symbol.as_str();
+                    let field = format!("__i{}", fields.len());
+                    fields.push(format!("{field}: i64"));
+                    inits.push((field.clone(), local.to_string()));
+                    steps.push(MutPlaceProjectionStep::SliceIndex { index: field });
+                }
+                RirPlaceStepKind::DataRefField(_) => return None,
             }
+            ty = projection.target_ty;
         }
         Some(MutPlaceProjection {
             root: root.to_string(),
@@ -351,7 +360,7 @@ impl<'a> RustPlaces<'a> {
                     "{{ let index = {checked}; {} }}",
                     target::list_with_elem_shared_short(
                         expr,
-                        "rt",
+                        target::runtime_param_name(),
                         "index",
                         &target::collection_structural_version(expr),
                         &body,
@@ -362,40 +371,18 @@ impl<'a> RustPlaces<'a> {
         }
     }
 
-    pub(super) fn dynamic_place_access(&self, place: &RirPlace) -> Option<SliceIndexAccess> {
-        self.slice_index_dynamic_access(place)
-    }
-
-    fn slice_index_dynamic_access(&self, place: &RirPlace) -> Option<SliceIndexAccess> {
+    pub(super) fn slice_index_access(&self, place: &RirPlace) -> Option<SliceIndexAccess> {
         let (last, prefix) = place.projections.split_last()?;
-        let RirProjection::Index(index) = last else {
-            return None;
+        let (index, list_root) = match last.kind {
+            RirPlaceStepKind::ListIndex { index, .. } => (index, true),
+            RirPlaceStepKind::SliceIndex { index, .. } => (index, false),
+            _ => return None,
         };
         let RirPlaceRoot::Local(root) = place.root else {
             unreachable!("expected a local RIR place")
         };
-        let mut base =
-            RirPlace::local(root, prefix.to_vec(), self.function.locals[root.index()].ty);
-        for projection in prefix {
-            base.ty = match (self.program.types[base.ty.index()], projection) {
-                (RirType::Struct(id), RirProjection::Field(field)) => {
-                    self.program.structs[id.index()].fields[field.index()].ty
-                }
-                (RirType::Tuple(id), RirProjection::TupleField(field)) => {
-                    self.program.tuples[id.index()].fields[field.index()].ty
-                }
-                (RirType::Array { elem, .. } | RirType::List(elem), RirProjection::Index(_)) => {
-                    elem
-                }
-                _ => return None,
-            };
-        }
+        let base = RirPlace::local(root, prefix.to_vec());
         let rendered = self.local_place_with_ty(&base);
-        let list_root = match self.program.types[rendered.ty.index()] {
-            RirType::Slice(_) => false,
-            RirType::List(_) => true,
-            _ => return None,
-        };
         Some(SliceIndexAccess {
             slice: rendered.expr,
             index: self.function.locals[index.index()]
@@ -411,137 +398,83 @@ impl<'a> RustPlaces<'a> {
         let RirPlaceRoot::Local(local) = place.root else {
             unreachable!("expected a local RIR place")
         };
-        self.function.locals[local.index()].payload_ref && !self.payload_ref_cell_local(local)
-            || self.param_abi_for_local(local) == Some(RirParamAbi::MutBorrow)
-    }
-
-    fn local_is_mut_place_param(&self, local: RirLocalId) -> bool {
-        self.param_abi_for_local(local) == Some(RirParamAbi::MutPlace)
-    }
-
-    pub(super) fn payload_ref_cell_local(&self, local: RirLocalId) -> bool {
-        self.function.locals[local.index()].payload_ref
-            && block_has_mut_place_payload(&self.function.body, local)
-    }
-
-    fn param_abi_for_local(&self, local: RirLocalId) -> Option<RirParamAbi> {
-        self.function
-            .params
-            .iter()
-            .find(|param| param.local == local)
-            .map(|param| param.abi)
-    }
-
-    fn sequence_materializer_closure(&self, ty: RirTypeId) -> String {
-        let materializer = self
-            .program
-            .sequence_elem_materializer(ty)
-            .expect("verified sequence storage declaration");
-        let body =
-            RustValues::new(self.program, self.function).materialize_ref(materializer, "value");
-        target::materializer_closure("value", &body)
+        matches!(
+            self.function.locals[local.index()].binding,
+            RirLocalBinding::DirectPayload
+                | RirLocalBinding::Parameter {
+                    mode: RirPassMode::MutBorrow,
+                    ..
+                }
+        )
     }
 
     fn apply_projections(
         &self,
         rendered: &mut RenderedPlace,
-        projections: &[RirProjection],
+        projections: &[RirPlaceStep],
         allow_list_index: bool,
     ) {
         for projection in projections {
-            match projection {
-                RirProjection::Field(field_id) => {
-                    let RirType::Struct(struct_id) = self.program.types[rendered.ty.index()] else {
-                        unreachable!("verified field projection")
-                    };
-                    let field = &self.program.structs[struct_id.index()].fields[field_id.index()];
+            debug_assert_eq!(rendered.ty, projection.source_ty);
+            match projection.kind {
+                RirPlaceStepKind::StructField(_)
+                | RirPlaceStepKind::ExternField(_)
+                | RirPlaceStepKind::TupleField(_) => {
                     rendered.expr.push('.');
-                    rendered.expr.push_str(field.symbol.as_str());
-                    rendered.ty = field.ty;
+                    rendered
+                        .expr
+                        .push_str(field_step_symbol(self.program, projection));
                 }
-                RirProjection::TupleField(field_id) => {
-                    let RirType::Tuple(tuple_id) = self.program.types[rendered.ty.index()] else {
-                        unreachable!("verified tuple projection")
-                    };
-                    let field = &self.program.tuples[tuple_id.index()].fields[field_id.index()];
-                    rendered.expr.push('.');
-                    rendered.expr.push_str(field.symbol.as_str());
-                    rendered.ty = field.ty;
-                }
-                RirProjection::Index(index) => {
+                RirPlaceStepKind::ArrayIndex { index, len, .. } => {
                     let index = self.function.locals[index.index()].symbol.as_str();
-                    match self.program.types[rendered.ty.index()] {
-                        RirType::Array { elem, len } => {
-                            let array = rendered.expr.clone();
-                            let checked =
-                                target::checked_index_result(index, &len.to_string(), "array");
-                            rendered.expr = format!("({array})[{checked}]");
-                            rendered.ty = elem;
-                        }
-                        RirType::List(elem) if allow_list_index => {
-                            let materialize = self.sequence_materializer_closure(rendered.ty);
-                            let list = rendered.expr.clone();
-                            let checked =
-                                target::checked_index_result(index, "__anv_list.len()", "list");
-                            rendered.expr = format!(
-                                "{{ let __anv_list = &({list}); let index = {checked}; {}? }}",
-                                target::list_elem_at_shared(
-                                    "__anv_list",
-                                    target::runtime_param_name(),
-                                    "index",
-                                    &target::collection_structural_version("__anv_list"),
-                                    &materialize,
-                                )
-                            );
-                            rendered.ty = elem;
-                        }
-                        RirType::Slice(elem) => {
-                            let materialize = self.sequence_materializer_closure(rendered.ty);
-                            rendered.expr = format!(
-                                "{}?",
-                                target::slice_elem_at_shared(
-                                    &rendered.expr,
-                                    target::runtime_param_name(),
-                                    index,
-                                    &materialize,
-                                )
-                            );
-                            rendered.ty = elem;
-                        }
-                        _ => unreachable!("verified index projection"),
-                    }
+                    let array = rendered.expr.clone();
+                    let checked = target::checked_index_result(index, &len.to_string(), "array");
+                    rendered.expr = format!("({array})[{checked}]");
+                }
+                RirPlaceStepKind::ListIndex {
+                    index,
+                    elem_materializer,
+                } if allow_list_index => {
+                    let index = self.function.locals[index.index()].symbol.as_str();
+                    let materialize = RustValues::new(self.program, self.function)
+                        .materialize_ref(elem_materializer, "value");
+                    let materialize = target::materializer_closure("value", &materialize);
+                    let list = rendered.expr.clone();
+                    let checked = target::checked_index_result(index, "__anv_list.len()", "list");
+                    rendered.expr = format!(
+                        "{{ let __anv_list = &({list}); let index = {checked}; {}? }}",
+                        target::list_elem_at_shared(
+                            "__anv_list",
+                            target::runtime_param_name(),
+                            "index",
+                            &target::collection_structural_version("__anv_list"),
+                            &materialize,
+                        )
+                    );
+                }
+                RirPlaceStepKind::SliceIndex {
+                    index,
+                    elem_materializer,
+                } => {
+                    let index = self.function.locals[index.index()].symbol.as_str();
+                    let materialize = RustValues::new(self.program, self.function)
+                        .materialize_ref(elem_materializer, "value");
+                    let materialize = target::materializer_closure("value", &materialize);
+                    rendered.expr = format!(
+                        "{}?",
+                        target::slice_elem_at_shared(
+                            &rendered.expr,
+                            target::runtime_param_name(),
+                            index,
+                            &materialize,
+                        )
+                    );
+                }
+                RirPlaceStepKind::ListIndex { .. } | RirPlaceStepKind::DataRefField(_) => {
+                    unreachable!("verified projection")
                 }
             }
+            rendered.ty = projection.target_ty;
         }
-    }
-}
-
-fn block_has_mut_place_payload(block: &RirStructuredBlock, local: RirLocalId) -> bool {
-    block.stmts.iter().any(|stmt| {
-        stmt_has_mut_place_payload(stmt, local)
-            || stmt_child_blocks_any(stmt, |block| block_has_mut_place_payload(block, local))
-    })
-}
-
-fn stmt_has_mut_place_payload(stmt: &RirStmt, local: RirLocalId) -> bool {
-    match stmt {
-        RirStmt::DynMatch(match_) => {
-            match_
-                .arms
-                .iter()
-                .any(|arm| arm.binding == super::rir::RirDynMatchBinding::Alias(local))
-                || matches!(
-                    match_.fallback_binding,
-                    super::rir::RirDynMatchFallbackBinding::Alias(binding) if binding == local
-                )
-        }
-        RirStmt::OptionMatch(match_) => {
-            matches!(
-                match_.payload,
-                Some(RirOptionPayloadBinding::Ref { local: payload, .. }) if payload == local
-            ) && matches!(match_.subject, RirOptionSubject::MutPlace(_))
-        }
-        RirStmt::MapEntryMatch(match_) => match_.payload == Some(local),
-        _ => false,
     }
 }

@@ -6,13 +6,13 @@ use std::{
 
 pub use anvyx_backend::rust::cargo_job::RustCargoProfile;
 use anvyx_backend::rust::{
+    RustPlanError, RustSource, RustTargetGap, RustTargetGaps,
     cargo_job::{
         self, RustCargoBatchCase, RustCargoBatchOutput, RustCargoCrateIdentityInput,
         RustCargoDependency, RustCargoDependencySource, RustCargoEvent, RustCargoFailure,
         RustCargoMode, RustCargoName, RustCargoOutput, RustCargoPackageMetadata,
         RustCargoPackageName, RustCargoSuccess, host_executable_name,
     },
-    emit::RustSource,
 };
 use anvyx_lang::{AirBuildError, AirBuildOutput, DiagnosticReport, FrontendConfig};
 use anvyx_runtime::{RustProviderSupport, validate_rust_provider_support};
@@ -32,12 +32,12 @@ pub struct RunInput {
 }
 
 #[derive(Debug, Clone)]
-pub enum Event {
-    Checking { file: PathBuf },
-    Checked { report: DiagnosticReport },
+pub enum Event<'a> {
+    Checking { file: &'a Path },
+    Checked { report: &'a DiagnosticReport },
     GeneratingRust,
     CompilingRust,
-    Running { file: PathBuf },
+    Running { file: &'a Path },
 }
 
 #[derive(Debug, Clone)]
@@ -75,9 +75,22 @@ pub struct BuildInput {
 }
 
 #[derive(Debug)]
+pub struct RustTargetDiagnostics {
+    pub gaps: RustTargetGaps,
+    pub report: DiagnosticReport,
+}
+
+impl std::fmt::Display for RustTargetDiagnostics {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.gaps)
+    }
+}
+
+#[derive(Debug)]
 pub enum Error {
     Air(AirBuildError<anvyx_lang::CheckError>),
-    Plan(anvyx_backend::rust::RustPlanError),
+    TargetDiagnostics(RustTargetDiagnostics),
+    Plan(RustPlanError),
     Cargo(cargo_job::RustCargoError),
     Dependency(String),
     CargoBuild(Box<RustCargoFailure>),
@@ -88,6 +101,7 @@ impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Air(error) => write!(f, "{}", air_error_ref(error)),
+            Self::TargetDiagnostics(output) => write!(f, "{output}"),
             Self::Plan(error) => write!(f, "{error}"),
             Self::Cargo(error) => write!(f, "{error}"),
             Self::Dependency(error) => write!(f, "{error}"),
@@ -127,7 +141,10 @@ pub fn run(input: RunInput) -> Result<RunOutput, Error> {
     run_with_events(input, |_| {})
 }
 
-pub fn run_with_events(input: RunInput, mut events: impl FnMut(Event)) -> Result<RunOutput, Error> {
+pub fn run_with_events(
+    input: RunInput,
+    mut events: impl for<'a> FnMut(&Event<'a>),
+) -> Result<RunOutput, Error> {
     let cache_root = input
         .cache_root
         .unwrap_or_else(|| default_run_cache_root(&input.file));
@@ -226,7 +243,7 @@ pub fn build(input: BuildInput) -> Result<BuildOutput, Error> {
 
 pub fn build_with_events(
     input: BuildInput,
-    mut events: impl FnMut(Event),
+    mut events: impl for<'a> FnMut(&Event<'a>),
 ) -> Result<BuildOutput, Error> {
     let cache_root = input
         .cache_root
@@ -257,7 +274,7 @@ fn execute(
     cache_root: PathBuf,
     cargo_profile: RustCargoProfile,
     mode: RustCargoMode,
-    events: &mut impl FnMut(Event),
+    events: &mut impl for<'a> FnMut(&Event<'a>),
 ) -> Result<RustCargoSuccess, Error> {
     let semantic_profile = semantic_profile_name(frontend.context.profile);
     let native = native_provider_context_for_file(file, &cache_root)?;
@@ -283,10 +300,8 @@ fn execute(
     );
 
     match cargo_job::execute_with_events(&job, |event| match event {
-        RustCargoEvent::Compiling => events(Event::CompilingRust),
-        RustCargoEvent::Running => events(Event::Running {
-            file: file.to_path_buf(),
-        }),
+        RustCargoEvent::Compiling => events(&Event::CompilingRust),
+        RustCargoEvent::Running => events(&Event::Running { file }),
     })
     .map_err(Error::Cargo)?
     {
@@ -417,30 +432,38 @@ fn emit_source_with_events(
     file: &Path,
     frontend: FrontendConfig,
     native: &NativeProviderContext,
-    events: &mut impl FnMut(Event),
+    events: &mut impl for<'a> FnMut(&Event<'a>),
 ) -> Result<EmittedRustSource, Error> {
-    events(Event::Checking {
-        file: file.to_path_buf(),
-    });
+    events(&Event::Checking { file });
     let output = match &native.graph {
         Some(graph) => build_air_path_with_graph_typed(file, frontend, graph),
         None => build_air_path_typed(file, frontend),
     }
     .map_err(Error::Air)?;
     let AirBuildOutput { report, air } = output;
-    events(Event::Checked { report });
+    events(&Event::Checked { report: &report });
+    let sources = report.sources;
     let native_providers = used_native_provider_supports(&air, &native.supports);
-    events(Event::GeneratingRust);
-    let plan = anvyx_backend::rust::plan(
+    events(&Event::GeneratingRust);
+    let source = anvyx_backend::rust::generate(
         &air.as_verified(),
         anvyx_backend::rust::RustPlanConfig {
             native_providers: native_providers.clone(),
             ..anvyx_backend::rust::RustPlanConfig::default()
         },
     )
-    .map_err(Error::Plan)?;
+    .map_err(|error| match error {
+        RustPlanError::TargetGaps(gaps) => {
+            let diagnostics = gaps.iter().map(RustTargetGap::diagnostic).collect();
+            Error::TargetDiagnostics(RustTargetDiagnostics {
+                gaps,
+                report: DiagnosticReport::new(sources, diagnostics).sorted(),
+            })
+        }
+        error @ RustPlanError::InvalidPlan(_) => Error::Plan(error),
+    })?;
     Ok(EmittedRustSource {
-        source: anvyx_backend::rust::emit::emit(&plan.verified()),
+        source,
         native_providers,
     })
 }

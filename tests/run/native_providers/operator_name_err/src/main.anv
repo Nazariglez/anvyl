@@ -1,0 +1,11 @@
+// @mode: run
+// @expect: error
+// @contains: Rust provider support does not export a binding for extern binary operator `Vec2.+ (receiver on left)`
+
+import pkg:host.host { Vec2 };
+
+fn main() {
+    let left = Vec2 { x: 1.0, y: 2.0 };
+    let right = Vec2 { x: 3.0, y: 4.0 };
+    let _ = left + right;
+}

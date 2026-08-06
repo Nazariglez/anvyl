@@ -17,12 +17,8 @@ impl RetainedCallbackSigPlan {
         Self { sig }
     }
 
-    pub(super) fn sig_index(self) -> usize {
-        self.sig.index()
-    }
-
     pub(super) fn sig(self, program: &RirProgram) -> &RirLambdaSig {
-        &program.lambda_sigs[self.sig_index()]
+        &program.lambda_sigs[self.sig.index()]
     }
 
     pub(super) fn args_ty(self, program: &RirProgram) -> String {
@@ -31,13 +27,13 @@ impl RetainedCallbackSigPlan {
             [] => "()".to_string(),
             [param] => format!(
                 "({},)",
-                policy.callable_param_ty(param.ty, param.abi, param.escape)
+                policy.callable_param_ty(param.ty, param.mode, param.escape)
             ),
             params => format!(
                 "({})",
                 comma(params.iter().map(|param| policy.callable_param_ty(
                     param.ty,
-                    param.abi,
+                    param.mode,
                     param.escape
                 )))
             ),
@@ -54,11 +50,7 @@ impl RetainedCallbackSigPlan {
             .any(|lambda| fallible_functions[lambda.function.index()])
     }
 
-    pub(super) fn table_id(self) -> usize {
-        self.sig.index() + 1
-    }
-
-    pub(super) fn signature_id(self) -> usize {
+    pub(super) fn callback_id(self) -> usize {
         self.sig.index() + 1
     }
 
@@ -202,10 +194,14 @@ impl<'a, 'w> RetainedCallbackEmitter<'a, 'w> {
                     ),
                     |w| {
                         w.line(format_args!(
-                            "if let Some((index, slot)) = self.{field}.iter_mut().enumerate().find(|(_, slot)| slot.is_free()) {{"
+                            "if let Some((index, slot)) = self.{field}.iter_mut().enumerate().find(|(_, slot)| {}) {{",
+                            target::callback_slot_is_free("slot")
                         ));
                         w.indented(|w| {
-                            w.line("let generation = slot.insert(handle).expect(\"callback slot open failed\");");
+                            w.line(format_args!(
+                                "let generation = {}.expect(\"callback slot open failed\");",
+                                target::callback_slot_insert("slot", "handle")
+                            ));
                             w.line("return (index, generation);");
                         });
                         w.line("}");
@@ -214,7 +210,10 @@ impl<'a, 'w> RetainedCallbackEmitter<'a, 'w> {
                             "let mut slot = {}::default();",
                             target::callback_slot_turbofish(&handle)
                         ));
-                        w.line("let generation = slot.insert(handle).expect(\"callback slot open failed\");");
+                        w.line(format_args!(
+                            "let generation = {}.expect(\"callback slot open failed\");",
+                            target::callback_slot_insert("slot", "handle")
+                        ));
                         w.line(format_args!("self.{field}.push(slot);"));
                         w.line("(index, generation)");
                     },
@@ -244,8 +243,8 @@ impl<'a, 'w> RetainedCallbackEmitter<'a, 'w> {
                 for line in RuntimeOwnerEmit::callback_entry_lines(
                     "owner_entry",
                     "inner_ptr",
-                    "key.owner_id()",
-                    "key.shutdown_generation()",
+                    &target::callback_key_owner_id("key"),
+                    &target::callback_key_shutdown_generation("key"),
                     &format!("{inner}<'_>"),
                 ) {
                     w.line(line);
@@ -254,7 +253,10 @@ impl<'a, 'w> RetainedCallbackEmitter<'a, 'w> {
                 w.indented(|w| {
                     w.line("let inner = unsafe { inner_ptr.as_mut() };");
                     w.line(format_args!("let table = &mut inner.callbacks.{field};"));
-                    w.line("let Some(slot) = table.get_mut(key.index()) else {");
+                    w.line(format_args!(
+                        "let Some(slot) = table.get_mut({}) else {{",
+                        target::callback_key_index("key")
+                    ));
                     w.indented(|w| {
                         w.line(format_args!(
                             "return Err({}::new(\"callback slot is closed\"));",
@@ -262,12 +264,18 @@ impl<'a, 'w> RetainedCallbackEmitter<'a, 'w> {
                         ));
                     });
                     w.line("};");
-                    w.line("let (record_handle, guard) = unsafe { slot.begin_invocation(owner, key) }?;");
+                    w.line(format_args!(
+                        "let (record_handle, guard) = {}?;",
+                        target::callback_slot_begin_invocation("slot", "owner", "key")
+                    ));
                     w.line(format_args!(
                         "let lambda = {};",
-                        target::map_heap_access_error(
-                            "inner.heap.try_with(&record_handle, |record| record.lambda.clone())"
-                        )
+                        target::map_heap_access_error(&target::callback_heap_try_with(
+                            "inner.heap",
+                            "&record_handle",
+                            "record",
+                            "record.lambda.clone()",
+                        ))
                     ));
                     w.line("(lambda, guard)");
                 });
@@ -298,8 +306,8 @@ impl<'a, 'w> RetainedCallbackEmitter<'a, 'w> {
                 for line in RuntimeOwnerEmit::callback_entry_lines(
                     "owner_entry",
                     "inner_ptr",
-                    "owner.owner_id()",
-                    "owner.shutdown_generation()",
+                    &target::owner_id("owner"),
+                    &target::owner_shutdown_generation("owner"),
                     &format!("{inner}<'cx>"),
                 ) {
                     w.line(line);
@@ -309,9 +317,12 @@ impl<'a, 'w> RetainedCallbackEmitter<'a, 'w> {
                     w.line("let inner = unsafe { inner_ptr.as_mut() };");
                     w.line(format_args!(
                         "let lambda = {};",
-                        target::map_heap_access_error(&format!(
-                            "inner.heap.try_with_erased(handle, inner.statics.{}, |record| record.lambda.clone())",
-                            plan.heap_type_field()
+                        target::map_heap_access_error(&target::callback_heap_try_with_erased(
+                            "inner.heap",
+                            "handle",
+                            &format!("inner.statics.{}", plan.heap_type_field()),
+                            "record",
+                            "record.lambda.clone()",
                         ))
                     ));
                     w.line("lambda");
@@ -341,16 +352,22 @@ impl<'a, 'w> RetainedCallbackEmitter<'a, 'w> {
                 for line in RuntimeOwnerEmit::callback_entry_lines(
                     "owner_entry",
                     "inner_ptr",
-                    "key.owner_id()",
-                    "key.shutdown_generation()",
+                    &target::callback_key_owner_id("key"),
+                    &target::callback_key_shutdown_generation("key"),
                     &format!("{inner}<'_>"),
                 ) {
                     w.line(line);
                 }
                 w.line("let inner = unsafe { inner_ptr.as_mut() };");
                 w.line(format_args!("let table = &mut inner.callbacks.{field};"));
-                w.line("let Some(slot) = table.get_mut(key.index()) else { return Ok(false); };");
-                w.line("let close = slot.close(key);");
+                w.line(format_args!(
+                    "let Some(slot) = table.get_mut({}) else {{ return Ok(false); }};",
+                    target::callback_key_index("key")
+                ));
+                w.line(format_args!(
+                    "let close = {};",
+                    target::callback_slot_close("slot", "key")
+                ));
                 w.line("Ok(close.closed)");
             },
         );
@@ -369,15 +386,22 @@ impl<'a, 'w> RetainedCallbackEmitter<'a, 'w> {
             w.line("(heap, statics, globals, safepoint, callbacks)");
         });
         w.line("};");
-        w.line("let statics = unsafe { statics.as_ref() };");
-        w.line("let globals = unsafe { globals.as_ref() };");
+        w.line(format_args!(
+            "let {} = unsafe {{ statics.as_ref() }};",
+            target::statics_param_name()
+        ));
+        w.line(format_args!(
+            "let {} = unsafe {{ globals.as_ref() }};",
+            target::globals_param_name()
+        ));
         w.line("let safepoint = unsafe { safepoint.as_ref() };");
         w.line(format_args!(
-            "let mut rt = {};",
+            "let mut {} = {};",
+            target::runtime_param_name(),
             if trace_globals {
                 target::runtime_ctx_from_raw_with_trace_roots_and_safepoint(
                     "heap",
-                    "globals",
+                    target::globals_param_name(),
                     "safepoint",
                 )
             } else {
@@ -405,9 +429,9 @@ impl<'a, 'w> RetainedCallbackEmitter<'a, 'w> {
     fn lambda_call_args(&self, plan: RetainedCallbackSigPlan) -> Vec<String> {
         let sig = plan.sig(self.program);
         [
-            "&mut rt".to_string(),
-            "statics".to_string(),
-            "globals".to_string(),
+            format!("&mut {}", target::runtime_param_name()),
+            target::statics_param_name().to_string(),
+            target::globals_param_name().to_string(),
             "owner".to_string(),
             "callbacks".to_string(),
         ]
@@ -417,9 +441,8 @@ impl<'a, 'w> RetainedCallbackEmitter<'a, 'w> {
     }
 
     fn key_check(plan: RetainedCallbackSigPlan) -> String {
-        format!(
-            "{}?;",
-            target::callback_check_identity("key", plan.table_id(), plan.signature_id())
-        )
+        let id = plan.callback_id();
+        let check = target::callback_check_identity("key", id, id);
+        format!("{check}?;")
     }
 }

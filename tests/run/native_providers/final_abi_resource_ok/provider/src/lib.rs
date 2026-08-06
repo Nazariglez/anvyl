@@ -18,6 +18,12 @@ impl Counter {
         self.value
     }
 
+    #[anvyx(ctx)]
+    pub fn inspect<'cx>(&self, ctx: &mut Ctx<'cx, '_>) -> i64 {
+        let _ = ctx;
+        self.value
+    }
+
     #[anvyx(setter)]
     pub fn set_value(&mut self, value: i64) {
         self.value = value;

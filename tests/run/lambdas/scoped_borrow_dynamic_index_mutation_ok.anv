@@ -1,0 +1,17 @@
+// @mode: run
+// @expect: success
+// @skip: scoped-borrow dynamic-index mutation is not executable yet
+
+fn set_first(ref values: [int]) {
+    let i = 0;
+    let set = || {
+        values[i] = 1;
+    };
+    set();
+}
+
+fn main() {
+    var values = [0];
+    set_first(values);
+    assert(values[0] == 1);
+}

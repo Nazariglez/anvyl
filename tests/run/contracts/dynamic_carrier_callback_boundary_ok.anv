@@ -1,0 +1,32 @@
+// @mode: run
+// @expect: success
+// @match: 7
+
+contract Callable {
+    fn call(self) -> int;
+}
+
+contract Score {
+    fn score(self) -> int;
+}
+
+struct Callback {
+    callback: fn() -> int,
+
+    fn call(self) -> int { invoke(self.callback) }
+}
+
+struct Outer {
+    inner: dyn Callable,
+
+    fn score(self) -> int { self.inner.call() }
+}
+
+fn invoke(callback: fn() -> int) -> int { callback() }
+
+fn seven() -> int { 7 }
+
+fn main() {
+    let value: dyn Score = Outer { inner: Callback { callback: seven } };
+    println(value.score());
+}

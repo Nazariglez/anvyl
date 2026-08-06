@@ -1610,6 +1610,7 @@ impl LowerCx<'_> {
         scope: &ModuleScope,
         target: ExternUseTarget,
         name: Ident,
+        span: Option<SourceSpan>,
         member: ExternMember,
         params: Vec<ExternParamDecl>,
         return_type: TypeId,
@@ -1630,6 +1631,7 @@ impl LowerCx<'_> {
         };
         let id = self.program.alloc_extern(ExternDecl {
             name,
+            span,
             module,
             member,
             params,
@@ -1703,6 +1705,7 @@ impl LowerCx<'_> {
                     &ty.key.module,
                     target,
                     field_decl.name,
+                    field_decl.site.span,
                     ExternMember::FieldGetter {
                         owner,
                         receiver: ExternReceiverDecl {
@@ -1731,6 +1734,7 @@ impl LowerCx<'_> {
                     &ty.key.module,
                     target,
                     field_decl.name,
+                    field_decl.site.span,
                     ExternMember::FieldSetter {
                         owner,
                         receiver: ExternReceiverDecl {
@@ -1760,6 +1764,7 @@ impl LowerCx<'_> {
                     &ty.key.module,
                     target,
                     method.name,
+                    method.site.span,
                     ExternMember::Method {
                         owner,
                         receiver: ExternReceiverDecl {
@@ -1782,6 +1787,7 @@ impl LowerCx<'_> {
                     &ty.key.module,
                     target,
                     static_method.name,
+                    static_method.site.span,
                     ExternMember::StaticMethod { owner },
                     params,
                     return_type,
@@ -1803,6 +1809,7 @@ impl LowerCx<'_> {
                     &ty.key.module,
                     target,
                     ty.key.name,
+                    ty.site.span,
                     ExternMember::Init { owner },
                     params,
                     return_type,
@@ -1823,6 +1830,7 @@ impl LowerCx<'_> {
                     &ty.key.module,
                     target,
                     operator_name(operator.op),
+                    operator.site.span,
                     ExternMember::UnaryOperator {
                         owner,
                         receiver: ExternReceiverDecl {
@@ -1854,6 +1862,7 @@ impl LowerCx<'_> {
                     &ty.key.module,
                     target,
                     operator_name(operator.op),
+                    operator.site.span,
                     ExternMember::BinaryOperator {
                         owner,
                         receiver: ExternReceiverDecl {
@@ -1887,6 +1896,7 @@ impl LowerCx<'_> {
             &function.key.module,
             ExternUseTarget::Function(id),
             function.key.name,
+            function.site.span,
             ExternMember::FreeFunction,
             params,
             return_type,

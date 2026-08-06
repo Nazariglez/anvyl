@@ -1,20 +1,19 @@
 use std::{collections::HashSet, error::Error, fmt};
 
 use anvyx_frontend::{
-    air::{self, FunctionId, TypePassClasses},
-    ast::{BinaryOp, ScalarKind, UnaryOp},
+    air,
+    ast::{BinaryOp, FormatKind, FormatSign, FormatSpec, ScalarKind, UnaryOp},
 };
 use anvyx_runtime::{
     CallbackEscape, CallbackThread, ExternCallbackSignature, ExternTypeExpr, ExternTypeKey,
-    RustExternAbi, RustParamAbi,
+    RustParamAbi, RustPath, RustTypeBinding, RustWrapperCtx,
 };
 
 use super::{
-    native, native_call,
-    place_access::{CollectionLoanBase, CollectionLoanProjection, collection_loan_step_supported},
+    native_call,
     rep_policy::{
-        LambdaStorageFamily, RirRustRepPolicy, RustPayloadStorage, RustRecipePosition,
-        RustRepresentationPlan, child_recipe_position,
+        LambdaStorageFamily, RirRustRepPolicy, RustApproxLayout, RustPrimitiveLayout,
+        RustRecipePosition, child_recipe_position, layout, target_profile,
     },
 };
 
@@ -46,6 +45,7 @@ rir_id!(RirLocalId);
 rir_id!(RirLoopId);
 rir_id!(RirStructId);
 rir_id!(RirDataRefId);
+rir_id!(RirDataRefPlaceId);
 rir_id!(RirEnumId);
 rir_id!(RirFlagId);
 rir_id!(RirFlagMemberId);
@@ -61,8 +61,33 @@ rir_id!(RirCollectionStorageId);
 rir_id!(RirCellId);
 rir_id!(RirScopedPlaceCellId);
 rir_id!(RirDynCarrierId);
-rir_id!(RirDynVariantId);
+rir_id!(RirDynDispatchId);
+rir_id!(RirDynWeakeningId);
+rir_id!(RirDynVariantSetId);
 rir_id!(RirMaterializerId);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct RirDynVariantId {
+    carrier: RirDynCarrierId,
+    index: u32,
+}
+
+impl RirDynVariantId {
+    pub(super) const fn new(carrier: RirDynCarrierId, index: usize) -> Self {
+        Self {
+            carrier,
+            index: index as u32,
+        }
+    }
+
+    pub const fn carrier(self) -> RirDynCarrierId {
+        self.carrier
+    }
+
+    pub const fn index(self) -> usize {
+        self.index as usize
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RirSymbol(pub String);
@@ -79,13 +104,13 @@ impl RirSymbol {
 
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct RirProgram {
-    pub ctx: RirCtxPlan,
     pub globals: Vec<RirGlobal>,
     pub functions: Vec<RirFunction>,
     pub externs: Vec<RirExtern>,
     pub types: Vec<RirType>,
     pub structs: Vec<RirStruct>,
     pub datarefs: Vec<RirDataRef>,
+    pub dataref_places: Vec<RirDataRefPlace>,
     pub enums: Vec<RirEnum>,
     pub flags: Vec<RirFlag>,
     pub tuples: Vec<RirTuple>,
@@ -97,9 +122,10 @@ pub struct RirProgram {
     pub scoped_place_cells: Vec<RirScopedPlaceCellDecl>,
     pub stringify_reqs: Vec<RirStringifyReq>,
     pub stringify_helpers: Vec<RirStringifyHelper>,
-    pub dyn_origins: RirDynOrigins,
     pub dyn_carriers: Vec<RirDynCarrier>,
+    pub dyn_dispatches: Vec<RirDynDispatch>,
     pub dyn_weakenings: Vec<RirDynWeakening>,
+    pub dyn_variant_sets: Vec<RirDynVariantSet>,
     pub materializers: Vec<RirMaterializer>,
     pub value_materializers: Vec<Option<RirMaterializerId>>,
     pub consts: Vec<RirConst>,
@@ -113,9 +139,15 @@ pub struct RirMaterializer {
     pub ty: RirTypeId,
     pub position: RustRecipePosition,
     pub action: RirMaterializerAction,
+    pub copy: Option<RirCopyEvidence>,
+    pub support: Option<RirSupportEvidence>,
 }
 
 impl RirMaterializer {
+    pub(super) fn is_copy(&self) -> bool {
+        self.copy.is_some()
+    }
+
     pub(super) fn stages_collection(&self, program: &RirProgram) -> bool {
         self.position == RustRecipePosition::StoredPayload(LambdaStorageFamily::DataRefProjection)
             && matches!(self.action, RirMaterializerAction::ManagedShare)
@@ -124,6 +156,45 @@ impl RirMaterializer {
                 RirType::List(_) | RirType::Map { .. }
             )
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RirCopyEvidence {
+    Leaf,
+    Struct {
+        family: LambdaStorageFamily,
+        fields: Vec<RirMaterializerId>,
+    },
+    Tuple {
+        fields: Vec<RirMaterializerId>,
+    },
+    Array {
+        elem: RirMaterializerId,
+    },
+    Enum {
+        variants: Vec<Vec<RirMaterializerId>>,
+    },
+    Optional {
+        payload: RirMaterializerId,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RirSupportEvidence {
+    List {
+        elem: RirMaterializerId,
+    },
+    Map {
+        key: RirMaterializerId,
+        key_contract: RirMaterializerId,
+        value: RirMaterializerId,
+    },
+    ProviderStruct {
+        fields: Vec<RirMaterializerId>,
+    },
+    ProviderEnum {
+        variants: Vec<Vec<RirMaterializerId>>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -151,8 +222,8 @@ pub enum RirMaterializerAction {
         payload: RirMaterializerId,
     },
     DynamicMaterialize {
-        surface: air::ContractSurfaceId,
-        variants: Vec<RirDynamicMaterializerVariant>,
+        carrier: RirDynCarrierId,
+        variants: Vec<RirMaterializerId>,
     },
 }
 
@@ -170,55 +241,9 @@ impl RirMaterializerAction {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct RirDynamicMaterializerVariant {
-    pub witness: air::ContractWitnessId,
-    pub payload: RirMaterializerId,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct RirDynOrigins {
-    pub surfaces: Vec<air::ContractSurfaceId>,
-    pub witnesses: Vec<RirDynWitnessOrigin>,
-    pub weakenings: Vec<RirDynWeakeningOrigin>,
-    pub slots: Vec<RirDynSlotOrigin>,
-    pub dispatches: Vec<RirDynDispatchOrigin>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct RirDynWitnessOrigin {
-    pub air_witness: air::ContractWitnessId,
-    pub surface: air::ContractSurfaceId,
-    pub concrete_ty: RirTypeId,
-    pub storage: RirDynStorage,
-    pub payload: RirMaterializerId,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct RirDynWeakeningOrigin {
-    pub air_weakening: air::ContractWeakeningId,
-    pub source: air::ContractSurfaceId,
-    pub target: air::ContractSurfaceId,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct RirDynSlotOrigin {
-    pub air_slot: air::ContractSlotId,
-    pub surface: air::ContractSurfaceId,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RirDynDispatchOrigin {
-    pub air_witness: air::ContractWitnessId,
-    pub air_slot: air::ContractSlotId,
-    pub receiver: RirParamAbi,
-    pub target: RirResolvedCallTarget,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RirDynCarrier {
     pub id: RirDynCarrierId,
-    pub air_surface: air::ContractSurfaceId,
     pub storage_ty: RirTypeId,
     pub variants: Vec<RirDynVariant>,
 }
@@ -226,10 +251,36 @@ pub struct RirDynCarrier {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RirDynVariant {
     pub id: RirDynVariantId,
-    pub air_witness: air::ContractWitnessId,
     pub concrete_ty: RirTypeId,
     pub storage: RirDynStorage,
+    pub inline_layout: RirDynInlineLayout,
+    pub box_reason: Option<RirDynBoxReason>,
     pub payload: RirMaterializerId,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RirDynLayout {
+    pub size: u64,
+    pub align: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RirDynInlineLayout {
+    Known(RirDynLayout),
+    Function,
+    Recursive,
+    Provider,
+    Unsupported,
+    Overflow,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RirDynBoxReason {
+    Function,
+    FunctionField,
+    Recursive,
+    Threshold,
+    WeakeningClass(RirDynCarrierId),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -243,7 +294,7 @@ pub enum RirResolvedCallTarget {
     Function(RirFunctionId),
     Extern(RirExternId),
     Promoted {
-        fields: Vec<RirFieldId>,
+        projections: Vec<RirPlaceStep>,
         target: Box<RirResolvedCallTarget>,
     },
 }
@@ -259,23 +310,45 @@ impl RirResolvedCallTarget {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RirDynDispatchArm {
-    pub variant: RirDynVariantId,
-    pub receiver: RirParamAbi,
+    pub receiver: RirPassMode,
     pub target: RirResolvedCallTarget,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RirDynDispatch {
+    pub id: RirDynDispatchId,
+    pub carrier: RirDynCarrierId,
+    pub params: Vec<RirDynDispatchParam>,
+    pub result_ty: RirTypeId,
+    pub arms: Vec<RirDynDispatchArm>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RirDynDispatchParam {
+    pub ty: RirTypeId,
+    pub mode: RirPassMode,
+    pub escape: RirParamEscape,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RirDynWeakenArm {
-    pub source: RirDynVariantId,
     pub target: RirDynVariantId,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RirDynWeakening {
-    pub air_id: air::ContractWeakeningId,
+    pub id: RirDynWeakeningId,
     pub source: RirDynCarrierId,
     pub target: RirDynCarrierId,
     pub arms: Vec<RirDynWeakenArm>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RirDynVariantSet {
+    pub id: RirDynVariantSetId,
+    pub carrier: RirDynCarrierId,
+    pub target: RirTypeId,
+    pub variants: Vec<RirDynVariantId>,
 }
 
 impl RirProgram {
@@ -285,20 +358,6 @@ impl RirProgram {
 
     pub fn stringify_req(&self, ty: RirTypeId) -> Option<&RirStringifyReq> {
         self.stringify_reqs.iter().find(|req| req.ty == ty)
-    }
-
-    pub(super) fn dataref_projection_materializer(
-        &self,
-        ty: RirTypeId,
-    ) -> Option<RirMaterializerId> {
-        self.materializers
-            .iter()
-            .find(|materializer| {
-                materializer.ty == ty
-                    && materializer.position
-                        == RustRecipePosition::StoredPayload(LambdaStorageFamily::DataRefProjection)
-            })
-            .map(|materializer| materializer.id)
     }
 
     pub fn dyn_borrow_symbol(&self, carrier: RirDynCarrierId) -> String {
@@ -313,30 +372,48 @@ impl RirProgram {
         self.lambdas.iter().filter(move |lambda| lambda.sig == sig)
     }
 
-    pub(super) fn retained_callback_sigs(&self) -> Vec<RirLambdaSigId> {
-        self.callback_sigs_by_role(|semantic| {
-            matches!(
-                semantic,
-                RirParamSemantic::EscapingLambda | RirParamSemantic::AnvCallback
-            )
-        })
-    }
-
-    pub(super) fn provider_callback_sigs(&self) -> Vec<RirLambdaSigId> {
-        self.callback_sigs_by_role(|semantic| semantic == RirParamSemantic::EscapingLambda)
-    }
-
-    pub(super) fn heap_callback_sigs(&self) -> Vec<RirLambdaSigId> {
-        self.callback_sigs_by_role(|semantic| semantic == RirParamSemantic::AnvCallback)
+    pub(super) fn callback_sigs(
+        &self,
+    ) -> (
+        Vec<RirLambdaSigId>,
+        Vec<RirLambdaSigId>,
+        Vec<RirLambdaSigId>,
+    ) {
+        let mut retained = vec![];
+        let mut provider = vec![];
+        let mut heap = vec![];
+        for ext in &self.externs {
+            for param in &ext.params {
+                let RirType::Lambda(sig) = self.types[param.ty.index()] else {
+                    continue;
+                };
+                let roles = match param.mode {
+                    RirPassMode::EscapingLambda => (&mut retained, Some(&mut provider)),
+                    RirPassMode::AnvCallback => (&mut retained, Some(&mut heap)),
+                    _ => continue,
+                };
+                if !roles.0.contains(&sig) {
+                    roles.0.push(sig);
+                }
+                if let Some(role) = roles.1
+                    && !role.contains(&sig)
+                {
+                    role.push(sig);
+                }
+            }
+        }
+        (retained, provider, heap)
     }
 
     pub(super) fn has_retained_callbacks(&self) -> bool {
-        !self.retained_callback_sigs().is_empty()
-    }
-
-    pub(super) fn native_call_plan(&self, ext: RirExternId) -> native_call::NativeCallPlan {
-        let RirExternKind::Native(native) = &self.externs[ext.index()].kind;
-        native.call_plan(self.has_retained_callbacks())
+        self.externs.iter().any(|ext| {
+            ext.params.iter().any(|param| {
+                matches!(
+                    param.mode,
+                    RirPassMode::EscapingLambda | RirPassMode::AnvCallback
+                )
+            })
+        })
     }
 
     pub(super) fn dyn_carrier_for_enum(&self, enm: RirEnumId) -> Option<&RirDynCarrier> {
@@ -345,31 +422,102 @@ impl RirProgram {
             .find(|carrier| self.types.get(carrier.storage_ty.index()) == Some(&RirType::Enum(enm)))
     }
 
-    fn callback_sigs_by_role(
-        &self,
-        role: impl Fn(RirParamSemantic) -> bool,
-    ) -> Vec<RirLambdaSigId> {
-        let mut sigs = vec![];
-        for ext in &self.externs {
-            for param in &ext.params {
-                if !role(param.semantic) {
-                    continue;
-                }
-                let RirType::Lambda(sig) = self.types[param.ty.index()] else {
-                    continue;
-                };
-                if !sigs.contains(&sig) {
-                    sigs.push(sig);
-                }
-            }
-        }
-        sigs
-    }
-
     pub fn collection_storage_for(&self, value_ty: RirTypeId) -> Option<&RirCollectionStorage> {
         self.collection_storages
             .iter()
             .find(|storage| storage.value_ty == value_ty)
+    }
+
+    pub fn place_ty(&self, function: &RirFunction, place: &RirPlace) -> Option<RirTypeId> {
+        if let Some(step) = place.projections.last() {
+            return Some(step.target_ty);
+        }
+        match place.root {
+            RirPlaceRoot::Local(local) => function.locals.get(local.index()).map(|local| local.ty),
+            RirPlaceRoot::Global(global) => {
+                self.globals.get(global.index()).map(|global| global.ty)
+            }
+        }
+    }
+
+    pub fn mut_place_root_ty(
+        &self,
+        function: &RirFunction,
+        access: &RirMutPlaceAccess,
+    ) -> Option<RirTypeId> {
+        match access {
+            RirMutPlaceAccess::Handle(handle) => match handle {
+                RirMutPlaceHandle::Local { local } | RirMutPlaceHandle::Param { local } => {
+                    function.locals.get(local.index()).map(|local| local.ty)
+                }
+                RirMutPlaceHandle::StackCell { cell } | RirMutPlaceHandle::HeapCell { cell } => {
+                    let cell = match cell {
+                        RirCellRef::Owner(cell) | RirCellRef::Capture { cell, .. } => cell,
+                    };
+                    self.cells.get(cell.index()).map(|cell| cell.payload_ty)
+                }
+                RirMutPlaceHandle::ScopedPlaceCell { cell } => {
+                    let cell = match cell {
+                        RirScopedPlaceCellRef::Owner(cell)
+                        | RirScopedPlaceCellRef::Capture { cell, .. } => cell,
+                    };
+                    self.scoped_place_cells
+                        .get(cell.index())
+                        .map(|cell| cell.payload_ty)
+                }
+                RirMutPlaceHandle::Global { global } => {
+                    self.globals.get(global.index()).map(|global| global.ty)
+                }
+            },
+            RirMutPlaceAccess::DataRef { place, .. } => self
+                .dataref_places
+                .get(place.index())?
+                .storage
+                .last()
+                .map(|step| step.target_ty),
+        }
+    }
+
+    pub fn mut_place_ty(&self, function: &RirFunction, arg: &RirMutPlaceArg) -> Option<RirTypeId> {
+        Some(arg.final_ty(self.mut_place_root_ty(function, &arg.access)?))
+    }
+
+    pub fn collection_ty(
+        &self,
+        function: &RirFunction,
+        collection: &RirCollectionAccess,
+    ) -> Option<RirTypeId> {
+        match collection {
+            RirCollectionAccess::Direct(place) => self.place_ty(function, place),
+            RirCollectionAccess::MutPlace(place) => self.mut_place_ty(function, place),
+        }
+    }
+
+    pub fn verified_place_ty(&self, function: &RirFunction, place: &RirPlace) -> RirTypeId {
+        self.place_ty(function, place).expect("verified place root")
+    }
+
+    pub fn verified_mut_place_root_ty(
+        &self,
+        function: &RirFunction,
+        access: &RirMutPlaceAccess,
+    ) -> RirTypeId {
+        self.mut_place_root_ty(function, access)
+            .expect("verified mutable-place root")
+    }
+
+    pub fn verified_mut_place_ty(&self, function: &RirFunction, arg: &RirMutPlaceArg) -> RirTypeId {
+        self.mut_place_ty(function, arg)
+            .expect("verified mutable-place root")
+    }
+
+    pub fn verified_collection_ty(
+        &self,
+        function: &RirFunction,
+        collection: &RirCollectionAccess,
+    ) -> RirTypeId {
+        self.collection_ty(function, collection)
+            .expect("verified collection root")
     }
 
     pub fn sequence_elem_materializer(&self, value_ty: RirTypeId) -> Option<RirMaterializerId> {
@@ -422,8 +570,6 @@ impl RirProgram {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RirGlobal {
     pub id: RirGlobalId,
-    pub air_id: air::GlobalId,
-    pub module: air::ModuleId,
     pub name: RirSymbol,
     pub slot_symbol: RirSymbol,
     pub ty: RirTypeId,
@@ -434,14 +580,19 @@ pub struct RirGlobal {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RirStruct {
     pub id: RirStructId,
-    pub air_id: Option<air::AggregateId>,
+    pub role: RirStructRole,
     pub symbol: RirSymbol,
     pub display: RirSymbol,
-    pub native_path: Option<Vec<String>>,
+    pub native: Option<RustTypeBinding>,
+    pub native_layout: Option<RirDynLayout>,
     pub native_ref: bool,
-    pub native_key: Option<ExternTypeKey>,
-    pub copyable: bool,
     pub fields: Vec<RirField>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RirStructRole {
+    Source,
+    Extern,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -456,19 +607,24 @@ pub struct RirTuple {
     pub id: RirTupleId,
     pub symbol: RirSymbol,
     pub display: RirSymbol,
-    pub copyable: bool,
     pub fields: Vec<RirField>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RirDataRef {
     pub id: RirDataRefId,
-    pub air_id: air::AggregateId,
     pub native_key: Option<ExternTypeKey>,
     pub symbol: RirSymbol,
     pub display: RirSymbol,
     pub cycle_capable: bool,
     pub fields: Vec<RirField>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RirDataRefPlace {
+    pub dataref: RirDataRefId,
+    pub storage: Vec<RirPlaceStep>,
+    pub materializer: RirMaterializerId,
 }
 
 impl RirDataRef {
@@ -484,16 +640,22 @@ impl RirDataRef {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RirEnum {
     pub id: RirEnumId,
-    pub air_id: Option<air::EnumId>,
-    pub native_path: Option<Vec<String>>,
-    pub native_key: Option<ExternTypeKey>,
+    pub role: RirEnumRole,
+    pub native: Option<RustTypeBinding>,
+    pub native_layout: Option<RirDynLayout>,
     pub core: Option<RirCoreEnumKind>,
     pub repr: RirEnumRepr,
     pub raw_type: Option<RirTypeId>,
     pub symbol: RirSymbol,
     pub display: RirSymbol,
-    pub copyable: bool,
     pub variants: Vec<RirVariant>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RirEnumRole {
+    DynamicCarrier,
+    Source,
+    Extern,
 }
 
 impl RirEnum {
@@ -507,7 +669,6 @@ impl RirEnum {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RirFlag {
     pub id: RirFlagId,
-    pub air_id: air::FlagId,
     pub symbol: RirSymbol,
     pub display: RirSymbol,
     pub known_bits: i64,
@@ -569,8 +730,7 @@ pub struct RirLambdaSig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RirLambdaParam {
     pub ty: RirTypeId,
-    pub semantic: RirParamSemantic,
-    pub abi: RirParamAbi,
+    pub mode: RirPassMode,
     pub escape: RirParamEscape,
 }
 
@@ -583,7 +743,6 @@ pub enum RirParamEscape {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RirLambda {
     pub id: RirLambdaId,
-    pub source: RirLambdaSource,
     pub function: RirFunctionId,
     pub sig: RirLambdaSigId,
     pub escape: RirLambdaEscape,
@@ -594,8 +753,7 @@ pub struct RirLambda {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RirLambdaCapture {
     pub ty: RirTypeId,
-    pub semantic: RirParamSemantic,
-    pub abi: RirParamAbi,
+    pub mode: RirPassMode,
     pub kind: RirLambdaCaptureKind,
 }
 
@@ -605,12 +763,6 @@ pub enum RirLambdaCaptureKind {
     StackCell { cell: RirCellId },
     HeapCell { cell: RirCellId },
     ScopedPlaceCell { cell: RirScopedPlaceCellId },
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RirLambdaSource {
-    Function(FunctionId),
-    Lambda(air::LambdaId),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -779,7 +931,7 @@ pub enum RirStringifyReqKind {
     Helper(RirStringifyHelperId),
     Override {
         function: RirFunctionId,
-        mode: RirParamSemantic,
+        mode: RirPassMode,
     },
 }
 
@@ -811,43 +963,37 @@ pub struct RirEnumStringifyVariant {
     pub field_labels: Vec<RirStringLiteralId>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RirCtxPlan {
-    pub statics_symbol: RirSymbol,
-    pub globals_symbol: RirSymbol,
-}
-
-impl Default for RirCtxPlan {
-    fn default() -> Self {
-        Self {
-            statics_symbol: RirSymbol::new("AnvStatics"),
-            globals_symbol: RirSymbol::new("AnvGlobals"),
-        }
-    }
-}
-
 #[derive(Debug, Clone, PartialEq)]
 pub struct RirFunction {
     pub id: RirFunctionId,
-    pub air_id: Option<FunctionId>,
     pub symbol: RirSymbol,
-    pub params: Vec<RirParam>,
+    pub params: Vec<RirLocalId>,
     pub ret: RirReturn,
     pub locals: Vec<RirLocal>,
     pub body: RirStructuredBlock,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct RirParam {
-    pub local: RirLocalId,
-    pub ty: RirTypeId,
-    pub semantic: RirParamSemantic,
-    pub abi: RirParamAbi,
-    pub escape: RirParamEscape,
+impl RirFunction {
+    fn parameter(&self, local: RirLocalId) -> Option<&RirLocal> {
+        self.locals
+            .get(local.index())
+            .filter(|local| matches!(local.binding, RirLocalBinding::Parameter { .. }))
+    }
+
+    fn parameter_data(
+        &self,
+        local: RirLocalId,
+    ) -> Option<(RirTypeId, RirPassMode, RirParamEscape)> {
+        let local = self.parameter(local)?;
+        let RirLocalBinding::Parameter { mode, escape } = local.binding else {
+            unreachable!("parameter local binding")
+        };
+        Some((local.ty, mode, escape))
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RirParamSemantic {
+pub enum RirPassMode {
     Value,
     SharedBorrow,
     MutBorrow,
@@ -861,24 +1007,29 @@ pub enum RirParamSemantic {
     ScopedPlaceCell,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RirParamAbi {
-    Value,
-    SharedBorrow,
-    MutBorrow,
-    MutPlace,
-    DynBorrow,
-    ScopedLambda,
-    EscapingLambda,
-    AnvCallback,
-    StackCell,
-    HeapCell,
-    ScopedPlaceCell,
-}
-
-impl RirParamAbi {
+impl RirPassMode {
     pub(super) fn is_readonly_receiver(self) -> bool {
         matches!(self, Self::Value | Self::SharedBorrow)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RirLocalBinding {
+    Value,
+    Parameter {
+        mode: RirPassMode,
+        escape: RirParamEscape,
+    },
+    DirectPayload,
+    ScopedPlacePayload,
+}
+
+impl RirLocalBinding {
+    pub(super) fn parameter(self) -> Option<(RirPassMode, RirParamEscape)> {
+        let Self::Parameter { mode, escape } = self else {
+            return None;
+        };
+        Some((mode, escape))
     }
 }
 
@@ -893,8 +1044,7 @@ pub struct RirLocal {
     pub ty: RirTypeId,
     pub mutable: bool,
     pub symbol: RirSymbol,
-    pub initialized: bool,
-    pub payload_ref: bool,
+    pub binding: RirLocalBinding,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -939,14 +1089,13 @@ pub enum RirStmt {
     },
     DataRefSet {
         object: RirOperand,
-        dataref: RirDataRefId,
-        projections: Vec<RirProjection>,
+        place: RirDataRefPlaceId,
+        suffix: Vec<RirPlaceStep>,
         value: RirRValue,
-        ty: RirTypeId,
     },
     SequenceSlotSet {
         collection: RirCollectionAccess,
-        index: RirLocalId,
+        step: RirPlaceStep,
         value: RirOperand,
     },
     MapValueSet {
@@ -968,61 +1117,6 @@ pub enum RirStmt {
 }
 
 impl RirStmt {
-    pub fn for_each_owned_value(&self, f: &mut impl FnMut(&RirOwnedValue)) {
-        match self {
-            Self::Init { value, .. }
-            | Self::GlobalSetRoot { value, .. }
-            | Self::GlobalUpdateRoot { value, .. }
-            | Self::CellInit { value, .. }
-            | Self::CellSet { value, .. }
-            | Self::ScopedPlaceCellSet { value, .. }
-            | Self::MutPlaceSet { value, .. }
-            | Self::DataRefSet { value, .. }
-            | Self::Assign { value, .. }
-            | Self::Eval(value) => value.for_each_owned_value(f),
-            Self::DynMatch(match_) => {
-                if let RirDynMatchSource::Owned(owned) = &match_.source {
-                    f(owned);
-                }
-            }
-            _ => {}
-        }
-        self.for_each_child(&mut |child| {
-            if let RirChild::Block(block) = child {
-                block.for_each_owned_value(f);
-            }
-        });
-    }
-
-    fn rvalue(&self) -> Option<&RirRValue> {
-        match self {
-            Self::Init { value, .. }
-            | Self::GlobalSetRoot { value, .. }
-            | Self::GlobalUpdateRoot { value, .. }
-            | Self::MutPlaceSet { value, .. }
-            | Self::Assign { value, .. }
-            | Self::CellInit { value, .. }
-            | Self::CellSet { value, .. }
-            | Self::ScopedPlaceCellSet { value, .. }
-            | Self::DataRefSet { value, .. }
-            | Self::Eval(value) => Some(value),
-            Self::GlobalEnsure { .. }
-            | Self::ScopedPlaceCellInit { .. }
-            | Self::SequenceSlotSet { .. }
-            | Self::MapValueSet { .. }
-            | Self::If(_)
-            | Self::Loop(_)
-            | Self::RangeFor(_)
-            | Self::CollectionFor(_)
-            | Self::CollectionLoanScope(_)
-            | Self::CollectionSlotScope(_)
-            | Self::PatternMatch(_)
-            | Self::DynMatch(_)
-            | Self::OptionMatch(_)
-            | Self::MapEntryMatch(_) => None,
-        }
-    }
-
     pub fn for_each_child(&self, f: &mut impl FnMut(RirChild<'_>)) {
         match self {
             Self::Init { value, .. }
@@ -1031,54 +1125,50 @@ impl RirStmt {
             | Self::CellInit { value, .. }
             | Self::CellSet { value, .. }
             | Self::ScopedPlaceCellSet { value, .. } => {
-                value.for_each_child(RirValueUse::Store, f);
+                value.for_each_child(f);
             }
-            Self::Eval(value) => value.for_each_child(RirValueUse::Read, f),
+            Self::Eval(value) => value.for_each_child(f),
             Self::MutPlaceSet { place, value } => {
-                f(RirChild::MutPlace {
-                    place,
-                    use_: RirPlaceUse::Mutate,
-                });
-                value.for_each_child(RirValueUse::Store, f);
+                f(RirChild::MutPlace { place });
+                value.for_each_child(f);
             }
             Self::Assign { dst, value } => {
-                f(RirChild::Place {
-                    place: dst,
-                    use_: RirPlaceUse::Mutate,
-                });
-                value.for_each_child(RirValueUse::Store, f);
+                f(RirChild::Place { place: dst });
+                value.for_each_child(f);
             }
-            Self::DataRefSet { object, value, .. } => {
-                f(RirChild::Operand {
-                    operand: object,
-                    use_: RirValueUse::Read,
-                });
-                value.for_each_child(RirValueUse::Store, f);
+            Self::DataRefSet {
+                object,
+                suffix,
+                value,
+                ..
+            } => {
+                f(RirChild::Operand { operand: object });
+                for step in suffix {
+                    if let Some(local) = step.index_local() {
+                        f(RirChild::LocalRead(local));
+                    }
+                }
+                value.for_each_child(f);
             }
             Self::SequenceSlotSet {
                 collection,
-                index,
-                value,
-            }
-            | Self::MapValueSet {
-                map: collection,
-                index,
+                step,
                 value,
             } => {
-                f(RirChild::Collection {
-                    collection,
-                    use_: RirPlaceUse::Mutate,
-                });
+                f(RirChild::Collection { collection });
+                f(RirChild::LocalRead(
+                    step.index_local().expect("sequence slot step"),
+                ));
+                f(RirChild::Operand { operand: value });
+            }
+            Self::MapValueSet { map, index, value } => {
+                f(RirChild::Collection { collection: map });
                 f(RirChild::LocalRead(*index));
-                f(RirChild::Operand {
-                    operand: value,
-                    use_: RirValueUse::Store,
-                });
+                f(RirChild::Operand { operand: value });
             }
             Self::If(branch) => {
                 f(RirChild::Operand {
                     operand: &branch.cond,
-                    use_: RirValueUse::Read,
                 });
                 f(RirChild::Block(&branch.then_block));
                 if let Some(block) = &branch.else_block {
@@ -1089,60 +1179,32 @@ impl RirStmt {
             Self::RangeFor(range) => {
                 f(RirChild::Operand {
                     operand: &range.start,
-                    use_: RirValueUse::Read,
                 });
                 f(RirChild::Operand {
                     operand: &range.end,
-                    use_: RirValueUse::Read,
                 });
                 for operand in range.ordinal_plan.operands() {
-                    f(RirChild::Operand {
-                        operand,
-                        use_: RirValueUse::Read,
-                    });
+                    f(RirChild::Operand { operand });
                 }
                 f(RirChild::Block(&range.body));
             }
             Self::CollectionFor(for_) => {
                 f(RirChild::LocalRead(for_.len));
                 for operand in for_.ordinal_plan.operands() {
-                    f(RirChild::Operand {
-                        operand,
-                        use_: RirValueUse::Read,
-                    });
+                    f(RirChild::Operand { operand });
                 }
                 f(RirChild::Block(&for_.body));
             }
             Self::CollectionLoanScope(scope) => {
-                let abi = match scope.mode {
-                    RirCollectionLoanMode::ReadonlySequence
-                    | RirCollectionLoanMode::ReadonlyMap => RirParamAbi::SharedBorrow,
-                    RirCollectionLoanMode::MutableSequenceElement
-                    | RirCollectionLoanMode::MutableMapValue => RirParamAbi::MutBorrow,
-                };
                 f(RirChild::Collection {
                     collection: &scope.root,
-                    use_: RirPlaceUse::Borrow(abi),
                 });
                 f(RirChild::Block(&scope.body));
             }
             Self::CollectionSlotScope(block) => f(RirChild::Block(block)),
             Self::PatternMatch(match_) => {
-                let aliases = match_.arms.iter().any(|arm| {
-                    arm.alternatives.iter().any(|alternative| {
-                        alternative
-                            .bindings
-                            .iter()
-                            .any(|binding| binding.mode.is_alias())
-                    })
-                });
                 f(RirChild::Place {
                     place: &match_.subject,
-                    use_: if aliases {
-                        RirPlaceUse::Mutate
-                    } else {
-                        RirPlaceUse::Read
-                    },
                 });
                 for arm in &match_.arms {
                     f(RirChild::Block(&arm.block));
@@ -1151,16 +1213,12 @@ impl RirStmt {
             Self::DynMatch(match_) => {
                 match &match_.source {
                     RirDynMatchSource::Owned(value) => owned_value(f, value),
-                    RirDynMatchSource::MutPlace(place) => f(RirChild::MutPlace {
-                        place,
-                        use_: RirPlaceUse::Mutate,
-                    }),
+                    RirDynMatchSource::MutPlace(place) => f(RirChild::MutPlace { place }),
                     RirDynMatchSource::Borrowed(borrow) => match &borrow.source {
                         RirDynBorrowSource::Concrete { place, .. }
-                        | RirDynBorrowSource::Owned { place, .. } => f(RirChild::MutPlace {
-                            place,
-                            use_: RirPlaceUse::Mutate,
-                        }),
+                        | RirDynBorrowSource::Owned { place, .. } => {
+                            f(RirChild::MutPlace { place });
+                        }
                         RirDynBorrowSource::Borrowed { local, .. }
                         | RirDynBorrowSource::Reborrowed { local, .. } => {
                             f(RirChild::LocalRead(*local));
@@ -1173,36 +1231,17 @@ impl RirStmt {
                 f(RirChild::Block(&match_.fallback));
             }
             Self::OptionMatch(match_) => {
-                let payload_ref = match_.payload.is_some_and(RirOptionPayloadBinding::is_ref);
                 match &match_.subject {
-                    RirOptionSubject::Place(place) => f(RirChild::Place {
-                        place,
-                        use_: if payload_ref {
-                            RirPlaceUse::Borrow(RirParamAbi::SharedBorrow)
-                        } else {
-                            RirPlaceUse::Read
-                        },
-                    }),
-                    RirOptionSubject::MutPlace(place) => f(RirChild::MutPlace {
-                        place,
-                        use_: if payload_ref {
-                            RirPlaceUse::Borrow(RirParamAbi::MutBorrow)
-                        } else {
-                            RirPlaceUse::Read
-                        },
-                    }),
+                    RirOptionSubject::Place(place) => f(RirChild::Place { place }),
+                    RirOptionSubject::MutPlace(place) => f(RirChild::MutPlace { place }),
                 }
                 f(RirChild::Block(&match_.some_block));
                 f(RirChild::Block(&match_.none_block));
             }
             Self::MapEntryMatch(match_) => {
-                f(RirChild::MutPlace {
-                    place: &match_.map,
-                    use_: RirPlaceUse::Mutate,
-                });
+                f(RirChild::MutPlace { place: &match_.map });
                 f(RirChild::Operand {
                     operand: &match_.key,
-                    use_: RirValueUse::Read,
                 });
                 f(RirChild::Block(&match_.some_block));
                 f(RirChild::Block(&match_.none_block));
@@ -1275,43 +1314,6 @@ pub struct RirStructuredBlock {
     pub term: RirTerm,
 }
 
-impl RirStructuredBlock {
-    pub fn for_each_owned_value(&self, f: &mut impl FnMut(&RirOwnedValue)) {
-        for stmt in &self.stmts {
-            stmt.for_each_owned_value(f);
-        }
-        if let RirTerm::ReturnOwned(owned) = &self.term {
-            f(owned);
-        }
-    }
-
-    pub fn for_each_child(&self, f: &mut impl FnMut(RirChild<'_>)) {
-        for stmt in &self.stmts {
-            stmt.for_each_child(f);
-        }
-        match &self.term {
-            RirTerm::Return(Some(value)) => f(RirChild::Operand {
-                operand: value,
-                use_: RirValueUse::Consume,
-            }),
-            RirTerm::ReturnOwned(owned) => owned_operand(
-                f,
-                &owned.value,
-                match owned.source {
-                    RirOwnedSource::Reuse(_) => RirValueUse::Read,
-                    RirOwnedSource::Transfer { .. } => RirValueUse::Consume,
-                },
-            ),
-            RirTerm::None
-            | RirTerm::Return(None)
-            | RirTerm::Break(_)
-            | RirTerm::Continue(_)
-            | RirTerm::Unreachable => {}
-        }
-        f(RirChild::Tail(&self.term));
-    }
-}
-
 #[derive(Debug, Clone, PartialEq)]
 pub struct RirIf {
     pub cond: RirOperand,
@@ -1376,8 +1378,16 @@ pub struct RirDynMatch {
     pub carrier: RirDynCarrierId,
     pub source: RirDynMatchSource,
     pub arms: Vec<RirDynMatchArm>,
+    pub mappings: Vec<RirDynMatchMapping>,
     pub fallback_binding: RirDynMatchFallbackBinding,
     pub fallback: RirStructuredBlock,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RirDynMatchMapping {
+    pub carrier: RirDynCarrierId,
+    pub variants: Vec<RirDynVariantSetId>,
+    pub targets: Vec<Option<usize>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1396,15 +1406,6 @@ pub enum RirDynMatchBinding {
         materializer: RirMaterializerId,
     },
     Alias(RirLocalId),
-}
-
-impl RirDynMatchBinding {
-    pub fn local(self) -> Option<RirLocalId> {
-        match self {
-            Self::Discard => None,
-            Self::Take(local) | Self::Materialize { local, .. } | Self::Alias(local) => Some(local),
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1426,8 +1427,6 @@ impl RirDynMatchFallbackBinding {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct RirDynMatchArm {
-    pub target: RirTypeId,
-    pub variants: Vec<RirDynVariantId>,
     pub binding: RirDynMatchBinding,
     pub block: RirStructuredBlock,
 }
@@ -1503,15 +1502,21 @@ pub struct RirPatternPath {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RirPatternPathStep {
-    Field(RirFieldId),
-    TupleField(u32),
-    OptionalSome,
+    Place(RirPlaceStep),
+    OptionalSome {
+        source_ty: RirTypeId,
+        target_ty: RirTypeId,
+    },
     EnumTupleField {
+        source_ty: RirTypeId,
+        target_ty: RirTypeId,
         enum_id: RirEnumId,
         variant: RirVariantId,
         field: u16,
     },
     EnumStructField {
+        source_ty: RirTypeId,
+        target_ty: RirTypeId,
         enum_id: RirEnumId,
         variant: RirVariantId,
         field: u16,
@@ -1602,99 +1607,50 @@ pub enum RirDynReceiver {
     Borrowed(RirDynBorrow),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RirValueUse {
-    Read,
-    Store,
-    CallValue,
-    Consume,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RirPlaceUse {
-    Read,
-    Mutate,
-    Borrow(RirParamAbi),
-}
-
 #[derive(Debug, Clone, Copy)]
 pub enum RirChild<'a> {
-    Operand {
-        operand: &'a RirOperand,
-        use_: RirValueUse,
-    },
-    Place {
-        place: &'a RirPlace,
-        use_: RirPlaceUse,
-    },
-    MutPlace {
-        place: &'a RirMutPlaceArg,
-        use_: RirPlaceUse,
-    },
-    Collection {
-        collection: &'a RirCollectionAccess,
-        use_: RirPlaceUse,
-    },
+    Operand { operand: &'a RirOperand },
+    Place { place: &'a RirPlace },
+    MutPlace { place: &'a RirMutPlaceArg },
+    Collection { collection: &'a RirCollectionAccess },
     CallArg(&'a RirCallArg),
     CaptureArg(&'a RirLambdaCaptureArg),
     LocalRead(RirLocalId),
     Block(&'a RirStructuredBlock),
-    Tail(&'a RirTerm),
 }
 
-fn operand<'a>(f: &mut impl FnMut(RirChild<'a>), operand: &'a RirOperand, use_: RirValueUse) {
-    f(RirChild::Operand { operand, use_ });
+fn operand<'a>(f: &mut impl FnMut(RirChild<'a>), operand: &'a RirOperand) {
+    f(RirChild::Operand { operand });
 }
 
-fn place<'a>(f: &mut impl FnMut(RirChild<'a>), place: &'a RirPlace, use_: RirPlaceUse) {
-    f(RirChild::Place { place, use_ });
+fn place<'a>(f: &mut impl FnMut(RirChild<'a>), place: &'a RirPlace) {
+    f(RirChild::Place { place });
 }
 
 fn dyn_borrow<'a>(f: &mut impl FnMut(RirChild<'a>), borrow: &'a RirDynBorrow) {
     match &borrow.source {
         RirDynBorrowSource::Concrete { place, .. } | RirDynBorrowSource::Owned { place, .. } => {
-            f(RirChild::MutPlace {
-                place,
-                use_: RirPlaceUse::Read,
-            });
+            f(RirChild::MutPlace { place });
         }
         RirDynBorrowSource::Borrowed { local, .. }
         | RirDynBorrowSource::Reborrowed { local, .. } => f(RirChild::LocalRead(*local)),
     }
 }
 
-fn owned_operand<'a>(
-    f: &mut impl FnMut(RirChild<'a>),
-    owned: &'a RirOwnedOperand,
-    use_: RirValueUse,
-) {
+fn owned_operand<'a>(f: &mut impl FnMut(RirChild<'a>), owned: &'a RirOwnedOperand) {
     match owned {
-        RirOwnedOperand::Value(value) => operand(f, value, use_),
-        RirOwnedOperand::Access(place) => f(RirChild::MutPlace {
-            place,
-            use_: RirPlaceUse::Read,
-        }),
+        RirOwnedOperand::Value(value) => operand(f, value),
+        RirOwnedOperand::Access(place) => f(RirChild::MutPlace { place }),
         RirOwnedOperand::DynBorrow(borrow) => dyn_borrow(f, borrow),
     }
 }
 
 fn owned_value<'a>(f: &mut impl FnMut(RirChild<'a>), owned: &'a RirOwnedValue) {
-    owned_operand(
-        f,
-        &owned.value,
-        match owned.source {
-            RirOwnedSource::Reuse(_) => RirValueUse::Read,
-            RirOwnedSource::Transfer { .. } => RirValueUse::Consume,
-        },
-    );
+    owned_operand(f, &owned.value);
 }
 
-fn collection<'a>(
-    f: &mut impl FnMut(RirChild<'a>),
-    collection: &'a RirCollectionAccess,
-    use_: RirPlaceUse,
-) {
-    f(RirChild::Collection { collection, use_ });
+fn collection<'a>(f: &mut impl FnMut(RirChild<'a>), collection: &'a RirCollectionAccess) {
+    f(RirChild::Collection { collection });
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1719,7 +1675,7 @@ pub enum RirOwnedOperand {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RirOwnedSource {
     Reuse(RirMaterializerId),
-    Transfer { air_local: air::LocalId },
+    Transfer { local: RirLocalId },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1728,35 +1684,25 @@ pub enum RirRValue {
     TakeStaged(RirOperand),
     Materialize(RirOwnedValue),
     DynPack {
-        carrier: RirDynCarrierId,
         variant: RirDynVariantId,
-        air_witness: air::ContractWitnessId,
         value: RirOwnedValue,
         ty: RirTypeId,
     },
     DynWeaken {
-        source: RirDynCarrierId,
-        target: RirDynCarrierId,
-        air_weakening: air::ContractWeakeningId,
+        weakening: RirDynWeakeningId,
         value: RirOwnedValue,
-        arms: Vec<RirDynWeakenArm>,
         ty: RirTypeId,
     },
     DynDowncast {
-        carrier: RirDynCarrierId,
-        air_surface: air::ContractSurfaceId,
+        variants: RirDynVariantSetId,
         value: RirOwnedValue,
-        target: RirTypeId,
-        variants: Vec<RirDynVariantId>,
         ty: RirTypeId,
     },
     DynCall {
-        carrier: RirDynCarrierId,
-        air_slot: air::ContractSlotId,
+        dispatch: RirDynDispatchId,
         exact_variant: Option<RirDynVariantId>,
         receiver: RirDynReceiver,
         args: Vec<RirCallArg>,
-        arms: Vec<RirDynDispatchArm>,
         ty: RirTypeId,
     },
     FunctionValue {
@@ -1845,7 +1791,7 @@ pub enum RirRValue {
     Format {
         value: RirOperand,
         source_ty: RirTypeId,
-        spec: RirFormatSpec,
+        spec: FormatSpec,
     },
     Len {
         source: RirPlace,
@@ -1855,8 +1801,7 @@ pub enum RirRValue {
     },
     SequenceSlotAt {
         collection: RirCollectionAccess,
-        index: RirLocalId,
-        ty: RirTypeId,
+        step: RirPlaceStep,
     },
     ListPush {
         list: RirCollectionAccess,
@@ -1969,10 +1914,8 @@ impl RirRValue {
         }
     }
 
-    pub fn for_each_child(&self, use_: RirValueUse, f: &mut impl FnMut(RirChild<'_>)) {
+    pub fn for_each_child(&self, f: &mut impl FnMut(RirChild<'_>)) {
         match self {
-            Self::Use(value) => operand(f, value, use_),
-            Self::TakeStaged(value) => operand(f, value, RirValueUse::Consume),
             Self::Materialize(owned)
             | Self::DynPack { value: owned, .. }
             | Self::DynWeaken { value: owned, .. }
@@ -1981,16 +1924,12 @@ impl RirRValue {
             Self::DynCall { receiver, args, .. } => {
                 match receiver {
                     RirDynReceiver::Owned(value) => owned_value(f, value),
-                    RirDynReceiver::MutPlace(value) => f(RirChild::MutPlace {
-                        place: value,
-                        use_: RirPlaceUse::Mutate,
-                    }),
+                    RirDynReceiver::MutPlace(value) => f(RirChild::MutPlace { place: value }),
                     RirDynReceiver::Borrowed(borrow) => match &borrow.source {
                         RirDynBorrowSource::Concrete { place, .. }
-                        | RirDynBorrowSource::Owned { place, .. } => f(RirChild::MutPlace {
-                            place,
-                            use_: RirPlaceUse::Mutate,
-                        }),
+                        | RirDynBorrowSource::Owned { place, .. } => {
+                            f(RirChild::MutPlace { place });
+                        }
                         RirDynBorrowSource::Borrowed { local, .. }
                         | RirDynBorrowSource::Reborrowed { local, .. } => {
                             f(RirChild::LocalRead(*local));
@@ -2018,20 +1957,22 @@ impl RirRValue {
                     owned_value(f, value);
                 }
             }
-            Self::Unary { value, .. }
+            Self::Use(value)
+            | Self::TakeStaged(value)
+            | Self::Unary { value, .. }
             | Self::Cast { value, .. }
             | Self::RawProject { value, .. }
             | Self::RawTryConstruct { value, .. }
             | Self::Stringify { value, .. }
-            | Self::Format { value, .. } => operand(f, value, RirValueUse::Read),
+            | Self::Format { value, .. } => operand(f, value),
             Self::OptionalSome { value, .. } => owned_value(f, value),
             Self::Binary { lhs, rhs, .. } | Self::SharedRefEq { lhs, rhs, .. } => {
-                operand(f, lhs, RirValueUse::Read);
-                operand(f, rhs, RirValueUse::Read);
+                operand(f, lhs);
+                operand(f, rhs);
             }
             Self::Call { callee, args, .. } => {
                 if let RirCallTarget::LambdaValue { callee, .. } = callee {
-                    operand(f, callee, RirValueUse::CallValue);
+                    operand(f, callee);
                 }
                 for arg in args {
                     f(RirChild::CallArg(arg));
@@ -2039,17 +1980,21 @@ impl RirRValue {
             }
             Self::StringConcat { parts } => {
                 for part in parts {
-                    operand(f, part, RirValueUse::Read);
+                    operand(f, part);
                 }
             }
-            Self::Len { source } => place(f, source, RirPlaceUse::Read),
-            Self::CollectionLen { source } => collection(f, source, RirPlaceUse::Read),
+            Self::Len { source } => place(f, source),
+            Self::CollectionLen { source } => collection(f, source),
             Self::SequenceSlotAt {
                 collection: source,
-                index,
-                ..
+                step,
+            } => {
+                collection(f, source);
+                f(RirChild::LocalRead(
+                    step.index_local().expect("sequence slot step"),
+                ));
             }
-            | Self::MapEntryAt {
+            Self::MapEntryAt {
                 map: source, index, ..
             }
             | Self::MapKeyAt {
@@ -2058,59 +2003,39 @@ impl RirRValue {
             | Self::MapValueAt {
                 map: source, index, ..
             } => {
-                collection(f, source, RirPlaceUse::Read);
+                collection(f, source);
                 f(RirChild::LocalRead(*index));
             }
             Self::ListPush { list, value } => {
-                collection(f, list, RirPlaceUse::Mutate);
+                collection(f, list);
                 owned_value(f, value);
             }
             Self::SliceView {
-                source,
-                start,
-                end,
-                mutable,
-                ..
+                source, start, end, ..
             } => {
-                collection(
-                    f,
-                    source,
-                    RirPlaceUse::Borrow(if *mutable {
-                        RirParamAbi::MutBorrow
-                    } else {
-                        RirParamAbi::SharedBorrow
-                    }),
-                );
+                collection(f, source);
                 f(RirChild::LocalRead(*start));
                 f(RirChild::LocalRead(*end));
             }
             Self::RangeListCopy {
                 source, start, end, ..
             } => {
-                place(f, source, RirPlaceUse::Read);
+                place(f, source);
                 f(RirChild::LocalRead(*start));
                 f(RirChild::LocalRead(*end));
             }
             Self::MapGet { map, key, .. } | Self::MapRemove { map, key, .. } => {
-                collection(
-                    f,
-                    map,
-                    if matches!(self, Self::MapRemove { .. }) {
-                        RirPlaceUse::Mutate
-                    } else {
-                        RirPlaceUse::Read
-                    },
-                );
-                operand(f, key, RirValueUse::Read);
+                collection(f, map);
+                operand(f, key);
             }
             Self::MapInsert {
                 map, key, value, ..
             } => {
-                collection(f, map, RirPlaceUse::Mutate);
+                collection(f, map);
                 owned_value(f, key);
                 owned_value(f, value);
             }
-            Self::CheckedIterCount { count, .. } => operand(f, count, RirValueUse::Read),
+            Self::CheckedIterCount { count, .. } => operand(f, count),
             Self::Lambda { captures, .. } => {
                 for capture in captures {
                     f(RirChild::CaptureArg(capture));
@@ -2120,47 +2045,10 @@ impl RirRValue {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct RirFormatSpec {
-    pub fill: char,
-    pub align: Option<RirFormatAlign>,
-    pub sign: RirFormatSign,
-    pub zero_pad: bool,
-    pub width: Option<u32>,
-    pub precision: Option<u32>,
-    pub kind: RirFormatKind,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RirFormatAlign {
-    Left,
-    Right,
-    Center,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum RirFormatSign {
-    #[default]
-    Default,
-    Always,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum RirFormatKind {
-    #[default]
-    Default,
-    Hex,
-    HexUpper,
-    Binary,
-    Exp,
-    ExpUpper,
-}
-
 #[derive(Debug, Clone, PartialEq)]
 pub enum RirLambdaCaptureArg {
     Owned { value: RirOwnedValue },
     Shared { place: RirPlace },
-    Scoped { place: RirPlace },
     StackCell { cell: RirCellRef },
     HeapCell { cell: RirCellRef },
     ScopedPlaceCell { cell: RirScopedPlaceCellRef },
@@ -2180,15 +2068,14 @@ pub enum RirCallTarget {
 pub struct RirDynBorrow {
     pub source: RirDynBorrowSource,
     pub target: RirDynCarrierId,
-    pub air_weakening: Option<air::ContractWeakeningId>,
+    pub weakening: Option<RirDynWeakeningId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RirDynBorrowSource {
     Concrete {
         place: RirMutPlaceArg,
-        carrier: RirDynCarrierId,
-        air_witness: air::ContractWitnessId,
+        variant: RirDynVariantId,
     },
     Owned {
         place: RirMutPlaceArg,
@@ -2245,95 +2132,26 @@ impl RirCallArg {
         }
     }
 
-    pub fn semantic(&self) -> RirParamSemantic {
+    pub fn mode(&self) -> RirPassMode {
         match self {
             Self::Value(_) | Self::InitFieldProvided(_) | Self::InitFieldOmitted => {
-                RirParamSemantic::Value
+                RirPassMode::Value
             }
-            Self::SharedBorrow(_) | Self::SharedStringConst(_) => RirParamSemantic::SharedBorrow,
-            Self::MutBorrow(_) => RirParamSemantic::MutBorrow,
-            Self::MutPlace(_) => RirParamSemantic::MutPlace,
-            Self::DynBorrow(_) => RirParamSemantic::DynBorrow,
-            Self::ScopedLambda { .. } => RirParamSemantic::ScopedLambda,
-            Self::EscapingLambda { .. } => RirParamSemantic::EscapingLambda,
-            Self::AnvCallback { .. } => RirParamSemantic::AnvCallback,
+            Self::SharedBorrow(_) | Self::SharedStringConst(_) => RirPassMode::SharedBorrow,
+            Self::MutBorrow(_) => RirPassMode::MutBorrow,
+            Self::MutPlace(_) => RirPassMode::MutPlace,
+            Self::DynBorrow(_) => RirPassMode::DynBorrow,
+            Self::ScopedLambda { .. } => RirPassMode::ScopedLambda,
+            Self::EscapingLambda { .. } => RirPassMode::EscapingLambda,
+            Self::AnvCallback { .. } => RirPassMode::AnvCallback,
         }
     }
-
-    pub fn adapted_to(&self, semantic: RirParamSemantic, program: &RirProgram) -> Option<Self> {
-        if self.semantic() == semantic {
-            return Some(self.clone());
-        }
-        match (semantic, self) {
-            (RirParamSemantic::Value, Self::SharedBorrow(place)) => {
-                reusable_place_value(program, place).map(Self::Value)
-            }
-            (RirParamSemantic::SharedBorrow, Self::Value(owned)) => {
-                reusable_owned_place(owned).cloned().map(Self::SharedBorrow)
-            }
-            (
-                RirParamSemantic::ScopedLambda
-                | RirParamSemantic::EscapingLambda
-                | RirParamSemantic::AnvCallback,
-                Self::SharedBorrow(place),
-            ) => adapt_callback(semantic, reusable_place_value(program, place)?, program),
-            (
-                RirParamSemantic::ScopedLambda
-                | RirParamSemantic::EscapingLambda
-                | RirParamSemantic::AnvCallback,
-                Self::Value(owned),
-            ) => adapt_callback(semantic, owned.clone(), program),
-            _ => None,
-        }
-    }
-}
-
-fn reusable_place_value(program: &RirProgram, place: &RirPlace) -> Option<RirOwnedValue> {
-    let materializer = program
-        .value_materializers
-        .get(place.ty.index())
-        .copied()
-        .flatten()?;
-    Some(RirOwnedValue {
-        value: RirOwnedOperand::Value(RirOperand::Place(place.clone())),
-        source: RirOwnedSource::Reuse(materializer),
-    })
-}
-
-fn reusable_owned_place(owned: &RirOwnedValue) -> Option<&RirPlace> {
-    match (&owned.value, owned.source) {
-        (RirOwnedOperand::Value(RirOperand::Place(place)), RirOwnedSource::Reuse(_)) => Some(place),
-        _ => None,
-    }
-}
-
-fn adapt_callback(
-    semantic: RirParamSemantic,
-    callee: RirOwnedValue,
-    program: &RirProgram,
-) -> Option<RirCallArg> {
-    let ty = match &callee.value {
-        RirOwnedOperand::Value(RirOperand::Place(place)) => place.ty,
-        RirOwnedOperand::Value(RirOperand::Const(id)) => program.consts.get(id.index())?.ty,
-        RirOwnedOperand::Access(place) => place.ty,
-        RirOwnedOperand::DynBorrow(_) => return None,
-    };
-    let RirType::Lambda(sig) = program.types.get(ty.index())? else {
-        return None;
-    };
-    Some(match semantic {
-        RirParamSemantic::ScopedLambda => RirCallArg::ScopedLambda { callee, sig: *sig },
-        RirParamSemantic::EscapingLambda => RirCallArg::EscapingLambda { callee, sig: *sig },
-        RirParamSemantic::AnvCallback => RirCallArg::AnvCallback { callee, sig: *sig },
-        _ => return None,
-    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RirMutPlaceArg {
     pub access: RirMutPlaceAccess,
-    pub projections: Vec<RirProjection>,
-    pub ty: RirTypeId,
+    pub projections: Vec<RirPlaceStep>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2341,50 +2159,21 @@ pub enum RirMutPlaceAccess {
     Handle(RirMutPlaceHandle),
     DataRef {
         object: RirOperand,
-        dataref: RirDataRefId,
+        place: RirDataRefPlaceId,
     },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RirMutPlaceHandle {
-    Local {
-        local: RirLocalId,
-        ty: RirTypeId,
-    },
-    Param {
-        local: RirLocalId,
-        ty: RirTypeId,
-    },
-    StackCell {
-        cell: RirCellRef,
-        ty: RirTypeId,
-    },
-    HeapCell {
-        cell: RirCellRef,
-        ty: RirTypeId,
-    },
-    ScopedPlaceCell {
-        cell: RirScopedPlaceCellRef,
-        ty: RirTypeId,
-    },
-    Global {
-        global: RirGlobalId,
-        ty: RirTypeId,
-    },
+    Local { local: RirLocalId },
+    Param { local: RirLocalId },
+    StackCell { cell: RirCellRef },
+    HeapCell { cell: RirCellRef },
+    ScopedPlaceCell { cell: RirScopedPlaceCellRef },
+    Global { global: RirGlobalId },
 }
 
 impl RirMutPlaceHandle {
-    pub fn ty(&self) -> RirTypeId {
-        match self {
-            Self::Local { ty, .. }
-            | Self::Param { ty, .. }
-            | Self::StackCell { ty, .. }
-            | Self::HeapCell { ty, .. }
-            | Self::ScopedPlaceCell { ty, .. }
-            | Self::Global { ty, .. } => *ty,
-        }
-    }
-
     pub fn local(&self) -> Option<RirLocalId> {
         match self {
             Self::Local { local, .. } | Self::Param { local, .. } => Some(*local),
@@ -2396,88 +2185,18 @@ impl RirMutPlaceHandle {
     }
 }
 
-impl RirMutPlaceAccess {
-    pub fn ty(&self) -> Option<RirTypeId> {
-        match self {
-            Self::Handle(handle) => Some(handle.ty()),
-            Self::DataRef { .. } => None,
-        }
-    }
-}
-
 impl RirMutPlaceArg {
-    pub fn from_handle(
-        handle: RirMutPlaceHandle,
-        projections: Vec<RirProjection>,
-        ty: RirTypeId,
-    ) -> Self {
+    pub fn from_handle(handle: RirMutPlaceHandle, projections: Vec<RirPlaceStep>) -> Self {
         Self {
             access: RirMutPlaceAccess::Handle(handle),
             projections,
-            ty,
         }
     }
 
-    pub fn projected(
-        handle: RirMutPlaceHandle,
-        projections: Vec<RirProjection>,
-        ty: RirTypeId,
-    ) -> Self {
-        Self::from_handle(handle, projections, ty)
-    }
-
-    pub fn local(place: RirPlace) -> Self {
-        let RirPlaceRoot::Local(local) = place.root else {
-            unreachable!("expected a local RIR place")
-        };
-        Self {
-            access: RirMutPlaceAccess::Handle(RirMutPlaceHandle::Local {
-                local,
-                ty: place.ty,
-            }),
-            projections: place.projections,
-            ty: place.ty,
-        }
-    }
-
-    pub fn param(local: RirLocalId, ty: RirTypeId) -> Self {
-        Self {
-            access: RirMutPlaceAccess::Handle(RirMutPlaceHandle::Param { local, ty }),
-            projections: vec![],
-            ty,
-        }
-    }
-
-    pub fn stack_cell(cell: RirCellRef, ty: RirTypeId) -> Self {
-        Self {
-            access: RirMutPlaceAccess::Handle(RirMutPlaceHandle::StackCell { cell, ty }),
-            projections: vec![],
-            ty,
-        }
-    }
-
-    pub fn heap_cell(cell: RirCellRef, ty: RirTypeId) -> Self {
-        Self {
-            access: RirMutPlaceAccess::Handle(RirMutPlaceHandle::HeapCell { cell, ty }),
-            projections: vec![],
-            ty,
-        }
-    }
-
-    pub fn scoped_place_cell(cell: RirScopedPlaceCellRef, ty: RirTypeId) -> Self {
-        Self {
-            access: RirMutPlaceAccess::Handle(RirMutPlaceHandle::ScopedPlaceCell { cell, ty }),
-            projections: vec![],
-            ty,
-        }
-    }
-
-    pub fn global(global: RirGlobalId, ty: RirTypeId) -> Self {
-        Self {
-            access: RirMutPlaceAccess::Handle(RirMutPlaceHandle::Global { global, ty }),
-            projections: vec![],
-            ty,
-        }
+    pub fn final_ty(&self, root_ty: RirTypeId) -> RirTypeId {
+        self.projections
+            .last()
+            .map_or(root_ty, |step| step.target_ty)
     }
 
     pub fn root_local(&self) -> Option<RirLocalId> {
@@ -2489,22 +2208,21 @@ impl RirMutPlaceArg {
 
     pub fn uses_local(&self, local: RirLocalId) -> bool {
         self.root_local() == Some(local)
-            || self.projections.iter().any(
-                |projection| matches!(projection, RirProjection::Index(index) if *index == local),
-            )
+            || self
+                .projections
+                .iter()
+                .any(|projection| projection.index_local() == Some(local))
             || matches!(&self.access, RirMutPlaceAccess::DataRef { object: RirOperand::Place(place), .. } if place.uses_local(local))
     }
 
     pub fn dataref(
         object: RirOperand,
-        dataref: RirDataRefId,
-        projections: Vec<RirProjection>,
-        ty: RirTypeId,
+        place: RirDataRefPlaceId,
+        projections: Vec<RirPlaceStep>,
     ) -> Self {
         Self {
-            access: RirMutPlaceAccess::DataRef { object, dataref },
+            access: RirMutPlaceAccess::DataRef { object, place },
             projections,
-            ty,
         }
     }
 }
@@ -2518,32 +2236,30 @@ pub enum RirPlaceRoot {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RirPlace {
     pub root: RirPlaceRoot,
-    pub projections: Vec<RirProjection>,
-    pub ty: RirTypeId,
+    pub projections: Vec<RirPlaceStep>,
 }
 
 impl RirPlace {
-    pub fn local(local: RirLocalId, projections: Vec<RirProjection>, ty: RirTypeId) -> Self {
+    pub fn local(local: RirLocalId, projections: Vec<RirPlaceStep>) -> Self {
         Self {
             root: RirPlaceRoot::Local(local),
             projections,
-            ty,
         }
     }
 
-    pub fn global(global: RirGlobalId, projections: Vec<RirProjection>, ty: RirTypeId) -> Self {
+    pub fn global(global: RirGlobalId, projections: Vec<RirPlaceStep>) -> Self {
         Self {
             root: RirPlaceRoot::Global(global),
             projections,
-            ty,
         }
     }
 
     pub fn uses_local(&self, local: RirLocalId) -> bool {
         self.root == RirPlaceRoot::Local(local)
-            || self.projections.iter().any(
-                |projection| matches!(projection, RirProjection::Index(index) if *index == local),
-            )
+            || self
+                .projections
+                .iter()
+                .any(|projection| projection.index_local() == Some(local))
     }
 }
 
@@ -2554,13 +2270,6 @@ pub enum RirCollectionAccess {
 }
 
 impl RirCollectionAccess {
-    pub fn ty(&self) -> RirTypeId {
-        match self {
-            Self::Direct(place) => place.ty,
-            Self::MutPlace(place) => place.ty,
-        }
-    }
-
     pub fn uses_local(&self, local: RirLocalId) -> bool {
         match self {
             Self::Direct(place) => place.uses_local(local),
@@ -2589,11 +2298,46 @@ impl RirCollectionAccess {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RirProjection {
-    Field(RirFieldId),
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct RirPlaceStep {
+    pub source_ty: RirTypeId,
+    pub target_ty: RirTypeId,
+    pub kind: RirPlaceStepKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum RirPlaceStepKind {
+    StructField(RirFieldId),
+    DataRefField(RirFieldId),
+    ExternField(RirFieldId),
     TupleField(RirFieldId),
-    Index(RirLocalId),
+    ArrayIndex {
+        index: RirLocalId,
+        len: u64,
+        elem_materializer: RirMaterializerId,
+    },
+    ListIndex {
+        index: RirLocalId,
+        elem_materializer: RirMaterializerId,
+    },
+    SliceIndex {
+        index: RirLocalId,
+        elem_materializer: RirMaterializerId,
+    },
+}
+
+impl RirPlaceStep {
+    pub fn index_local(self) -> Option<RirLocalId> {
+        match self.kind {
+            RirPlaceStepKind::ArrayIndex { index, .. }
+            | RirPlaceStepKind::ListIndex { index, .. }
+            | RirPlaceStepKind::SliceIndex { index, .. } => Some(index),
+            RirPlaceStepKind::StructField(_)
+            | RirPlaceStepKind::DataRefField(_)
+            | RirPlaceStepKind::ExternField(_)
+            | RirPlaceStepKind::TupleField(_) => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2665,68 +2409,70 @@ pub enum RirConstValue {
     Nil,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RirNativeReturn {
+    Void,
+    Value(ExternTypeExpr),
+    OwnedNamed {
+        ty: ExternTypeExpr,
+        adopt: bool,
+    },
+    Option {
+        payload_ty: RirTypeId,
+        payload: Box<RirNativeReturn>,
+    },
+    Result {
+        ok_ty: RirTypeId,
+        ok: Box<RirNativeReturn>,
+        err_ty: RirTypeId,
+        err: Box<RirNativeReturn>,
+    },
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct RirExtern {
     pub id: RirExternId,
-    pub air_id: Option<air::ExternId>,
-    pub symbol: RirSymbol,
-    pub kind: RirExternKind,
+    pub path: RustPath,
     pub params: Vec<RirExternParam>,
     pub ret: RirTypeId,
-    pub abi: air::ExternAbi,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum RirExternKind {
-    Native(RirNativeExtern),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RirNativeExtern {
-    pub path: Vec<String>,
-    pub abi: RustExternAbi,
+    pub ret_plan: RirNativeReturn,
     pub callback_receiver: Option<usize>,
+    pub ctx: RustWrapperCtx,
+    pub fallible: bool,
+    pub suspends_runtime_entry: bool,
 }
 
-impl RirNativeExtern {
-    pub(super) fn new(path: Vec<String>, abi: RustExternAbi) -> Self {
-        Self {
-            path,
-            abi,
-            callback_receiver: None,
+impl RirExtern {
+    pub(super) fn arg_action(
+        &self,
+        index: usize,
+        arg: &RirCallArg,
+    ) -> native_call::NativeArgAction {
+        let action = self.params[index].action;
+        match (action, arg) {
+            (native_call::NativeArgAction::SnapshotString, RirCallArg::SharedStringConst(_))
+            | (native_call::NativeArgAction::RejectLiveBoundary, RirCallArg::InitFieldOmitted) => {
+                native_call::NativeArgAction::Direct
+            }
+            _ => action,
         }
     }
 
-    pub(super) fn with_callback_receiver(mut self, receiver: Option<usize>) -> Self {
-        self.callback_receiver = receiver;
-        self
-    }
-
-    pub(super) fn call_plan(&self, retained_callbacks: bool) -> native_call::NativeCallPlan {
-        native_call::NativeCallPlan::for_abi(&self.abi, retained_callbacks)
+    pub(super) fn rejects_reentry_arg(&self, index: usize, arg: &RirCallArg) -> bool {
+        self.arg_action(index, arg) == native_call::NativeArgAction::RejectLiveBoundary
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RirExternParam {
     pub ty: RirTypeId,
-    pub semantic: RirParamSemantic,
-    pub abi: RirParamAbi,
+    pub mode: RirPassMode,
     pub escape: RirParamEscape,
+    pub abi: RustParamAbi,
+    pub(super) action: native_call::NativeArgAction,
 }
 
-#[derive(Debug, Clone, Copy)]
-pub struct VerifiedRirProgram<'a> {
-    program: &'a RirProgram,
-}
-
-impl<'a> VerifiedRirProgram<'a> {
-    pub fn program(&self) -> &'a RirProgram {
-        self.program
-    }
-}
-
-pub fn verify(program: &RirProgram) -> Result<VerifiedRirProgram<'_>, Vec<RirVerifyError>> {
+pub(super) fn verify(program: &RirProgram) -> Result<(), Vec<RirVerifyError>> {
     let mut cx = VerifyCx::new(program);
     cx.check();
     if !super::exact_witness::is_canonical(program) {
@@ -2736,1136 +2482,10 @@ pub fn verify(program: &RirProgram) -> Result<VerifiedRirProgram<'_>, Vec<RirVer
         });
     }
     if cx.errors.is_empty() {
-        Ok(VerifiedRirProgram { program })
+        Ok(())
     } else {
         Err(cx.errors)
     }
-}
-
-pub fn verify_with_air<'a>(
-    program: &'a RirProgram,
-    air: &air::Program,
-) -> Result<VerifiedRirProgram<'a>, Vec<RirVerifyError>> {
-    verify_with_air_and_native(program, air, &[])
-}
-
-pub fn verify_with_air_and_native<'a>(
-    program: &'a RirProgram,
-    air: &air::Program,
-    native: &[anvyx_runtime::RustProviderSupport],
-) -> Result<VerifiedRirProgram<'a>, Vec<RirVerifyError>> {
-    let mut errors = match verify(program) {
-        Ok(_) => vec![],
-        Err(errors) => errors,
-    };
-    let invalid = || RirVerifyError {
-        site: RirVerifySite::Program,
-        kind: RirVerifyErrorKind::InvalidDynOrigin,
-    };
-    for surface in &program.dyn_origins.surfaces {
-        if surface.index() >= air.contract_surfaces.len() {
-            errors.push(invalid());
-        }
-    }
-    for origin in &program.dyn_origins.witnesses {
-        let valid = air
-            .contract_witnesses
-            .get(origin.air_witness.index())
-            .is_some_and(|witness| {
-                witness.key.surface == origin.surface
-                    && air_rir_type_matches(
-                        air,
-                        program,
-                        witness.key.concrete_ty,
-                        origin.concrete_ty,
-                        &mut std::collections::BTreeSet::new(),
-                    )
-            });
-        if !valid {
-            errors.push(invalid());
-        }
-    }
-    for origin in &program.dyn_origins.weakenings {
-        let valid = air
-            .contract_weakenings
-            .get(origin.air_weakening.index())
-            .is_some_and(|weakening| {
-                weakening.source == origin.source && weakening.target == origin.target
-            });
-        if !valid {
-            errors.push(invalid());
-        }
-    }
-    for origin in &program.dyn_origins.slots {
-        let valid = air
-            .contract_surfaces
-            .get(origin.surface.index())
-            .is_some_and(|surface| surface.slots.iter().any(|slot| slot.id == origin.air_slot));
-        if !valid {
-            errors.push(invalid());
-        }
-    }
-    for enm in &program.enums {
-        if let Some(air_id) = enm.air_id
-            && !air_enum_metadata_matches(air, program, air_id, enm)
-        {
-            errors.push(RirVerifyError {
-                site: RirVerifySite::Program,
-                kind: RirVerifyErrorKind::InvalidAirMetadata,
-            });
-        }
-    }
-    for flag in &program.flags {
-        if !air_flag_metadata_matches(air, flag) {
-            errors.push(RirVerifyError {
-                site: RirVerifySite::Program,
-                kind: RirVerifyErrorKind::InvalidAirMetadata,
-            });
-        }
-    }
-    for helper in &program.stringify_helpers {
-        if !air_stringify_metadata_matches(air, program, helper) {
-            errors.push(RirVerifyError {
-                site: RirVerifySite::Program,
-                kind: RirVerifyErrorKind::InvalidAirMetadata,
-            });
-        }
-    }
-    for carrier in &program.dyn_carriers {
-        let storage_matches = air.type_arena.iter().enumerate().any(|(index, ty)| {
-            matches!(ty, air::TypeData::Dyn(surface) if *surface == carrier.air_surface)
-                && RirTypeId::from_index(index) == carrier.storage_ty
-                && air_rir_type_matches(
-                    air,
-                    program,
-                    air::TypeId::from_index(index),
-                    carrier.storage_ty,
-                    &mut std::collections::BTreeSet::new(),
-                )
-        });
-        if !storage_matches {
-            errors.push(invalid());
-        }
-    }
-    let classes = TypePassClasses::analyze(air);
-    let physical = RustRepresentationPlan::new(air, &classes).dynamic_layout_plan();
-    let physical_valid = physical.is_ok_and(|physical| {
-        physical.carriers.len() == program.dyn_carriers.len()
-            && physical.carriers.iter().all(|planned| {
-                program
-                    .dyn_carriers
-                    .iter()
-                    .find(|carrier| carrier.air_surface == planned.surface)
-                    .is_some_and(|carrier| {
-                        carrier.variants.len() == planned.variants.len()
-                            && planned.variants.iter().all(|planned| {
-                                carrier.variants.iter().any(|variant| {
-                                    variant.air_witness == planned.witness
-                                        && variant.concrete_ty.index()
-                                            == planned.concrete_ty.index()
-                                        && (variant.storage
-                                            == match planned.storage {
-                                                RustPayloadStorage::Inline => RirDynStorage::Inline,
-                                                RustPayloadStorage::Boxed => RirDynStorage::Boxed,
-                                            }
-                                            || (matches!(
-                                                air.type_arena.data(planned.concrete_ty),
-                                                air::TypeData::Function(_)
-                                            ) && variant.storage == RirDynStorage::Boxed))
-                                        && expected_dynamic_payload(program, planned.witness)
-                                            == Some(variant.payload)
-                                })
-                            })
-                    })
-            })
-    });
-    if !physical_valid {
-        errors.push(invalid());
-    }
-    verify_dynamic_weakenings(program, air, &mut errors);
-    verify_dynamic_dispatch_origins(program, air, &mut errors);
-    verify_owned_transfer_origins(program, air, &mut errors);
-    verify_native_materializers(program, air, native, &mut errors);
-    if errors.is_empty() {
-        Ok(VerifiedRirProgram { program })
-    } else {
-        Err(errors)
-    }
-}
-
-fn verify_native_materializers(
-    program: &RirProgram,
-    air: &air::Program,
-    native: &[anvyx_runtime::RustProviderSupport],
-    errors: &mut Vec<RirVerifyError>,
-) {
-    let invalid = || RirVerifyError {
-        site: RirVerifySite::Program,
-        kind: RirVerifyErrorKind::InvalidAirMetadata,
-    };
-    for (air_index, ty) in air.type_arena.iter().enumerate() {
-        let air::TypeData::Extern(extern_id) = ty else {
-            continue;
-        };
-        let decl = air.extern_type(*extern_id);
-        let Some(source) = decl
-            .binding
-            .as_ref()
-            .and_then(|binding| native::type_binding(native, binding))
-        else {
-            errors.push(invalid());
-            continue;
-        };
-        let air_ty = air::TypeId::from_index(air_index);
-        let matched = program.types.iter().enumerate().filter_map(|(index, _)| {
-            let rir_ty = RirTypeId::from_index(index);
-            air_rir_type_matches(
-                air,
-                program,
-                air_ty,
-                rir_ty,
-                &mut std::collections::BTreeSet::new(),
-            )
-            .then_some(rir_ty)
-        });
-        let matches = matched
-            .filter(|rir_ty| native_type_support_matches(program, *rir_ty, decl, source))
-            .count();
-        if matches != 1 {
-            errors.push(invalid());
-        }
-    }
-}
-
-fn native_type_support_matches(
-    program: &RirProgram,
-    ty: RirTypeId,
-    decl: &air::ExternTypeDecl,
-    source: &anvyx_runtime::RustTypeBinding,
-) -> bool {
-    let path = std::iter::once(source.path.crate_name.clone())
-        .chain(source.path.segments.iter().cloned())
-        .collect::<Vec<_>>();
-    let metadata_matches = match program.types.get(ty.index()) {
-        Some(RirType::Struct(id)) => program.structs.get(id.index()).is_some_and(|rir| {
-            rir.native_path.as_ref() == Some(&path)
-                && rir.native_key.as_ref() == Some(&source.key)
-                && rir.native_ref == (decl.rep == air::ExternRep::Shared)
-                && rir.copyable
-                    == matches!(
-                        decl.materialization,
-                        Some(anvyx_runtime::ExternMaterialization::Copy)
-                    )
-        }),
-        Some(RirType::Enum(id)) => program.enums.get(id.index()).is_some_and(|rir| {
-            rir.native_path.as_ref() == Some(&path)
-                && rir.native_key.as_ref() == Some(&source.key)
-                && rir.copyable
-                    == matches!(
-                        decl.materialization,
-                        Some(anvyx_runtime::ExternMaterialization::Copy)
-                    )
-        }),
-        _ => false,
-    };
-    let materializers = program
-        .materializers
-        .iter()
-        .filter(|materializer| materializer.ty == ty)
-        .collect::<Vec<_>>();
-    metadata_matches
-        && !materializers.is_empty()
-        && materializers
-            .into_iter()
-            .all(|materializer| match decl.materialization {
-                Some(mode @ anvyx_runtime::ExternMaterialization::Copy) => {
-                    source.validated_materializer(mode).is_some()
-                        && matches!(materializer.action, RirMaterializerAction::Copy)
-                }
-                Some(mode @ anvyx_runtime::ExternMaterialization::Materialize) => {
-                    let expected = source.validated_materializer(mode);
-                    matches!(
-                        &materializer.action,
-                        RirMaterializerAction::ProviderMaterialize { binding }
-                            if Some(binding) == expected
-                    )
-                }
-                None => {
-                    decl.rep == air::ExternRep::Shared
-                        && source.materializer.is_none()
-                        && matches!(materializer.action, RirMaterializerAction::IdentityShare)
-                }
-            })
-}
-
-fn expected_dynamic_payload(
-    program: &RirProgram,
-    witness: air::ContractWitnessId,
-) -> Option<RirMaterializerId> {
-    program.materializers.iter().find_map(|materializer| {
-        let RirMaterializerAction::DynamicMaterialize { variants, .. } = &materializer.action
-        else {
-            return None;
-        };
-        variants
-            .iter()
-            .find(|variant| variant.witness == witness)
-            .map(|variant| variant.payload)
-    })
-}
-
-fn air_enum_metadata_matches(
-    air: &air::Program,
-    rir: &RirProgram,
-    air_id: air::EnumId,
-    enm: &RirEnum,
-) -> bool {
-    let Some(source) = air.enums.get(air_id.index()) else {
-        return false;
-    };
-    let repr_matches = matches!(
-        (source.repr, enm.repr),
-        (air::EnumRepr::Adt, RirEnumRepr::Adt)
-            | (air::EnumRepr::RawInt, RirEnumRepr::RawInt)
-            | (air::EnumRepr::RawString, RirEnumRepr::RawString)
-    );
-    repr_matches
-        && source.name.as_str() == enm.display.as_str()
-        && source.variants.len() == enm.variants.len()
-        && source
-            .variants
-            .iter()
-            .zip(&enm.variants)
-            .all(|(source, target)| {
-                source.name.as_str() == target.display.as_str()
-                    && match (&source.raw_value, &target.raw_value) {
-                        (None, None) => true,
-                        (Some(air::RawEnumValue::Int(a)), Some(RirRawEnumValue::Int(b))) => a == b,
-                        (Some(air::RawEnumValue::String(a)), Some(RirRawEnumValue::String(b))) => {
-                            rir.string_literals
-                                .get(b.index())
-                                .is_some_and(|literal| literal.text == *a)
-                        }
-                        _ => false,
-                    }
-            })
-}
-
-fn air_flag_metadata_matches(air: &air::Program, flag: &RirFlag) -> bool {
-    let Some(source) = air.flags.get(flag.air_id.index()) else {
-        return false;
-    };
-    source.name.as_str() == flag.display.as_str()
-        && source.known_bits == flag.known_bits
-        && source.members.len() == flag.members.len()
-        && source
-            .members
-            .iter()
-            .zip(&flag.members)
-            .all(|(source, target)| {
-                source.id.index() == target.id.index()
-                    && source.name.as_str() == target.display.as_str()
-                    && source.value == target.value
-                    && source.atomic == target.atomic
-            })
-}
-
-fn air_stringify_metadata_matches(
-    air: &air::Program,
-    rir: &RirProgram,
-    helper: &RirStringifyHelper,
-) -> bool {
-    match &helper.kind {
-        RirStringifyHelperKind::Struct(strukt) => {
-            let Some(target) = rir.structs.get(strukt.index()) else {
-                return false;
-            };
-            let Some(air_id) = target.air_id else {
-                return false;
-            };
-            let Some(source) = air.aggregates.get(air_id.index()) else {
-                return false;
-            };
-            source.kind == air::AggregateKind::Struct
-                && source.name.as_str() == target.display.as_str()
-                && source.fields.len() == target.fields.len()
-        }
-        RirStringifyHelperKind::Enum { enm, variants } => {
-            let Some(target) = rir.enums.get(enm.index()) else {
-                return false;
-            };
-            let Some(air_id) = target.air_id else {
-                return false;
-            };
-            let Some(source) = air.enums.get(air_id.index()) else {
-                return false;
-            };
-            variants.len() == source.variants.len()
-                && variants
-                    .iter()
-                    .zip(&source.variants)
-                    .all(|(plan, variant)| {
-                        let label = format!("{}.{}", source.name.as_str(), variant.name.as_str());
-                        rir.string_literals
-                            .get(plan.label.index())
-                            .is_some_and(|literal| literal.text == label)
-                            && match &variant.shape {
-                                air::VariantShape::Struct(fields) => {
-                                    plan.field_labels.len() == fields.len()
-                                        && plan.field_labels.iter().zip(fields).all(
-                                            |(id, field)| {
-                                                rir.string_literals.get(id.index()).is_some_and(
-                                                    |literal| {
-                                                        literal.text
-                                                            == format!("{}: ", field.name.as_str())
-                                                    },
-                                                )
-                                            },
-                                        )
-                                }
-                                air::VariantShape::Unit | air::VariantShape::Tuple(_) => {
-                                    plan.field_labels.is_empty()
-                                }
-                            }
-                    })
-        }
-        RirStringifyHelperKind::Flag {
-            flag,
-            empty,
-            members,
-        } => {
-            let Some(target) = rir.flags.get(flag.index()) else {
-                return false;
-            };
-            let Some(source) = air.flags.get(target.air_id.index()) else {
-                return false;
-            };
-            rir.string_literals
-                .get(empty.index())
-                .is_some_and(|literal| literal.text == format!("{}.empty()", source.name.as_str()))
-                && members.len() == source.members.len()
-                && members.iter().zip(&source.members).all(|(id, member)| {
-                    rir.string_literals.get(id.index()).is_some_and(|literal| {
-                        literal.text == format!("{}.{}", source.name.as_str(), member.name.as_str())
-                    })
-                })
-        }
-    }
-}
-
-fn air_rir_type_matches(
-    air_program: &air::Program,
-    rir: &RirProgram,
-    air_ty: air::TypeId,
-    rir_ty: RirTypeId,
-    visiting: &mut std::collections::BTreeSet<(air::TypeId, RirTypeId)>,
-) -> bool {
-    if !visiting.insert((air_ty, rir_ty)) {
-        return true;
-    }
-    let matches =
-        match (
-            air_program.type_arena.data(air_ty),
-            rir.types.get(rir_ty.index()),
-        ) {
-            (air::TypeData::Int, Some(RirType::Int))
-            | (air::TypeData::Float, Some(RirType::Float))
-            | (air::TypeData::Bool, Some(RirType::Bool))
-            | (air::TypeData::String, Some(RirType::String))
-            | (air::TypeData::Char, Some(RirType::Char))
-            | (air::TypeData::Void, Some(RirType::Void)) => true,
-            (air::TypeData::Dyn(surface), Some(RirType::Enum(_))) => rir
-                .dyn_carriers
-                .iter()
-                .any(|carrier| carrier.air_surface == *surface && carrier.storage_ty == rir_ty),
-            (air::TypeData::Optional(inner), Some(RirType::Option(rir_inner)))
-            | (air::TypeData::List(inner), Some(RirType::List(rir_inner)))
-            | (air::TypeData::Slice(inner), Some(RirType::Slice(rir_inner))) => {
-                air_rir_type_matches(air_program, rir, *inner, *rir_inner, visiting)
-            }
-            (
-                air::TypeData::Array { elem, len },
-                Some(RirType::Array {
-                    elem: rir_inner,
-                    len: rir_len,
-                }),
-            ) => {
-                u64::try_from(*len).ok() == Some(*rir_len)
-                    && air_rir_type_matches(air_program, rir, *elem, *rir_inner, visiting)
-            }
-            (
-                air::TypeData::Map { key, value, .. },
-                Some(RirType::Map {
-                    key: rir_key,
-                    value: rir_value,
-                }),
-            ) => {
-                air_rir_type_matches(air_program, rir, *key, *rir_key, visiting)
-                    && air_rir_type_matches(air_program, rir, *value, *rir_value, visiting)
-            }
-            (air::TypeData::Aggregate(air_id), Some(RirType::Struct(rir_id))) => rir
-                .structs
-                .get(rir_id.index())
-                .is_some_and(|decl| decl.air_id == Some(*air_id)),
-            (air::TypeData::DataRef(air_id), Some(RirType::DataRef(rir_id))) => rir
-                .datarefs
-                .get(rir_id.index())
-                .is_some_and(|decl| decl.air_id == *air_id),
-            (air::TypeData::Enum(air_id), Some(RirType::Enum(rir_id))) => rir
-                .enums
-                .get(rir_id.index())
-                .is_some_and(|decl| decl.air_id == Some(*air_id)),
-            (air::TypeData::Flag(air_id), Some(RirType::Flag(rir_id))) => rir
-                .flags
-                .get(rir_id.index())
-                .is_some_and(|decl| decl.air_id == *air_id),
-            (air::TypeData::Tuple(air_fields), Some(RirType::Tuple(rir_id))) => {
-                rir.tuples.get(rir_id.index()).is_some_and(|decl| {
-                    decl.fields.len() == air_fields.len()
-                        && air_fields.iter().zip(&decl.fields).all(|(air_ty, field)| {
-                            air_rir_type_matches(air_program, rir, *air_ty, field.ty, visiting)
-                        })
-                })
-            }
-            (air::TypeData::Function(air_sig), Some(RirType::Lambda(rir_id))) => {
-                rir.lambda_sigs.get(rir_id.index()).is_some_and(|rir_sig| {
-                    air_sig.params.len() == rir_sig.params.len()
-                        && air_sig.params.iter().zip(&rir_sig.params).all(
-                            |(air_param, rir_param)| {
-                                source_param_semantic(air_program, air_param.ty, air_param.mode)
-                                    == rir_param.semantic
-                                    && matches!(
-                                        (air_param.escape, rir_param.escape),
-                                        (air::ParamEscape::Escaping, RirParamEscape::Escaping)
-                                            | (
-                                                air::ParamEscape::NonEscaping,
-                                                RirParamEscape::NonEscaping
-                                            )
-                                    )
-                                    && air_rir_type_matches(
-                                        air_program,
-                                        rir,
-                                        air_param.ty,
-                                        rir_param.ty,
-                                        visiting,
-                                    )
-                            },
-                        )
-                        && air_rir_type_matches(
-                            air_program,
-                            rir,
-                            air_sig.ret.ty(),
-                            rir_sig.ret,
-                            visiting,
-                        )
-                })
-            }
-            (air::TypeData::Extern(air_id), Some(RirType::Struct(rir_id))) => {
-                let air_decl = air_program.extern_type(*air_id);
-                rir.structs.get(rir_id.index()).is_some_and(|rir_decl| {
-                    rir_decl.native_key.is_some()
-                        && rir_decl.native_key
-                            == air_decl.binding.as_ref().map(|binding| binding.key.clone())
-                })
-            }
-            (air::TypeData::Extern(air_id), Some(RirType::Enum(rir_id))) => {
-                let air_decl = air_program.extern_type(*air_id);
-                rir.enums.get(rir_id.index()).is_some_and(|rir_decl| {
-                    rir_decl.native_key.is_some()
-                        && rir_decl.native_key
-                            == air_decl.binding.as_ref().map(|binding| binding.key.clone())
-                        && extern_variants_match(
-                            air_program,
-                            rir,
-                            &air_decl.variants,
-                            &rir_decl.variants,
-                            visiting,
-                        )
-                })
-            }
-            _ => false,
-        };
-    visiting.remove(&(air_ty, rir_ty));
-    matches
-}
-
-fn extern_variants_match(
-    air_program: &air::Program,
-    rir_program: &RirProgram,
-    air_variants: &[air::VariantDecl],
-    rir_variants: &[RirVariant],
-    visiting: &mut std::collections::BTreeSet<(air::TypeId, RirTypeId)>,
-) -> bool {
-    air_variants.len() == rir_variants.len()
-        && air_variants.iter().zip(rir_variants).all(|(air, rir)| {
-            let (kind, fields) = match &air.shape {
-                air::VariantShape::Unit => (RirVariantKind::Unit, vec![]),
-                air::VariantShape::Tuple(fields) => (RirVariantKind::Tuple, fields.clone()),
-                air::VariantShape::Struct(fields) => (
-                    RirVariantKind::Struct,
-                    fields.iter().map(|field| field.ty).collect(),
-                ),
-            };
-            rir.display.as_str() == air.name.as_str()
-                && rir.kind == kind
-                && fields.len() == rir.fields.len()
-                && fields.iter().zip(&rir.fields).all(|(air, rir)| {
-                    air_rir_type_matches(air_program, rir_program, *air, rir.ty, visiting)
-                })
-        })
-}
-
-fn verify_owned_transfer_origins(
-    program: &RirProgram,
-    air: &air::Program,
-    errors: &mut Vec<RirVerifyError>,
-) {
-    fn origin_valid(
-        program: &RirProgram,
-        function: &RirFunction,
-        air_program: &air::Program,
-        air_function: Option<&air::Function>,
-        uses: &[usize],
-        repeated: &HashSet<air::LocalId>,
-        air_local: air::LocalId,
-    ) -> bool {
-        let Some(air_function) = air_function else {
-            return false;
-        };
-        let mut attestations = 0;
-        air_function.body.block.for_each_owned_value(&mut |owned| {
-            if matches!(owned.source, air::ValueSource::TransferTemp { local } if local == air_local)
-            {
-                attestations += 1;
-            }
-        });
-        let types_match = air_function
-            .locals
-            .get(air_local.index())
-            .zip(function.locals.get(air_local.index()))
-            .is_some_and(|(air_local, rir_local)| {
-                air_rir_type_matches(
-                    air_program,
-                    program,
-                    air_local.ty,
-                    rir_local.ty,
-                    &mut std::collections::BTreeSet::new(),
-                )
-            });
-        let local_valid = air_function
-            .locals
-            .get(air_local.index())
-            .is_some_and(|local| {
-                local.binding.is_none()
-                    && local.kind == air::LocalKind::Temp
-                    && uses.get(air_local.index()) == Some(&1)
-            });
-        local_valid && attestations == 1 && types_match && !repeated.contains(&air_local)
-    }
-
-    fn collect_transfers(block: &RirStructuredBlock, transfers: &mut Vec<air::LocalId>) {
-        block.for_each_owned_value(&mut |owned| {
-            if let RirOwnedSource::Transfer { air_local } = owned.source {
-                transfers.push(air_local);
-            }
-        });
-    }
-
-    fn take_stages_valid(block: &RirStructuredBlock, air_locals: Option<usize>) -> bool {
-        for stmt in &block.stmts {
-            if let Some(RirRValue::TakeStaged(RirOperand::Place(place))) = stmt.rvalue()
-                && let RirPlaceRoot::Local(local) = place.root
-                && air_locals.is_none_or(|count| local.index() < count)
-            {
-                return false;
-            }
-            let mut valid = true;
-            stmt.for_each_child(&mut |child| {
-                if let RirChild::Block(block) = child {
-                    valid &= take_stages_valid(block, air_locals);
-                }
-            });
-            if !valid {
-                return false;
-            }
-        }
-        true
-    }
-
-    fn collect_repeated_transfers(
-        block: &RirStructuredBlock,
-        transfers: &mut HashSet<air::LocalId>,
-    ) {
-        for stmt in &block.stmts {
-            match stmt {
-                RirStmt::Loop(loop_) => {
-                    let mut found = vec![];
-                    collect_transfers(&loop_.body, &mut found);
-                    transfers.extend(found);
-                }
-                RirStmt::RangeFor(for_) => {
-                    let mut found = vec![];
-                    collect_transfers(&for_.body, &mut found);
-                    transfers.extend(found);
-                }
-                RirStmt::CollectionFor(for_) => {
-                    let mut found = vec![];
-                    collect_transfers(&for_.body, &mut found);
-                    transfers.extend(found);
-                }
-                _ => stmt.for_each_child(&mut |child| {
-                    if let RirChild::Block(block) = child {
-                        collect_repeated_transfers(block, transfers);
-                    }
-                }),
-            }
-        }
-    }
-
-    fn owned_value_uses_local(value: &RirOwnedValue, local: RirLocalId) -> bool {
-        match &value.value {
-            RirOwnedOperand::Value(RirOperand::Place(place)) => place.uses_local(local),
-            RirOwnedOperand::Access(place) => place.uses_local(local),
-            RirOwnedOperand::DynBorrow(borrow) => match &borrow.source {
-                RirDynBorrowSource::Concrete { place, .. }
-                | RirDynBorrowSource::Owned { place, .. } => place.uses_local(local),
-                RirDynBorrowSource::Borrowed { local: found, .. }
-                | RirDynBorrowSource::Reborrowed { local: found, .. } => *found == local,
-            },
-            RirOwnedOperand::Value(RirOperand::Const(_)) => false,
-        }
-    }
-
-    fn call_arg_uses_local(arg: &RirCallArg, local: RirLocalId) -> bool {
-        match arg {
-            RirCallArg::Value(operand)
-            | RirCallArg::InitFieldProvided(operand)
-            | RirCallArg::ScopedLambda {
-                callee: operand, ..
-            }
-            | RirCallArg::EscapingLambda {
-                callee: operand, ..
-            }
-            | RirCallArg::AnvCallback {
-                callee: operand, ..
-            } => owned_value_uses_local(operand, local),
-            RirCallArg::SharedBorrow(place) | RirCallArg::MutBorrow(place) => {
-                place.uses_local(local)
-            }
-            RirCallArg::MutPlace(place) => place.uses_local(local),
-            RirCallArg::DynBorrow(borrow) => match &borrow.source {
-                RirDynBorrowSource::Concrete { place, .. }
-                | RirDynBorrowSource::Owned { place, .. } => place.uses_local(local),
-                RirDynBorrowSource::Borrowed { local: found, .. }
-                | RirDynBorrowSource::Reborrowed { local: found, .. } => *found == local,
-            },
-            RirCallArg::InitFieldOmitted | RirCallArg::SharedStringConst(_) => false,
-        }
-    }
-
-    fn count_uses(block: &RirStructuredBlock, uses: &mut [usize]) {
-        block.for_each_child(&mut |child| {
-            if let RirChild::Block(child) = child {
-                count_uses(child, uses);
-                return;
-            }
-            for (index, count) in uses.iter_mut().enumerate() {
-                let local = RirLocalId::from_index(index);
-                let used = match child {
-                    RirChild::Operand {
-                        operand: RirOperand::Place(place),
-                        ..
-                    }
-                    | RirChild::Place { place, .. }
-                    | RirChild::CaptureArg(
-                        RirLambdaCaptureArg::Shared { place }
-                        | RirLambdaCaptureArg::Scoped { place },
-                    ) => place.uses_local(local),
-                    RirChild::MutPlace { place, .. } => place.uses_local(local),
-                    RirChild::Collection { collection, .. } => collection.uses_local(local),
-                    RirChild::LocalRead(found) => found == local,
-                    RirChild::CallArg(arg) => call_arg_uses_local(arg, local),
-                    RirChild::CaptureArg(RirLambdaCaptureArg::Owned { value }) => {
-                        owned_value_uses_local(value, local)
-                    }
-                    RirChild::CaptureArg(
-                        RirLambdaCaptureArg::StackCell {
-                            cell: RirCellRef::Capture { local: found, .. },
-                        }
-                        | RirLambdaCaptureArg::HeapCell {
-                            cell: RirCellRef::Capture { local: found, .. },
-                        }
-                        | RirLambdaCaptureArg::ScopedPlaceCell {
-                            cell: RirScopedPlaceCellRef::Capture { local: found, .. },
-                        },
-                    ) => *found == local,
-                    _ => false,
-                };
-                if used {
-                    *count += 1;
-                }
-            }
-        });
-    }
-
-    let mut air_function_uses = vec![0; air.functions.len()];
-    for function in &program.functions {
-        if let Some(air_id) = function.air_id
-            && let Some(count) = air_function_uses.get_mut(air_id.index())
-        {
-            *count += 1;
-        }
-    }
-    for function in &program.functions {
-        let air_function = function.air_id.and_then(|air_id| {
-            (air_function_uses.get(air_id.index()) == Some(&1))
-                .then(|| air.functions.get(air_id.index()))
-                .flatten()
-        });
-        let mut rir_transfers = vec![];
-        collect_transfers(&function.body, &mut rir_transfers);
-        if !take_stages_valid(
-            &function.body,
-            air_function.map(|function| function.locals.len()),
-        ) {
-            errors.push(RirVerifyError {
-                site: RirVerifySite::Function(function.id),
-                kind: RirVerifyErrorKind::InvalidDynOrigin,
-            });
-        }
-        if let Some(air_function) = air_function {
-            let mut air_transfers = vec![];
-            air_function.body.block.for_each_owned_value(&mut |owned| {
-                if let air::ValueSource::TransferTemp { local } = owned.source {
-                    air_transfers.push(local);
-                }
-            });
-            air_transfers.sort_by_key(|local| local.index());
-            let mut inventory = rir_transfers.clone();
-            inventory.sort_by_key(|local| local.index());
-            if air_transfers != inventory {
-                errors.push(RirVerifyError {
-                    site: RirVerifySite::Function(function.id),
-                    kind: RirVerifyErrorKind::InvalidDynOrigin,
-                });
-            }
-        }
-        let mut uses = vec![0; function.locals.len()];
-        count_uses(&function.body, &mut uses);
-        let mut repeated = HashSet::new();
-        collect_repeated_transfers(&function.body, &mut repeated);
-        for air_local in rir_transfers {
-            if !origin_valid(
-                program,
-                function,
-                air,
-                air_function,
-                &uses,
-                &repeated,
-                air_local,
-            ) {
-                errors.push(RirVerifyError {
-                    site: RirVerifySite::Function(function.id),
-                    kind: RirVerifyErrorKind::InvalidDynOrigin,
-                });
-            }
-        }
-    }
-}
-
-fn verify_dynamic_weakenings(
-    program: &RirProgram,
-    air: &air::Program,
-    errors: &mut Vec<RirVerifyError>,
-) {
-    let mut found = std::collections::BTreeSet::new();
-    for weakening in &program.dyn_weakenings {
-        let valid = found.insert(weakening.air_id)
-            && program
-                .dyn_origins
-                .weakenings
-                .iter()
-                .filter(|origin| origin.air_weakening == weakening.air_id)
-                .count()
-                == 1
-            && air
-                .contract_weakenings
-                .get(weakening.air_id.index())
-                .is_some_and(|origin| {
-                    let Some(source) = program.dyn_carriers.get(weakening.source.index()) else {
-                        return false;
-                    };
-                    let Some(target) = program.dyn_carriers.get(weakening.target.index()) else {
-                        return false;
-                    };
-                    origin.source == source.air_surface
-                        && origin.target == target.air_surface
-                        && weakening.arms.len() == source.variants.len()
-                        && weakening.arms.iter().enumerate().all(|(index, arm)| {
-                            let Some(source_variant) = source.variants.get(arm.source.index())
-                            else {
-                                return false;
-                            };
-                            let Some(target_variant) = target.variants.get(arm.target.index())
-                            else {
-                                return false;
-                            };
-                            arm.source.index() == index
-                                && source_variant.concrete_ty == target_variant.concrete_ty
-                                && source_variant.storage == target_variant.storage
-                                && weakening_arm_matches_air(
-                                    air,
-                                    source_variant.air_witness,
-                                    target_variant.air_witness,
-                                    origin,
-                                )
-                        })
-                });
-        if !valid {
-            errors.push(RirVerifyError {
-                site: RirVerifySite::Program,
-                kind: RirVerifyErrorKind::InvalidDynOrigin,
-            });
-        }
-    }
-    let expected = program
-        .dyn_origins
-        .weakenings
-        .iter()
-        .map(|origin| origin.air_weakening)
-        .collect::<std::collections::BTreeSet<_>>();
-    if expected.len() != program.dyn_origins.weakenings.len() || found != expected {
-        errors.push(RirVerifyError {
-            site: RirVerifySite::Program,
-            kind: RirVerifyErrorKind::InvalidDynOrigin,
-        });
-    }
-}
-
-fn verify_dynamic_dispatch_origins(
-    program: &RirProgram,
-    air: &air::Program,
-    errors: &mut Vec<RirVerifyError>,
-) {
-    fn visit_block(
-        program: &RirProgram,
-        air: &air::Program,
-        block: &RirStructuredBlock,
-        errors: &mut Vec<RirVerifyError>,
-    ) {
-        for stmt in &block.stmts {
-            let value = match stmt {
-                RirStmt::Init { value, .. }
-                | RirStmt::GlobalSetRoot { value, .. }
-                | RirStmt::GlobalUpdateRoot { value, .. }
-                | RirStmt::MutPlaceSet { value, .. }
-                | RirStmt::Assign { value, .. }
-                | RirStmt::CellInit { value, .. }
-                | RirStmt::CellSet { value, .. }
-                | RirStmt::ScopedPlaceCellSet { value, .. }
-                | RirStmt::Eval(value) => Some(value),
-                _ => None,
-            };
-            if let Some(RirRValue::DynWeaken {
-                source,
-                target,
-                air_weakening,
-                arms,
-                ..
-            }) = value
-            {
-                let valid = match (
-                    program.dyn_carriers.get(source.index()),
-                    program.dyn_carriers.get(target.index()),
-                    air.contract_weakenings.get(air_weakening.index()),
-                ) {
-                    (Some(source), Some(target), Some(weakening)) => arms.iter().all(|arm| {
-                        let source = source
-                            .variants
-                            .iter()
-                            .find(|variant| variant.id == arm.source);
-                        let target = target
-                            .variants
-                            .iter()
-                            .find(|variant| variant.id == arm.target);
-                        match (source, target) {
-                            (Some(source), Some(target)) => weakening_arm_matches_air(
-                                air,
-                                source.air_witness,
-                                target.air_witness,
-                                weakening,
-                            ),
-                            _ => false,
-                        }
-                    }),
-                    _ => false,
-                };
-                if !valid {
-                    errors.push(RirVerifyError {
-                        site: RirVerifySite::Program,
-                        kind: RirVerifyErrorKind::InvalidDynOrigin,
-                    });
-                }
-            }
-            if let Some(RirRValue::DynCall {
-                carrier,
-                air_slot,
-                arms,
-                ..
-            }) = value
-            {
-                let valid = program
-                    .dyn_carriers
-                    .get(carrier.index())
-                    .is_some_and(|carrier| {
-                        arms.iter().all(|arm| {
-                            let Some(variant) = carrier
-                                .variants
-                                .iter()
-                                .find(|variant| variant.id == arm.variant)
-                            else {
-                                return false;
-                            };
-                            let Some(witness) =
-                                air.contract_witnesses.get(variant.air_witness.index())
-                            else {
-                                return false;
-                            };
-                            witness
-                                .key
-                                .slots
-                                .iter()
-                                .find(|slot| slot.slot == *air_slot)
-                                .is_some_and(|slot| {
-                                    dyn_target_matches_air(
-                                        program,
-                                        air,
-                                        variant.concrete_ty,
-                                        witness.key.concrete_ty,
-                                        &arm.target,
-                                        &slot.target,
-                                    )
-                                })
-                        })
-                    });
-                if !valid {
-                    errors.push(RirVerifyError {
-                        site: RirVerifySite::Program,
-                        kind: RirVerifyErrorKind::InvalidDynOrigin,
-                    });
-                }
-            }
-            stmt.for_each_child(&mut |child| {
-                if let RirChild::Block(child) = child {
-                    visit_block(program, air, child, errors);
-                }
-            });
-        }
-    }
-    for function in &program.functions {
-        visit_block(program, air, &function.body, errors);
-    }
-}
-
-fn dyn_target_matches_air(
-    program: &RirProgram,
-    air_program: &air::Program,
-    rir_ty: RirTypeId,
-    air_ty: air::TypeId,
-    rir: &RirResolvedCallTarget,
-    air: &air::ContractWitnessTarget,
-) -> bool {
-    match (rir, air) {
-        (
-            RirResolvedCallTarget::Function(rir),
-            air::ContractWitnessTarget::Function { function }
-            | air::ContractWitnessTarget::IteratorFunction { function },
-        ) => program
-            .functions
-            .get(rir.index())
-            .is_some_and(|rir| rir.air_id == Some(*function)),
-        (RirResolvedCallTarget::Extern(rir), air::ContractWitnessTarget::Extern { function }) => {
-            program
-                .externs
-                .get(rir.index())
-                .is_some_and(|rir| rir.air_id == Some(*function))
-        }
-        (
-            RirResolvedCallTarget::Promoted {
-                fields: rir_fields,
-                target: rir_target,
-            },
-            air::ContractWitnessTarget::Promoted {
-                fields: air_fields,
-                target: air_target,
-            },
-        ) => {
-            if rir_fields.len() != air_fields.len() {
-                return false;
-            }
-            let mut rir_ty = rir_ty;
-            let mut air_ty = air_ty;
-            for (rir_field, air_field) in rir_fields.iter().zip(air_fields) {
-                let (Some(RirType::Struct(rir_struct)), air::TypeData::Aggregate(air_aggregate)) = (
-                    program.types.get(rir_ty.index()),
-                    air_program.type_arena.data(air_ty),
-                ) else {
-                    return false;
-                };
-                let Some(rir_decl) = program.structs.get(rir_struct.index()) else {
-                    return false;
-                };
-                if rir_decl.air_id != Some(*air_aggregate) || rir_field.index() != air_field.index()
-                {
-                    return false;
-                }
-                let (Some(rir_field), Some(air_field)) = (
-                    rir_decl.fields.get(rir_field.index()),
-                    air_program
-                        .aggregate(*air_aggregate)
-                        .fields
-                        .get(air_field.index()),
-                ) else {
-                    return false;
-                };
-                rir_ty = rir_field.ty;
-                air_ty = air_field.ty;
-            }
-            dyn_target_matches_air(program, air_program, rir_ty, air_ty, rir_target, air_target)
-        }
-        _ => false,
-    }
-}
-
-fn weakening_arm_matches_air(
-    air: &air::Program,
-    source: air::ContractWitnessId,
-    target: air::ContractWitnessId,
-    weakening: &air::ContractWeakeningDecl,
-) -> bool {
-    let (Some(source), Some(target)) = (
-        air.contract_witnesses.get(source.index()),
-        air.contract_witnesses.get(target.index()),
-    ) else {
-        return false;
-    };
-    source.key.surface == weakening.source
-        && target.key.surface == weakening.target
-        && source.key.concrete_ty == target.key.concrete_ty
-        && target.key.slots.len() == weakening.target_to_source.len()
-        && target
-            .key
-            .slots
-            .iter()
-            .zip(&weakening.target_to_source)
-            .all(|(target, source_slot)| {
-                source
-                    .key
-                    .slots
-                    .iter()
-                    .find(|source| source.slot == *source_slot)
-                    .is_some_and(|source| source.target == target.target)
-            })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3877,7 +2497,6 @@ pub struct RirVerifyError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RirVerifySite {
     Program,
-    Context,
     Global(RirGlobalId),
     Type(RirTypeId),
     Const(RirConstId),
@@ -3932,332 +2551,6 @@ impl MutPlaceUse {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum RirPlaceError {
-    BadId,
-    Unsupported,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct RirProjectionPath {
-    ty: RirTypeId,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct RirDataRefStoragePath {
-    ty: RirTypeId,
-    steps: Vec<RirDataRefStorageStep>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct RirDataRefStorageStep {
-    pub(super) projection: RirProjection,
-    pub(super) symbol: RirSymbol,
-    pub(super) ty: RirTypeId,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct RirProjectionStep {
-    ty: RirTypeId,
-    kind: RirProjectionKind,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RirProjectionKind {
-    Field,
-    TupleField,
-    SequenceIndex { local: RirLocalId },
-}
-
-pub(super) struct RirPlaceModel<'a> {
-    program: &'a RirProgram,
-}
-
-impl RirProjectionPath {
-    pub(super) fn ty(&self) -> RirTypeId {
-        self.ty
-    }
-}
-
-impl RirDataRefStoragePath {
-    pub(super) fn ty(&self) -> RirTypeId {
-        self.ty
-    }
-
-    pub(super) fn steps(&self) -> &[RirDataRefStorageStep] {
-        &self.steps
-    }
-}
-
-impl<'a> RirPlaceModel<'a> {
-    pub(super) fn new(program: &'a RirProgram) -> Self {
-        Self { program }
-    }
-
-    pub(super) fn dataref_storage_path(
-        &self,
-        dataref_id: RirDataRefId,
-        projections: &[RirProjection],
-    ) -> Result<RirDataRefStoragePath, RirPlaceError> {
-        let (path, consumed) = self.dataref_storage_prefix(dataref_id, projections)?;
-        if consumed == projections.len() {
-            Ok(path)
-        } else {
-            Err(RirPlaceError::Unsupported)
-        }
-    }
-
-    pub(super) fn dataref_storage_prefix(
-        &self,
-        dataref_id: RirDataRefId,
-        projections: &[RirProjection],
-    ) -> Result<(RirDataRefStoragePath, usize), RirPlaceError> {
-        let Some((first, rest)) = projections.split_first() else {
-            return Err(RirPlaceError::Unsupported);
-        };
-        let RirProjection::Field(field_id) = first else {
-            return Err(RirPlaceError::Unsupported);
-        };
-        let field = self
-            .program
-            .datarefs
-            .get(dataref_id.index())
-            .and_then(|dataref| dataref.fields.get(field_id.index()))
-            .ok_or(RirPlaceError::BadId)?;
-        let mut ty = field.ty;
-        let mut steps = vec![RirDataRefStorageStep {
-            projection: *first,
-            symbol: field.symbol.clone(),
-            ty,
-        }];
-        for (index, projection) in rest.iter().enumerate() {
-            if matches!(projection, RirProjection::Index(_)) {
-                return Ok((RirDataRefStoragePath { ty, steps }, index + 1));
-            }
-            if matches!(self.ty(ty), Some(RirType::DataRef(_))) {
-                return Err(RirPlaceError::Unsupported);
-            }
-            let step = self.dataref_storage_step(ty, *projection)?;
-            ty = step.ty;
-            steps.push(step);
-            if index + 1 < rest.len() && matches!(self.ty(ty), Some(RirType::DataRef(_))) {
-                return Err(RirPlaceError::Unsupported);
-            }
-        }
-        Ok((RirDataRefStoragePath { ty, steps }, projections.len()))
-    }
-
-    pub(super) fn projection_path(
-        &self,
-        root_ty: RirTypeId,
-        projections: &[RirProjection],
-    ) -> Option<RirProjectionPath> {
-        let mut ty = root_ty;
-        for projection in projections {
-            ty = self.step(ty, *projection, true).ok()?.ty;
-        }
-        Some(RirProjectionPath { ty })
-    }
-
-    pub(super) fn collection_loan_projection_supported(
-        &self,
-        root_ty: RirTypeId,
-        projections: &[RirProjection],
-    ) -> bool {
-        let mut ty = root_ty;
-        for projection in projections {
-            if !collection_loan_step_supported(
-                rir_collection_loan_base(self.ty(ty)),
-                rir_collection_loan_projection(*projection),
-            ) {
-                return false;
-            }
-            let Ok(step) = self.step(ty, *projection, true) else {
-                return false;
-            };
-            ty = step.ty;
-        }
-        true
-    }
-
-    pub(super) fn projection_dynamic_facts(
-        &self,
-        root_ty: RirTypeId,
-        projections: &[RirProjection],
-    ) -> Option<bool> {
-        let mut ty = root_ty;
-        let mut fallible = false;
-        for projection in projections {
-            if matches!(
-                (self.ty(ty), projection),
-                (
-                    Some(RirType::Array { .. } | RirType::List(_) | RirType::Slice(_)),
-                    RirProjection::Index(_),
-                )
-            ) {
-                fallible = true;
-            }
-            let Ok(step) = self.step(ty, *projection, true) else {
-                return None;
-            };
-            ty = step.ty;
-        }
-        Some(fallible)
-    }
-
-    fn mut_place_supported(
-        &self,
-        root_ty: RirTypeId,
-        projections: &[RirProjection],
-        allow_collections: bool,
-    ) -> bool {
-        let mut ty = root_ty;
-        let mut slice_dynamic = false;
-        for projection in projections {
-            let Ok(step) = self.step(ty, *projection, true) else {
-                return false;
-            };
-            let collection = allow_collections
-                && !slice_dynamic
-                && matches!(
-                    (self.ty(ty), projection),
-                    (Some(RirType::List(_)), RirProjection::Index(_))
-                );
-            let slice = allow_collections
-                && matches!(
-                    (self.ty(ty), projection),
-                    (Some(RirType::Slice(_)), RirProjection::Index(_))
-                );
-            let static_value = matches!(
-                (self.ty(ty), projection),
-                (
-                    Some(RirType::Struct(_) | RirType::Tuple(_) | RirType::Array { .. }),
-                    RirProjection::Field(_)
-                        | RirProjection::TupleField(_)
-                        | RirProjection::Index(_),
-                )
-            );
-            if !(static_value || collection || slice) {
-                return false;
-            }
-            slice_dynamic |= slice;
-            ty = step.ty;
-        }
-        true
-    }
-
-    fn dataref_mut_place_payload_supported(&self, ty: RirTypeId) -> bool {
-        let materializable = self
-            .program
-            .value_materializers
-            .get(ty.index())
-            .is_some_and(Option::is_some);
-        materializable
-            && !matches!(
-                self.program.types.get(ty.index()),
-                None | Some(RirType::Void | RirType::Slice(_))
-            )
-    }
-
-    fn dataref_storage_step(
-        &self,
-        ty: RirTypeId,
-        projection: RirProjection,
-    ) -> Result<RirDataRefStorageStep, RirPlaceError> {
-        match (self.ty(ty), projection) {
-            (Some(RirType::Struct(id)), RirProjection::Field(field)) => {
-                let field = self
-                    .program
-                    .structs
-                    .get(id.index())
-                    .and_then(|strukt| strukt.fields.get(field.index()))
-                    .ok_or(RirPlaceError::BadId)?;
-                Ok(RirDataRefStorageStep {
-                    projection,
-                    symbol: field.symbol.clone(),
-                    ty: field.ty,
-                })
-            }
-            (Some(RirType::Tuple(id)), RirProjection::TupleField(field)) => {
-                let field = self
-                    .program
-                    .tuples
-                    .get(id.index())
-                    .and_then(|tuple| tuple.fields.get(field.index()))
-                    .ok_or(RirPlaceError::BadId)?;
-                Ok(RirDataRefStorageStep {
-                    projection,
-                    symbol: field.symbol.clone(),
-                    ty: field.ty,
-                })
-            }
-            _ => Err(RirPlaceError::Unsupported),
-        }
-    }
-
-    fn step(
-        &self,
-        ty: RirTypeId,
-        projection: RirProjection,
-        allow_collections: bool,
-    ) -> Result<RirProjectionStep, RirPlaceError> {
-        let (next, kind) = match (self.ty(ty), projection) {
-            (Some(RirType::Struct(id)), RirProjection::Field(field)) => {
-                let field = self
-                    .program
-                    .structs
-                    .get(id.index())
-                    .and_then(|strukt| strukt.fields.get(field.index()))
-                    .ok_or(RirPlaceError::BadId)?;
-                (field.ty, RirProjectionKind::Field)
-            }
-            (Some(RirType::Tuple(id)), RirProjection::TupleField(field)) => {
-                let field = self
-                    .program
-                    .tuples
-                    .get(id.index())
-                    .and_then(|tuple| tuple.fields.get(field.index()))
-                    .ok_or(RirPlaceError::BadId)?;
-                (field.ty, RirProjectionKind::TupleField)
-            }
-            (
-                Some(
-                    RirType::Array { elem: next, .. } | RirType::List(next) | RirType::Slice(next),
-                ),
-                RirProjection::Index(local),
-            ) => {
-                if !allow_collections && !matches!(self.ty(ty), Some(RirType::Array { .. })) {
-                    return Err(RirPlaceError::Unsupported);
-                }
-                (next, RirProjectionKind::SequenceIndex { local })
-            }
-            _ => return Err(RirPlaceError::Unsupported),
-        };
-        Ok(RirProjectionStep { ty: next, kind })
-    }
-
-    fn ty(&self, id: RirTypeId) -> Option<RirType> {
-        self.program.types.get(id.index()).copied()
-    }
-}
-
-fn rir_collection_loan_base(ty: Option<RirType>) -> CollectionLoanBase {
-    match ty {
-        Some(RirType::Struct(_)) => CollectionLoanBase::Aggregate,
-        Some(RirType::Tuple(_)) => CollectionLoanBase::Tuple,
-        Some(RirType::Array { .. }) => CollectionLoanBase::Array,
-        _ => CollectionLoanBase::Other,
-    }
-}
-
-fn rir_collection_loan_projection(projection: RirProjection) -> CollectionLoanProjection {
-    match projection {
-        RirProjection::Field(_) => CollectionLoanProjection::Field,
-        RirProjection::TupleField(_) => CollectionLoanProjection::TupleField,
-        RirProjection::Index(_) => CollectionLoanProjection::Index,
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RirVerifyErrorKind {
     BadId,
@@ -4288,8 +2581,7 @@ pub enum RirVerifyErrorKind {
     InvalidRawProject,
     InvalidRawTryConstruct,
     InvalidFlagStatic,
-    InvalidDynOrigin,
-    InvalidAirMetadata,
+    InvalidDynPlan,
     InvalidDynCarrier,
     InvalidDynVariant,
     InvalidDynStorage,
@@ -4298,7 +2590,7 @@ pub enum RirVerifyErrorKind {
     UnsupportedLambdaCapture,
     UnsupportedLambdaCell,
     ImmutableCellSourceLocal(RirLocalId),
-    CellSourceLocalPayloadRef(RirLocalId),
+    CellSourcePayloadBinding(RirLocalId),
     DuplicateCell {
         owner: RirFunctionId,
         source_local: RirLocalId,
@@ -4336,17 +2628,14 @@ pub enum RirVerifyErrorKind {
     CallArgMode,
     CallArgEscape,
     LambdaEscapeProofMismatch,
-    DuplicateMatchArm,
-    MatchNotExhaustive,
     PatternAlternativeRequired,
     PatternBindingMismatch,
     PatternPayloadWithoutVariantTest,
     OptionPayloadEscapeRequiresPayload,
-    OptionPayloadEscapeRequiresRef,
     OptionPayloadEscapeNoneMustDiverge,
     OptionPayloadRefLocalMismatch,
     OptionPayloadRefDiscriminantMustBeMutable,
-    OptionPayloadRefWithoutOwner,
+    PayloadBindingWithoutProducer,
     InitPayloadRefLocal,
     BreakOutsideLoop(RirLoopId),
     ContinueOutsideLoop(RirLoopId),
@@ -4412,19 +2701,29 @@ impl RirFunctionValueState {
         }
     }
 
-    fn project(&self, projection: RirProjection) -> Self {
+    fn project_field(&self, field: RirFieldId) -> Self {
         let Self::Fields(fields) = self else {
             return Self::Unknown;
         };
-        match projection {
-            RirProjection::Field(field) | RirProjection::TupleField(field) => {
-                fields.get(field.index()).cloned().unwrap_or(Self::Unknown)
-            }
-            RirProjection::Index(_) => fields
-                .iter()
-                .cloned()
-                .reduce(Self::join)
-                .unwrap_or(Self::Unknown),
+        fields.get(field.index()).cloned().unwrap_or(Self::Unknown)
+    }
+
+    fn project(&self, projection: RirPlaceStep) -> Self {
+        match projection.kind {
+            RirPlaceStepKind::StructField(field)
+            | RirPlaceStepKind::DataRefField(field)
+            | RirPlaceStepKind::ExternField(field)
+            | RirPlaceStepKind::TupleField(field) => self.project_field(field),
+            RirPlaceStepKind::ArrayIndex { .. }
+            | RirPlaceStepKind::ListIndex { .. }
+            | RirPlaceStepKind::SliceIndex { .. } => match self {
+                Self::Fields(fields) => fields
+                    .iter()
+                    .cloned()
+                    .reduce(Self::join)
+                    .unwrap_or(Self::Unknown),
+                _ => Self::Unknown,
+            },
         }
     }
 
@@ -4439,21 +2738,26 @@ impl RirFunctionValueState {
             .unwrap_or(Self::Unknown)
     }
 
-    fn projection_mut(&mut self, projections: &[RirProjection]) -> Option<&mut Self> {
+    fn projection_mut(&mut self, projections: &[RirPlaceStep]) -> Option<&mut Self> {
         let Some((first, rest)) = projections.split_first() else {
             return Some(self);
         };
         let Self::Fields(fields) = self else {
             return None;
         };
-        let index = match first {
-            RirProjection::Field(field) | RirProjection::TupleField(field) => field.index(),
-            RirProjection::Index(_) => return None,
+        let index = match first.kind {
+            RirPlaceStepKind::StructField(field)
+            | RirPlaceStepKind::DataRefField(field)
+            | RirPlaceStepKind::ExternField(field)
+            | RirPlaceStepKind::TupleField(field) => field.index(),
+            RirPlaceStepKind::ArrayIndex { .. }
+            | RirPlaceStepKind::ListIndex { .. }
+            | RirPlaceStepKind::SliceIndex { .. } => return None,
         };
         fields.get_mut(index)?.projection_mut(rest)
     }
 
-    fn assign_projection(&mut self, projections: &[RirProjection], value: Self) -> bool {
+    fn assign_projection(&mut self, projections: &[RirPlaceStep], value: Self) -> bool {
         let Some(slot) = self.projection_mut(projections) else {
             return false;
         };
@@ -4461,7 +2765,7 @@ impl RirFunctionValueState {
         true
     }
 
-    fn push_projection(&mut self, projections: &[RirProjection], value: Self) -> bool {
+    fn push_projection(&mut self, projections: &[RirPlaceStep], value: Self) -> bool {
         let Some(Self::Fields(fields)) = self.projection_mut(projections) else {
             return false;
         };
@@ -4600,8 +2904,492 @@ impl RirBlockEntryState {
     }
 }
 
-fn materializer_tables_complete(program: &RirProgram) -> bool {
-    program.value_materializers.len() == program.types.len()
+fn final_dyn_storage(program: &RirProgram) -> Option<Vec<Vec<RirDynStorage>>> {
+    let classes = dyn_weakening_classes(program)?;
+    let mut storage = program
+        .dyn_carriers
+        .iter()
+        .map(|carrier| vec![RirDynStorage::Inline; carrier.variants.len()])
+        .collect::<Vec<_>>();
+    let mut direct_reasons = storage
+        .iter()
+        .map(|variants| vec![None; variants.len()])
+        .collect::<Vec<Vec<Option<RirDynBoxReason>>>>();
+    let mut scratch = DynStorageScratch::new(program);
+    for (carrier_index, carrier) in program.dyn_carriers.iter().enumerate() {
+        for (variant_index, variant) in carrier.variants.iter().enumerate() {
+            scratch.clear();
+            let recursive =
+                type_reaches_carrier(program, variant.concrete_ty, carrier.id, &mut scratch);
+            let reason = if matches!(
+                program.types.get(variant.concrete_ty.index()),
+                Some(RirType::Lambda(_))
+            ) {
+                Some(RirDynBoxReason::Function)
+            } else if recursive {
+                Some(RirDynBoxReason::Recursive)
+            } else {
+                None
+            };
+            if reason.is_some() {
+                storage[carrier_index][variant_index] = RirDynStorage::Boxed;
+            }
+            direct_reasons[carrier_index][variant_index] = reason;
+        }
+    }
+    loop {
+        let mut layouts = DynStorageLayoutCx::new(program, &storage);
+        scratch.boxed.clear();
+        for (carrier_index, carrier) in program.dyn_carriers.iter().enumerate() {
+            for (variant_index, variant) in carrier.variants.iter().enumerate() {
+                if direct_reasons[carrier_index][variant_index].is_none()
+                    && matches!(
+                        layouts.type_layout(variant.concrete_ty),
+                        Err(FinalDynLayoutFailure::Function)
+                    )
+                {
+                    scratch.boxed.push((carrier_index, variant_index));
+                }
+            }
+        }
+        if scratch.boxed.is_empty() {
+            break;
+        }
+        for &(carrier, variant) in &scratch.boxed {
+            direct_reasons[carrier][variant] = Some(RirDynBoxReason::FunctionField);
+            storage[carrier][variant] = RirDynStorage::Boxed;
+        }
+    }
+    let thresholds = {
+        let mut layouts = DynStorageLayoutCx::new(program, &storage);
+        scratch.boxed.clear();
+        for (carrier_index, carrier) in program.dyn_carriers.iter().enumerate() {
+            for (variant_index, variant) in carrier.variants.iter().enumerate() {
+                let direct_reason = direct_reasons[carrier_index][variant_index];
+                if let Some(reason) = direct_reason {
+                    let evidence = match reason {
+                        RirDynBoxReason::Function => RirDynInlineLayout::Function,
+                        RirDynBoxReason::FunctionField
+                            if matches!(
+                                layouts.type_layout(variant.concrete_ty),
+                                Err(FinalDynLayoutFailure::Function)
+                            ) =>
+                        {
+                            RirDynInlineLayout::Function
+                        }
+                        RirDynBoxReason::Recursive => RirDynInlineLayout::Recursive,
+                        RirDynBoxReason::FunctionField
+                        | RirDynBoxReason::Threshold
+                        | RirDynBoxReason::WeakeningClass(_) => return None,
+                    };
+                    if variant.inline_layout != evidence {
+                        return None;
+                    }
+                    continue;
+                }
+                let Ok(layout) = layouts.type_layout(variant.concrete_ty) else {
+                    return None;
+                };
+                let RirDynInlineLayout::Known(found) = variant.inline_layout else {
+                    return None;
+                };
+                if !layout::valid(RustApproxLayout {
+                    size: found.size,
+                    align: found.align,
+                }) || found.size != layout.size
+                    || found.align != layout.align
+                {
+                    return None;
+                }
+                if layout.size > target_profile().inline_payload_limit()
+                    || layout.align > target_profile().pointer_align()
+                {
+                    scratch.boxed.push((carrier_index, variant_index));
+                }
+            }
+        }
+        &scratch.boxed
+    };
+    for &(carrier, variant) in thresholds {
+        direct_reasons[carrier][variant] = Some(RirDynBoxReason::Threshold);
+        storage[carrier][variant] = RirDynStorage::Boxed;
+    }
+    while propagate_dyn_storage(program, &classes, &mut storage)? {}
+    for (carrier_index, carrier) in program.dyn_carriers.iter().enumerate() {
+        for (variant_index, variant) in carrier.variants.iter().enumerate() {
+            let expected = direct_reasons[carrier_index][variant_index].or_else(|| {
+                (storage.get(carrier_index)?.get(variant_index) == Some(&RirDynStorage::Boxed))
+                    .then_some(RirDynBoxReason::WeakeningClass(classes[&carrier.id]))
+            });
+            if variant.box_reason != expected {
+                return None;
+            }
+        }
+    }
+    Some(storage)
+}
+
+struct DynStorageScratch {
+    visiting_carriers: Vec<bool>,
+    visiting_types: Vec<bool>,
+    boxed: Vec<(usize, usize)>,
+}
+
+impl DynStorageScratch {
+    fn new(program: &RirProgram) -> Self {
+        Self {
+            visiting_carriers: vec![false; program.dyn_carriers.len()],
+            visiting_types: vec![false; program.types.len()],
+            boxed: vec![],
+        }
+    }
+
+    fn clear(&mut self) {
+        self.visiting_carriers.fill(false);
+        self.visiting_types.fill(false);
+    }
+}
+
+fn type_reaches_carrier(
+    program: &RirProgram,
+    ty: RirTypeId,
+    target: RirDynCarrierId,
+    scratch: &mut DynStorageScratch,
+) -> bool {
+    let Some(visiting) = scratch.visiting_types.get_mut(ty.index()) else {
+        return false;
+    };
+    if *visiting {
+        return false;
+    }
+    *visiting = true;
+    let reaches = match program.types.get(ty.index()) {
+        Some(RirType::Enum(id)) => {
+            if let Some(carrier) = program.dyn_carriers.iter().find(|carrier| {
+                matches!(program.types.get(carrier.storage_ty.index()), Some(RirType::Enum(candidate)) if candidate == id)
+            }) {
+                carrier_reaches(program, carrier.id, target, scratch)
+            } else {
+                program.enums.get(id.index()).is_some_and(|enm| {
+                    enm.variants.iter().flat_map(|variant| &variant.fields).any(|field| {
+                        type_reaches_carrier(program, field.ty, target, scratch)
+                    })
+                })
+            }
+        }
+        Some(RirType::Struct(id)) => program.structs.get(id.index()).is_some_and(|decl| {
+            decl.fields.iter().any(|field| type_reaches_carrier(program, field.ty, target, scratch))
+        }),
+        Some(RirType::Tuple(id)) => program.tuples.get(id.index()).is_some_and(|decl| {
+            decl.fields.iter().any(|field| type_reaches_carrier(program, field.ty, target, scratch))
+        }),
+        Some(RirType::Option(inner) | RirType::Array { elem: inner, .. }) => {
+            type_reaches_carrier(program, *inner, target, scratch)
+        }
+        _ => false,
+    };
+    scratch.visiting_types[ty.index()] = false;
+    reaches
+}
+
+fn carrier_reaches(
+    program: &RirProgram,
+    current: RirDynCarrierId,
+    target: RirDynCarrierId,
+    scratch: &mut DynStorageScratch,
+) -> bool {
+    if current == target {
+        return true;
+    }
+    let Some(visiting) = scratch.visiting_carriers.get_mut(current.index()) else {
+        return false;
+    };
+    if *visiting {
+        return false;
+    }
+    *visiting = true;
+    let reaches = program
+        .dyn_carriers
+        .get(current.index())
+        .is_some_and(|carrier| {
+            carrier
+                .variants
+                .iter()
+                .any(|variant| type_reaches_carrier(program, variant.concrete_ty, target, scratch))
+        });
+    scratch.visiting_carriers[current.index()] = false;
+    reaches
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FinalDynLayoutFailure {
+    Function,
+    FunctionCarrier,
+    Provider,
+    Recursive,
+    Overflow,
+    Unsupported,
+    Invalid,
+}
+
+type FinalDynLayout = Result<RustApproxLayout, FinalDynLayoutFailure>;
+
+struct DynStorageLayoutCx<'a> {
+    program: &'a RirProgram,
+    storage: &'a [Vec<RirDynStorage>],
+    carriers: Vec<Option<FinalDynLayout>>,
+    visiting_carriers: Vec<bool>,
+    visiting_types: Vec<bool>,
+}
+
+impl<'a> DynStorageLayoutCx<'a> {
+    fn new(program: &'a RirProgram, storage: &'a [Vec<RirDynStorage>]) -> Self {
+        Self {
+            program,
+            storage,
+            carriers: vec![None; program.dyn_carriers.len()],
+            visiting_carriers: vec![false; program.dyn_carriers.len()],
+            visiting_types: vec![false; program.types.len()],
+        }
+    }
+
+    fn carrier_layout(&mut self, carrier: RirDynCarrierId) -> FinalDynLayout {
+        if let Some(layout) = self.carriers.get(carrier.index()).copied().flatten() {
+            return layout;
+        }
+        let Some(visiting) = self.visiting_carriers.get_mut(carrier.index()) else {
+            return Err(FinalDynLayoutFailure::Invalid);
+        };
+        if *visiting {
+            return Err(FinalDynLayoutFailure::Recursive);
+        }
+        *visiting = true;
+        let layout = (|| {
+            let decl = self
+                .program
+                .dyn_carriers
+                .get(carrier.index())
+                .ok_or(FinalDynLayoutFailure::Invalid)?;
+            let mut payload = target_profile().primitive_layout(RustPrimitiveLayout::Unit);
+            for (index, variant) in decl.variants.iter().enumerate() {
+                let layout = match self
+                    .storage
+                    .get(carrier.index())
+                    .and_then(|variants| variants.get(index))
+                    .ok_or(FinalDynLayoutFailure::Invalid)?
+                {
+                    RirDynStorage::Inline => match self.type_layout(variant.concrete_ty) {
+                        Err(
+                            FinalDynLayoutFailure::Function
+                            | FinalDynLayoutFailure::FunctionCarrier,
+                        ) => return Err(FinalDynLayoutFailure::FunctionCarrier),
+                        layout => layout?,
+                    },
+                    RirDynStorage::Boxed => target_profile().pointer_layout(),
+                };
+                payload.size = payload.size.max(layout.size);
+                payload.align = payload.align.max(layout.align);
+            }
+            layout::enum_layout(target_profile().carrier_discriminant_layout(), payload)
+                .ok_or(FinalDynLayoutFailure::Overflow)
+        })();
+        self.visiting_carriers[carrier.index()] = false;
+        if let Some(slot) = self.carriers.get_mut(carrier.index()) {
+            *slot = Some(layout);
+        }
+        layout
+    }
+
+    fn type_layout(&mut self, ty: RirTypeId) -> FinalDynLayout {
+        let Some(visiting) = self.visiting_types.get_mut(ty.index()) else {
+            return Err(FinalDynLayoutFailure::Invalid);
+        };
+        if *visiting {
+            return Err(FinalDynLayoutFailure::Recursive);
+        }
+        *visiting = true;
+        let layout = (|| {
+            match self
+            .program
+            .types
+            .get(ty.index())
+            .ok_or(FinalDynLayoutFailure::Invalid)?
+        {
+            RirType::Int | RirType::Float | RirType::Flag(_) => {
+                Ok(target_profile().primitive_layout(RustPrimitiveLayout::Integer))
+            }
+            RirType::Bool => Ok(target_profile().primitive_layout(RustPrimitiveLayout::Bool)),
+            RirType::Char => Ok(target_profile().primitive_layout(RustPrimitiveLayout::Char)),
+            RirType::Void => Ok(target_profile().primitive_layout(RustPrimitiveLayout::Unit)),
+            RirType::String => layout::repeat(
+                target_profile().pointer_layout(),
+                3,
+            )
+            .ok_or(FinalDynLayoutFailure::Overflow),
+            RirType::List(_) | RirType::Map { .. } => {
+                Ok(target_profile().pointer_layout())
+            }
+            RirType::DataRef(id) => self
+                .program
+                .datarefs
+                .get(id.index())
+                .map(|_| target_profile().pointer_layout())
+                .ok_or(FinalDynLayoutFailure::Unsupported),
+            RirType::Slice(_) => layout::repeat(
+                target_profile().pointer_layout(),
+                2,
+            )
+            .ok_or(FinalDynLayoutFailure::Overflow),
+            RirType::Lambda(_) => Err(FinalDynLayoutFailure::Function),
+            RirType::Option(inner) => layout::enum_layout(
+                target_profile().primitive_layout(RustPrimitiveLayout::Bool),
+                self.type_layout(*inner)?,
+            )
+            .ok_or(FinalDynLayoutFailure::Overflow),
+            RirType::Array { elem, len } => layout::repeat(
+                self.type_layout(*elem)?,
+                *len,
+            )
+            .ok_or(FinalDynLayoutFailure::Overflow),
+            RirType::Struct(id) => {
+                let decl = self
+                    .program
+                    .structs
+                    .get(id.index())
+                    .ok_or(FinalDynLayoutFailure::Invalid)?;
+                if decl.native_ref {
+                    Ok(target_profile().pointer_layout())
+                } else if decl.native.is_some() {
+                    decl.native_layout
+                        .map(layout_from_evidence)
+                        .ok_or(FinalDynLayoutFailure::Provider)?
+                } else {
+                    self.fields_layout(&decl.fields)
+                }
+            }
+            RirType::Tuple(id) => self.fields_layout(
+                &self
+                    .program
+                    .tuples
+                    .get(id.index())
+                    .ok_or(FinalDynLayoutFailure::Invalid)?
+                    .fields,
+            ),
+            RirType::Enum(id) => {
+                if let Some(carrier) = self.program.dyn_carriers.iter().find(|carrier| {
+                    matches!(self.program.types.get(carrier.storage_ty.index()), Some(RirType::Enum(candidate)) if candidate == id)
+                }) {
+                    self.carrier_layout(carrier.id)
+                } else {
+                    let decl = self
+                        .program
+                        .enums
+                        .get(id.index())
+                        .ok_or(FinalDynLayoutFailure::Invalid)?;
+                    if decl.native.is_some() {
+                        decl.native_layout
+                            .map(layout_from_evidence)
+                            .ok_or(FinalDynLayoutFailure::Provider)?
+                    } else {
+                        let mut payload = target_profile().primitive_layout(RustPrimitiveLayout::Unit);
+                        for variant in &decl.variants {
+                            let layout = self.fields_layout(&variant.fields)?;
+                            payload.size = payload.size.max(layout.size);
+                            payload.align = payload.align.max(layout.align);
+                        }
+                        layout::enum_layout(
+                            target_profile().carrier_discriminant_layout(),
+                            payload,
+                        )
+                        .ok_or(FinalDynLayoutFailure::Overflow)
+                    }
+                }
+            }
+        }
+        })();
+        self.visiting_types[ty.index()] = false;
+        layout
+    }
+
+    fn fields_layout(&mut self, fields: &[RirField]) -> FinalDynLayout {
+        let mut layouts = Vec::with_capacity(fields.len());
+        for field in fields {
+            layouts.push(self.type_layout(field.ty)?);
+        }
+        layout::fields(layouts).ok_or(FinalDynLayoutFailure::Overflow)
+    }
+}
+
+fn layout_from_evidence(layout: RirDynLayout) -> FinalDynLayout {
+    let layout = RustApproxLayout {
+        size: layout.size,
+        align: layout.align,
+    };
+    layout::valid(layout)
+        .then_some(layout)
+        .ok_or(FinalDynLayoutFailure::Invalid)
+}
+
+fn dyn_weakening_classes(
+    program: &RirProgram,
+) -> Option<std::collections::BTreeMap<RirDynCarrierId, RirDynCarrierId>> {
+    let mut classes = program
+        .dyn_carriers
+        .iter()
+        .map(|carrier| (carrier.id, carrier.id))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    loop {
+        let mut changed = false;
+        for weakening in &program.dyn_weakenings {
+            let root = (*classes.get(&weakening.source)?).min(*classes.get(&weakening.target)?);
+            let source = *classes.get(&weakening.source)?;
+            let target = *classes.get(&weakening.target)?;
+            for class in classes.values_mut() {
+                if *class == source || *class == target {
+                    changed |= *class != root;
+                    *class = root;
+                }
+            }
+        }
+        if !changed {
+            return Some(classes);
+        }
+    }
+}
+
+fn propagate_dyn_storage(
+    program: &RirProgram,
+    classes: &std::collections::BTreeMap<RirDynCarrierId, RirDynCarrierId>,
+    storage: &mut [Vec<RirDynStorage>],
+) -> Option<bool> {
+    let mut changed = false;
+    for (carrier_index, carrier) in program.dyn_carriers.iter().enumerate() {
+        for (variant_index, variant) in carrier.variants.iter().enumerate() {
+            let boxed =
+                program
+                    .dyn_carriers
+                    .iter()
+                    .enumerate()
+                    .any(|(other_index, other)| {
+                        classes.get(&other.id) == classes.get(&carrier.id)
+                            && other.variants.iter().enumerate().any(
+                                |(other_variant, other_decl)| {
+                                    other_decl.concrete_ty == variant.concrete_ty
+                                        && storage
+                                            .get(other_index)
+                                            .and_then(|variants| variants.get(other_variant))
+                                            == Some(&RirDynStorage::Boxed)
+                                },
+                            )
+                    });
+            if boxed {
+                let slot = storage.get_mut(carrier_index)?.get_mut(variant_index)?;
+                changed |= *slot != RirDynStorage::Boxed;
+                *slot = RirDynStorage::Boxed;
+            }
+        }
+    }
+    Some(changed)
 }
 
 struct VerifyCx<'a> {
@@ -4609,7 +3397,7 @@ struct VerifyCx<'a> {
     errors: Vec<RirVerifyError>,
     initialized: Vec<bool>,
     possibly_initialized: Vec<bool>,
-    payload_ref_owned: Vec<bool>,
+    payload_bound: Vec<bool>,
     lambda_escapes: Vec<Option<RirLambdaEscape>>,
     lambda_values: Vec<RirFunctionValueState>,
     loop_lambda_scopes: Vec<Option<usize>>,
@@ -4638,127 +3426,158 @@ fn cell_ref_id(cell: RirCellRef) -> RirCellId {
 
 fn native_extern_signature_ok(
     program: &RirProgram,
-    native: &RirNativeExtern,
     ext: &RirExtern,
-    void: Option<RirTypeId>,
+    retained_callbacks: bool,
 ) -> bool {
-    !native.path.is_empty()
-        && native.path.iter().all(|segment| !segment.is_empty())
-        && rust_extern_abi_supported_with_receiver(&native.abi, native.callback_receiver)
-        && native.abi.params.len() == ext.params.len()
-        && ext.abi.params.len() == ext.params.len()
-        && native::rust_abi_matches_air(&native.abi.params, &native.abi.ret, &ext.abi)
-        && program
-            .native_call_plan(ext.id)
-            .matches_signature(&ext.params)
-        && native_callback_receiver_ok(program, native, ext)
-        && native_hidden_ctx_borrows_ok(program, &native.abi, ext)
-        && ext
-            .abi
-            .params
-            .iter()
-            .zip(&ext.params)
-            .all(|(abi, param)| extern_param_abi_ok(program, abi, *param))
-        && extern_return_abi_ok(program, &ext.abi.ret, ext.ret, void)
+    !ext.path.crate_name.is_empty()
+        && !ext.path.segments.is_empty()
+        && ext.path.segments.iter().all(|segment| !segment.is_empty())
+        && ext.params.iter().all(|param| {
+            let (mode, escape) = native_call::classify_param(&param.abi);
+            let native_ref = native_ty_is_resource_ref(program, param.ty);
+            param.mode == mode
+                && param.escape == escape
+                && param.action
+                    == native_call::classify_arg_action(
+                        &param.abi,
+                        mode,
+                        native_ref,
+                        ext.suspends_runtime_entry,
+                    )
+                && rir_type_matches_rust_param(program, param.ty, &param.abi)
+        })
+        && rir_native_return_valid(program, ext.ret, &ext.ret_plan)
+        && ext.suspends_runtime_entry == retained_callbacks
+        && native_callback_receiver_ok(program, ext)
+        && native_hidden_ctx_borrows_ok(program, ext)
 }
 
-fn native_callback_receiver_ok(
+fn rir_type_matches_rust_param(program: &RirProgram, ty: RirTypeId, abi: &RustParamAbi) -> bool {
+    match abi {
+        RustParamAbi::Value(expected)
+        | RustParamAbi::OwnedNamed(expected)
+        | RustParamAbi::Borrow(expected)
+        | RustParamAbi::MutBorrow(expected)
+        | RustParamAbi::MutPlace(expected) => rir_type_matches_extern(program, ty, expected),
+        RustParamAbi::ScopedLambda(callback)
+        | RustParamAbi::EscapingLambda(callback)
+        | RustParamAbi::AnvCallback(callback) => rir_type_matches_callback(program, ty, callback),
+        RustParamAbi::InitField(inner) => rir_type_matches_rust_param(program, ty, inner),
+        RustParamAbi::Option(inner) => {
+            matches!(program.types.get(ty.index()), Some(RirType::Option(payload))
+                if rir_type_matches_rust_param(program, *payload, inner))
+        }
+        RustParamAbi::Slice(inner) => {
+            matches!(program.types.get(ty.index()), Some(RirType::Slice(elem))
+                if rir_type_matches_rust_param(program, *elem, inner))
+        }
+        RustParamAbi::Result(ok, err) => {
+            let Some(RirType::Enum(id)) = program.types.get(ty.index()) else {
+                return false;
+            };
+            let enm = &program.enums[id.index()];
+            let [ok_variant, err_variant] = enm.variants.as_slice() else {
+                return false;
+            };
+            enm.core == Some(RirCoreEnumKind::Result)
+                && rir_rust_param_variant_matches(program, ok_variant, "Ok", ok)
+                && rir_rust_param_variant_matches(program, err_variant, "Err", err)
+        }
+    }
+}
+
+fn rir_rust_param_variant_matches(
     program: &RirProgram,
-    native: &RirNativeExtern,
-    ext: &RirExtern,
+    variant: &RirVariant,
+    name: &str,
+    abi: &RustParamAbi,
 ) -> bool {
-    if !native.abi.has_callback_wrapper() {
+    variant.symbol.as_str() == name
+        && variant.kind == RirVariantKind::Tuple
+        && matches!(variant.fields.as_slice(), [field]
+            if rir_type_matches_rust_param(program, field.ty, abi))
+}
+
+fn rir_native_return_valid(program: &RirProgram, ty: RirTypeId, plan: &RirNativeReturn) -> bool {
+    match plan {
+        RirNativeReturn::Void => {
+            matches!(program.types.get(ty.index()), Some(RirType::Void))
+        }
+        RirNativeReturn::Value(expected) => rir_type_matches_extern(program, ty, expected),
+        RirNativeReturn::OwnedNamed {
+            ty: expected,
+            adopt,
+        } => {
+            *adopt == native_ty_is_resource_ref(program, ty)
+                && rir_type_matches_extern(program, ty, expected)
+        }
+        RirNativeReturn::Option {
+            payload_ty,
+            payload,
+        } => {
+            matches!(program.types.get(ty.index()), Some(RirType::Option(expected)) if expected == payload_ty)
+                && rir_native_return_valid(program, *payload_ty, payload)
+        }
+        RirNativeReturn::Result {
+            ok_ty,
+            ok,
+            err_ty,
+            err,
+        } => {
+            let Some(RirType::Enum(id)) = program.types.get(ty.index()) else {
+                return false;
+            };
+            let enm = &program.enums[id.index()];
+            let [ok_variant, err_variant] = enm.variants.as_slice() else {
+                return false;
+            };
+            enm.core == Some(RirCoreEnumKind::Result)
+                && rir_native_return_variant_valid(program, ok_variant, "Ok", *ok_ty, ok)
+                && rir_native_return_variant_valid(program, err_variant, "Err", *err_ty, err)
+        }
+    }
+}
+
+fn rir_native_return_variant_valid(
+    program: &RirProgram,
+    variant: &RirVariant,
+    name: &str,
+    ty: RirTypeId,
+    plan: &RirNativeReturn,
+) -> bool {
+    variant.symbol.as_str() == name
+        && variant.kind == RirVariantKind::Tuple
+        && matches!(variant.fields.as_slice(), [field] if field.ty == ty)
+        && rir_native_return_valid(program, ty, plan)
+}
+
+fn native_callback_receiver_ok(program: &RirProgram, ext: &RirExtern) -> bool {
+    if !ext
+        .params
+        .iter()
+        .any(|param| param.abi.is_callback_wrapper())
+    {
         return true;
     }
-    let Some(receiver) = native.callback_receiver else {
+    let Some(receiver) = ext.callback_receiver else {
         return true;
     };
-    native
-        .abi
-        .params
-        .get(receiver)
-        .is_some_and(|param| matches!(param, RustParamAbi::Borrow(_) | RustParamAbi::MutBorrow(_)))
-        && ext
-            .params
-            .get(receiver)
-            .is_some_and(|param| native_ty_is_resource_ref(program, param.ty))
+    ext.params.get(receiver).is_some_and(|param| {
+        matches!(
+            param.abi,
+            RustParamAbi::Borrow(_) | RustParamAbi::MutBorrow(_)
+        ) && native_ty_is_resource_ref(program, param.ty)
+    })
 }
 
-fn native_hidden_ctx_borrows_ok(
-    program: &RirProgram,
-    abi: &RustExternAbi,
-    ext: &RirExtern,
-) -> bool {
-    !native_call::NativeHiddenCtxPlan::from_abi(abi.ctx).borrows_runtime()
-        || abi.params.iter().zip(&ext.params).all(|(abi, param)| {
-            !matches!(abi, RustParamAbi::Borrow(_) | RustParamAbi::MutBorrow(_))
-                || !native_ty_is_resource_ref(program, param.ty)
+fn native_hidden_ctx_borrows_ok(program: &RirProgram, ext: &RirExtern) -> bool {
+    ext.ctx != RustWrapperCtx::HiddenRuntime
+        || ext.params.iter().all(|param| {
+            !matches!(
+                param.abi,
+                RustParamAbi::Borrow(_) | RustParamAbi::MutBorrow(_)
+            ) || !native_ty_is_resource_ref(program, param.ty)
         })
-}
-
-pub(super) fn rust_extern_abi_supported_with_receiver(
-    abi: &RustExternAbi,
-    receiver: Option<usize>,
-) -> bool {
-    match abi.support {
-        anvyx_runtime::RustAbiSupport::Direct => abi.backend_supported(),
-        anvyx_runtime::RustAbiSupport::NeedsWrapperConversion => {
-            abi.supported_callback_wrapper_with_receiver(receiver)
-        }
-        anvyx_runtime::RustAbiSupport::Unsupported => false,
-    }
-}
-
-pub(super) fn native_return_adopts_resource(
-    program: &RirProgram,
-    ret: RirTypeId,
-    abi: &anvyx_runtime::RustReturnAbi,
-) -> bool {
-    match abi {
-        anvyx_runtime::RustReturnAbi::OwnedNamed(_) => native_ty_is_resource_ref(program, ret),
-        anvyx_runtime::RustReturnAbi::Option(inner) => {
-            let RirType::Option(inner_ty) = program.types[ret.index()] else {
-                return false;
-            };
-            native_return_adopts_resource(program, inner_ty, inner)
-        }
-        anvyx_runtime::RustReturnAbi::Result(ok, err) => {
-            let RirType::Enum(enum_id) = program.types[ret.index()] else {
-                return false;
-            };
-            let [ok_variant, err_variant] = program.enums[enum_id.index()].variants.as_slice()
-            else {
-                return false;
-            };
-            native_return_adopts_resource(program, ok_variant.fields[0].ty, ok)
-                || native_return_adopts_resource(program, err_variant.fields[0].ty, err)
-        }
-        anvyx_runtime::RustReturnAbi::Void | anvyx_runtime::RustReturnAbi::Value(_) => false,
-    }
-}
-
-pub(super) fn native_dynamic_arg_facts(
-    program: &RirProgram,
-    ty: RirTypeId,
-    semantic: RirParamSemantic,
-) -> native_call::NativeArgFacts {
-    native_call::NativeArgFacts::dynamic(
-        semantic,
-        matches!(program.types[ty.index()], RirType::String),
-        native_ty_is_resource_ref(program, ty),
-    )
-}
-
-pub(super) fn native_arg_facts(
-    program: &RirProgram,
-    ty: RirTypeId,
-    arg: &RirCallArg,
-) -> native_call::NativeArgFacts {
-    native_call::NativeArgFacts::rir(
-        arg,
-        matches!(program.types[ty.index()], RirType::String),
-        native_ty_is_resource_ref(program, ty),
-    )
 }
 
 pub(super) fn native_ty_is_resource_ref(program: &RirProgram, ty: RirTypeId) -> bool {
@@ -4766,21 +3585,6 @@ pub(super) fn native_ty_is_resource_ref(program: &RirProgram, ty: RirTypeId) -> 
         program.types[ty.index()],
         RirType::Struct(id) if program.structs[id.index()].native_ref
     )
-}
-
-fn extern_param_abi_ok(program: &RirProgram, abi: &ExternTypeExpr, param: RirExternParam) -> bool {
-    param.escape == extern_param_escape(abi) && rir_type_matches_extern(program, param.ty, abi)
-}
-
-fn extern_param_escape(abi: &ExternTypeExpr) -> RirParamEscape {
-    match abi {
-        ExternTypeExpr::Callback(callback)
-            if callback.policy.escape == CallbackEscape::Escaping =>
-        {
-            RirParamEscape::Escaping
-        }
-        _ => RirParamEscape::NonEscaping,
-    }
 }
 
 fn rir_type_matches_callback(
@@ -4808,19 +3612,6 @@ fn rir_type_matches_callback(
                     && rir_type_matches_extern(program, param.ty, &callback.ty)
             })
         && rir_type_matches_extern(program, sig.ret, &callback.ret)
-}
-
-fn extern_return_abi_ok(
-    program: &RirProgram,
-    abi: &ExternTypeExpr,
-    ret: RirTypeId,
-    void: Option<RirTypeId>,
-) -> bool {
-    match abi {
-        ExternTypeExpr::Void => Some(ret) == void,
-        ExternTypeExpr::Slice(_) | ExternTypeExpr::Callback(_) => false,
-        _ => rir_type_matches_extern(program, ret, abi),
-    }
 }
 
 fn native_key_matches(
@@ -4879,7 +3670,10 @@ fn rir_type_matches_extern(program: &RirProgram, id: RirTypeId, expected: &Exter
         (RirType::Struct(struct_id), ExternTypeExpr::Named { module, name, args }) => {
             args.is_empty()
                 && native_key_matches(
-                    program.structs[struct_id.index()].native_key.as_ref(),
+                    program.structs[struct_id.index()]
+                        .native
+                        .as_ref()
+                        .map(|native| &native.key),
                     module.as_ref(),
                     name,
                 )
@@ -4895,7 +3689,10 @@ fn rir_type_matches_extern(program: &RirProgram, id: RirTypeId, expected: &Exter
         (RirType::Enum(enum_id), ExternTypeExpr::Named { module, name, args }) => {
             args.is_empty()
                 && native_key_matches(
-                    program.enums[enum_id.index()].native_key.as_ref(),
+                    program.enums[enum_id.index()]
+                        .native
+                        .as_ref()
+                        .map(|native| &native.key),
                     module.as_ref(),
                     name,
                 )
@@ -4941,7 +3738,7 @@ impl VerifyCx<'_> {
             errors: vec![],
             initialized: vec![],
             possibly_initialized: vec![],
-            payload_ref_owned: vec![],
+            payload_bound: vec![],
             lambda_escapes: vec![],
             lambda_values: vec![],
             loop_lambda_scopes: vec![],
@@ -4961,11 +3758,6 @@ impl VerifyCx<'_> {
         if let Some(entry) = self.program.entry {
             self.check_function_id(RirVerifySite::Program, entry);
         }
-        if self.program.ctx.statics_symbol.as_str().is_empty()
-            || self.program.ctx.globals_symbol.as_str().is_empty()
-        {
-            self.push(RirVerifySite::Context, RirVerifyErrorKind::BadId);
-        }
         for (index, ty) in self.program.types.iter().enumerate() {
             let site = RirVerifySite::Type(RirTypeId::from_index(index));
             self.check_type_id(site, RirTypeId::from_index(index));
@@ -4975,46 +3767,15 @@ impl VerifyCx<'_> {
                 RirType::Enum(id) => self.check_enum_id(site, *id),
                 RirType::Flag(id) => self.check_flag_id(site, *id),
                 RirType::Tuple(id) => self.check_tuple_id(site, *id),
-                RirType::Array { elem, .. } => {
-                    self.check_type_id(site, *elem);
-                    self.check_lambda_container_type_family(
-                        site,
-                        *elem,
-                        LambdaStorageFamily::FixedArrayElement,
-                    );
-                }
-                RirType::List(elem) => {
-                    self.check_type_id(site, *elem);
-                    self.check_lambda_container_type_family(
-                        site,
-                        *elem,
-                        LambdaStorageFamily::ListElement,
-                    );
-                }
-                RirType::Slice(elem) => {
+                RirType::Array { elem, .. } | RirType::List(elem) | RirType::Slice(elem) => {
                     self.check_type_id(site, *elem);
                 }
                 RirType::Map { key, value } => {
                     self.check_type_id(site, *key);
                     self.check_type_id(site, *value);
-                    self.check_lambda_container_type_family(
-                        site,
-                        *key,
-                        LambdaStorageFamily::MapKey,
-                    );
-                    self.check_lambda_container_type_family(
-                        site,
-                        *value,
-                        LambdaStorageFamily::MapValue,
-                    );
                 }
                 RirType::Option(inner) => {
                     self.check_type_id(site, *inner);
-                    self.check_lambda_container_type_family(
-                        site,
-                        *inner,
-                        LambdaStorageFamily::OptionalPayload,
-                    );
                 }
                 RirType::Lambda(sig) => self.check_lambda_sig_id(site, *sig),
                 _ => {}
@@ -5032,6 +3793,7 @@ impl VerifyCx<'_> {
         self.check_cell_symbol_uniqueness();
         self.check_structs();
         self.check_datarefs();
+        self.check_dataref_places();
         self.check_enums();
         self.check_flags();
         self.check_tuples();
@@ -5063,12 +3825,13 @@ impl VerifyCx<'_> {
             }
             self.check_const(id, konst);
         }
+        let retained_callbacks = self.program.has_retained_callbacks();
         for (index, ext) in self.program.externs.iter().enumerate() {
             let id = RirExternId::from_index(index);
             if ext.id != id {
                 self.push(RirVerifySite::Extern(id), RirVerifyErrorKind::BadId);
             }
-            self.check_extern(id, ext);
+            self.check_extern(id, ext, retained_callbacks);
         }
         for (index, function) in self.program.functions.iter().enumerate() {
             let id = RirFunctionId::from_index(index);
@@ -5081,151 +3844,165 @@ impl VerifyCx<'_> {
 
     fn check_dyn_carriers(&mut self) {
         let site = RirVerifySite::Program;
-        let mut surfaces = std::collections::BTreeSet::new();
-        let mut witnesses = std::collections::BTreeSet::new();
+        let expected_storage = final_dyn_storage(self.program);
+        if expected_storage.is_none() {
+            self.push(site, RirVerifyErrorKind::InvalidDynStorage);
+        }
         let mut backings = std::collections::BTreeSet::new();
         for (index, carrier) in self.program.dyn_carriers.iter().enumerate() {
-            if carrier.id != RirDynCarrierId::from_index(index)
-                || !self
-                    .program
-                    .dyn_origins
-                    .surfaces
-                    .contains(&carrier.air_surface)
-                || !surfaces.insert(carrier.air_surface)
-            {
+            if carrier.id != RirDynCarrierId::from_index(index) {
                 self.push(site, RirVerifyErrorKind::InvalidDynCarrier);
             }
             self.check_type_id(site, carrier.storage_ty);
             let backing = match self.program.types.get(carrier.storage_ty.index()) {
-                Some(RirType::Enum(id))
-                    if self.program.enums.get(id.index()).is_some_and(|decl| {
-                        decl.air_id.is_none()
-                            && decl.native_path.is_none()
-                            && decl.native_key.is_none()
-                            && decl.core.is_none()
-                            && decl.repr == RirEnumRepr::Adt
-                    }) =>
-                {
-                    Some(*id)
-                }
-                _ => {
-                    self.push(site, RirVerifyErrorKind::InvalidDynStorage);
-                    None
-                }
+                Some(RirType::Enum(id)) => self.program.enums.get(id.index()),
+                _ => None,
             };
-            if backing.is_some_and(|id| !backings.insert(id)) {
+            let Some(backing) = backing else {
                 self.push(site, RirVerifyErrorKind::InvalidDynStorage);
-            }
-            if backing
-                .and_then(|id| self.program.enums.get(id.index()))
-                .map_or(0, |decl| decl.variants.len())
-                != carrier.variants.len()
+                continue;
+            };
+            if backing.role != RirEnumRole::DynamicCarrier
+                || backing.native.is_some()
+                || backing.core.is_some()
+                || backing.repr != RirEnumRepr::Adt
+                || !backings.insert(backing.id)
+                || backing.variants.len() != carrier.variants.len()
             {
                 self.push(site, RirVerifyErrorKind::InvalidDynStorage);
             }
             for (variant_index, variant) in carrier.variants.iter().enumerate() {
-                if variant.id != RirDynVariantId::from_index(variant_index) {
+                if variant.id != RirDynVariantId::new(carrier.id, variant_index) {
                     self.push(site, RirVerifyErrorKind::InvalidDynVariant);
                 }
-                let origin = self
-                    .program
-                    .dyn_origins
-                    .witnesses
-                    .iter()
-                    .find(|origin| origin.air_witness == variant.air_witness);
-                if !witnesses.insert(variant.air_witness)
-                    || !origin.is_some_and(|origin| {
-                        origin.surface == carrier.air_surface
-                            && origin.concrete_ty == variant.concrete_ty
-                            && origin.storage == variant.storage
-                            && origin.payload == variant.payload
-                    })
-                {
-                    self.push(site, RirVerifyErrorKind::InvalidDynOrigin);
-                }
                 self.check_type_id(site, variant.concrete_ty);
-                let payload_valid = backing
-                    .and_then(|id| self.program.enums.get(id.index()))
-                    .and_then(|decl| decl.variants.get(variant_index))
-                    .is_some_and(|backing| {
-                        backing.kind == RirVariantKind::Tuple
-                            && backing.fields.len() == 1
-                            && backing.fields[0].ty == variant.concrete_ty
+                let payload_valid = backing.variants.get(variant_index).is_some_and(|backing| {
+                    backing.kind == RirVariantKind::Tuple
+                        && backing.fields.len() == 1
+                        && backing.fields[0].ty == variant.concrete_ty
+                }) && self
+                    .program
+                    .materializers
+                    .get(variant.payload.index())
+                    .is_some_and(|payload| {
+                        payload.ty == variant.concrete_ty
+                            && payload.position
+                                == RustRecipePosition::StoredPayload(
+                                    LambdaStorageFamily::DynamicPayload,
+                                )
                     });
-                if !payload_valid {
+                if !payload_valid
+                    || expected_storage
+                        .as_ref()
+                        .and_then(|carriers| carriers.get(index))
+                        .and_then(|variants| variants.get(variant_index))
+                        != Some(&variant.storage)
+                {
                     self.push(site, RirVerifyErrorKind::InvalidDynStorage);
                 }
             }
-            let expected = self
-                .program
-                .dyn_origins
-                .witnesses
-                .iter()
-                .filter(|origin| origin.surface == carrier.air_surface)
-                .count();
-            if carrier.variants.len() != expected {
-                self.push(site, RirVerifyErrorKind::InvalidDynVariant);
+        }
+        for (index, dispatch) in self.program.dyn_dispatches.iter().enumerate() {
+            if dispatch.id != RirDynDispatchId::from_index(index) {
+                self.push(site, RirVerifyErrorKind::InvalidDynDispatch);
+            }
+            let Some(carrier) = self.program.dyn_carriers.get(dispatch.carrier.index()) else {
+                self.push(site, RirVerifyErrorKind::InvalidDynCarrier);
+                continue;
+            };
+            self.check_type_id(site, dispatch.result_ty);
+            for param in &dispatch.params {
+                self.check_type_id(site, param.ty);
+            }
+            if dispatch.arms.len() != carrier.variants.len()
+                || dispatch.arms.iter().enumerate().any(|(index, arm)| {
+                    !self.dyn_dispatch_target_valid(
+                        carrier.variants[index].concrete_ty,
+                        arm,
+                        &dispatch.params,
+                        dispatch.result_ty,
+                    )
+                })
+                || !dispatch.arms.first().is_some_and(|first| {
+                    dispatch.arms.iter().all(|arm| {
+                        arm.receiver.is_readonly_receiver() == first.receiver.is_readonly_receiver()
+                    })
+                })
+            {
+                self.push(site, RirVerifyErrorKind::InvalidDynDispatch);
             }
         }
-        let dispatches_valid = self.program.dyn_carriers.iter().all(|carrier| {
-            let slots = self
-                .program
-                .dyn_origins
-                .slots
-                .iter()
-                .filter(|slot| slot.surface == carrier.air_surface)
-                .collect::<Vec<_>>();
-            carrier.variants.iter().all(|variant| {
-                slots.iter().all(|slot| {
-                    self.program
-                        .dyn_origins
-                        .dispatches
-                        .iter()
-                        .filter(|origin| {
-                            origin.air_witness == variant.air_witness
-                                && origin.air_slot == slot.air_slot
-                        })
-                        .count()
-                        == 1
+        for (index, weakening) in self.program.dyn_weakenings.iter().enumerate() {
+            if weakening.id != RirDynWeakeningId::from_index(index) {
+                self.push(site, RirVerifyErrorKind::InvalidDynStorage);
+            }
+            let (Some(source), Some(target)) = (
+                self.program.dyn_carriers.get(weakening.source.index()),
+                self.program.dyn_carriers.get(weakening.target.index()),
+            ) else {
+                self.push(site, RirVerifyErrorKind::InvalidDynCarrier);
+                continue;
+            };
+            if weakening.source == weakening.target
+                || weakening.arms.len() != source.variants.len()
+                || weakening.arms.iter().enumerate().any(|(index, arm)| {
+                    arm.target.carrier() != target.id
+                        || target
+                            .variants
+                            .get(arm.target.index())
+                            .is_none_or(|target_variant| {
+                                let source_variant = &source.variants[index];
+                                target_variant.concrete_ty != source_variant.concrete_ty
+                                    || target_variant.storage != source_variant.storage
+                            })
                 })
-            })
-        });
-        let expected_dispatches = self
-            .program
-            .dyn_carriers
-            .iter()
-            .map(|carrier| {
-                carrier.variants.len()
-                    * self
-                        .program
-                        .dyn_origins
-                        .slots
-                        .iter()
-                        .filter(|slot| slot.surface == carrier.air_surface)
-                        .count()
-            })
-            .sum::<usize>();
-        if surfaces.len() != self.program.dyn_origins.surfaces.len()
-            || witnesses.len() != self.program.dyn_origins.witnesses.len()
-            || !dispatches_valid
-            || expected_dispatches != self.program.dyn_origins.dispatches.len()
-        {
-            self.push(site, RirVerifyErrorKind::InvalidDynOrigin);
+            {
+                self.push(site, RirVerifyErrorKind::InvalidDynStorage);
+            }
+        }
+        for (index, set) in self.program.dyn_variant_sets.iter().enumerate() {
+            if set.id != RirDynVariantSetId::from_index(index) {
+                self.push(site, RirVerifyErrorKind::InvalidDynVariant);
+            }
+            self.check_type_id(site, set.target);
+            let Some(carrier) = self.program.dyn_carriers.get(set.carrier.index()) else {
+                self.push(site, RirVerifyErrorKind::InvalidDynCarrier);
+                continue;
+            };
+            let expected = carrier
+                .variants
+                .iter()
+                .enumerate()
+                .filter_map(|(index, variant)| {
+                    (variant.concrete_ty == set.target)
+                        .then_some(RirDynVariantId::new(carrier.id, index))
+                })
+                .collect::<Vec<_>>();
+            if set.variants != expected {
+                self.push(site, RirVerifyErrorKind::InvalidDynVariant);
+            }
         }
     }
 
     fn check_materializers(&mut self) {
         let site = RirVerifySite::Program;
-        if !materializer_tables_complete(self.program) {
+        if self.program.value_materializers.len() != self.program.types.len() {
             self.push(site, RirVerifyErrorKind::BadId);
         }
         for (index, materializer) in self.program.value_materializers.iter().enumerate() {
-            if let Some(materializer) = materializer
-                && !self.materializer_matches(
-                    RirTypeId::from_index(index),
-                    *materializer,
-                    RustRecipePosition::Value,
-                )
+            let ty = RirTypeId::from_index(index);
+            let required = match self.program.types.get(index) {
+                Some(RirType::Void | RirType::Slice(_)) | None => false,
+                Some(RirType::Lambda(sig)) => {
+                    let policy = RirRustRepPolicy::new(self.program);
+                    policy.lambda_sig_copyable(*sig) || policy.lambda_sig_cloneable(*sig)
+                }
+                Some(_) => true,
+            };
+            if materializer.is_some() != required
+                || materializer.is_some_and(|materializer| {
+                    !self.materializer_matches(ty, materializer, RustRecipePosition::Value)
+                })
             {
                 self.push(site, RirVerifyErrorKind::BadId);
             }
@@ -5240,6 +4017,248 @@ impl VerifyCx<'_> {
                 self.push(site, RirVerifyErrorKind::BadId);
             }
         }
+        if !self.materializer_cycles_valid() {
+            self.push(site, RirVerifyErrorKind::BadId);
+        }
+    }
+
+    fn materializer_cycles_valid(&self) -> bool {
+        fn visit_all<'a>(
+            program: &RirProgram,
+            ids: impl IntoIterator<Item = &'a RirMaterializerId>,
+            states: &mut [u8],
+        ) -> bool {
+            ids.into_iter().all(|id| visit(program, *id, states))
+        }
+
+        fn visit(program: &RirProgram, id: RirMaterializerId, states: &mut [u8]) -> bool {
+            let Some(state) = states.get_mut(id.index()) else {
+                return false;
+            };
+            match *state {
+                1 => return false,
+                2 => return true,
+                _ => *state = 1,
+            }
+            let Some(materializer) = program.materializers.get(id.index()) else {
+                return false;
+            };
+            let copy_valid = match &materializer.copy {
+                Some(
+                    RirCopyEvidence::Struct { fields, .. } | RirCopyEvidence::Tuple { fields },
+                ) => visit_all(program, fields, states),
+                Some(RirCopyEvidence::Array { elem }) => visit(program, *elem, states),
+                Some(RirCopyEvidence::Enum { variants }) => {
+                    visit_all(program, variants.iter().flatten(), states)
+                }
+                Some(RirCopyEvidence::Optional { payload }) => visit(program, *payload, states),
+                Some(RirCopyEvidence::Leaf) | None => true,
+            };
+            let support_valid = match &materializer.support {
+                Some(RirSupportEvidence::ProviderStruct { fields }) => {
+                    visit_all(program, fields, states)
+                }
+                Some(RirSupportEvidence::ProviderEnum { variants }) => {
+                    visit_all(program, variants.iter().flatten(), states)
+                }
+                Some(RirSupportEvidence::List { .. } | RirSupportEvidence::Map { .. }) | None => {
+                    true
+                }
+            };
+            let action_valid =
+                match &materializer.action {
+                    RirMaterializerAction::Struct { fields }
+                    | RirMaterializerAction::Tuple { fields } => visit_all(program, fields, states),
+                    RirMaterializerAction::Array { elem } => visit(program, *elem, states),
+                    RirMaterializerAction::Enum { variants } => {
+                        visit_all(program, variants.iter().flatten(), states)
+                    }
+                    RirMaterializerAction::Optional { payload } => visit(program, *payload, states),
+                    RirMaterializerAction::DynamicMaterialize { carrier, variants } => {
+                        let Some(carrier) = program.dyn_carriers.get(carrier.index()) else {
+                            return false;
+                        };
+                        visit_all(
+                            program,
+                            carrier.variants.iter().zip(variants).filter_map(
+                                |(variant, payload)| {
+                                    (variant.storage == RirDynStorage::Inline).then_some(payload)
+                                },
+                            ),
+                            states,
+                        )
+                    }
+                    RirMaterializerAction::Copy
+                    | RirMaterializerAction::ManagedShare
+                    | RirMaterializerAction::IdentityShare
+                    | RirMaterializerAction::CallableShare
+                    | RirMaterializerAction::ProviderMaterialize { .. } => true,
+                };
+            if !copy_valid || !support_valid || !action_valid {
+                return false;
+            }
+            states[id.index()] = 2;
+            true
+        }
+
+        let mut states = vec![0; self.program.materializers.len()];
+        (0..states.len()).all(|index| {
+            visit(
+                self.program,
+                RirMaterializerId::from_index(index),
+                &mut states,
+            )
+        })
+    }
+
+    fn support_evidence_valid(&self, materializer: &RirMaterializer) -> bool {
+        let child = |id: RirMaterializerId, ty: RirTypeId, family: LambdaStorageFamily| {
+            self.materializer_matches(ty, id, child_recipe_position(materializer.position, family))
+        };
+        let ty = self.program.types.get(materializer.ty.index());
+        match (&materializer.support, ty) {
+            (Some(RirSupportEvidence::List { elem }), Some(RirType::List(ty))) => {
+                child(*elem, *ty, LambdaStorageFamily::ListElement)
+            }
+            (
+                Some(RirSupportEvidence::Map {
+                    key,
+                    key_contract,
+                    value,
+                }),
+                Some(RirType::Map {
+                    key: key_ty,
+                    value: value_ty,
+                }),
+            ) => {
+                child(*key, *key_ty, LambdaStorageFamily::MapKey)
+                    && self.materializer_matches(*key_ty, *key_contract, RustRecipePosition::MapKey)
+                    && child(*value, *value_ty, LambdaStorageFamily::MapValue)
+            }
+            (Some(RirSupportEvidence::ProviderStruct { fields }), Some(RirType::Struct(id))) => {
+                self.program.structs.get(id.index()).is_some_and(|strukt| {
+                    strukt.native.is_some()
+                        && !strukt.native_ref
+                        && fields.len() == strukt.fields.len()
+                        && fields.iter().zip(&strukt.fields).all(|(entry, field)| {
+                            child(*entry, field.ty, LambdaStorageFamily::StructField)
+                        })
+                })
+            }
+            (Some(RirSupportEvidence::ProviderEnum { variants }), Some(RirType::Enum(id))) => {
+                self.program.enums.get(id.index()).is_some_and(|enm| {
+                    enm.native.is_some()
+                        && variants.len() == enm.variants.len()
+                        && variants
+                            .iter()
+                            .zip(&enm.variants)
+                            .all(|(entries, variant)| {
+                                entries.len() == variant.fields.len()
+                                    && entries.iter().zip(&variant.fields).all(|(entry, field)| {
+                                        child(*entry, field.ty, LambdaStorageFamily::EnumPayload)
+                                    })
+                            })
+                })
+            }
+            (None, Some(RirType::Struct(id))) => {
+                self.program.structs[id.index()].native.is_none()
+                    || self.program.structs[id.index()].native_ref
+            }
+            (None, Some(RirType::Enum(id))) => self.program.enums[id.index()].native.is_none(),
+            (None, Some(RirType::List(_) | RirType::Map { .. })) | (Some(_), _) => false,
+            (None, _) => true,
+        }
+    }
+
+    fn copy_evidence_valid(&self, materializer: &RirMaterializer) -> bool {
+        let child = |id: RirMaterializerId, ty: RirTypeId, family: LambdaStorageFamily| {
+            self.program
+                .materializers
+                .get(id.index())
+                .is_some_and(|entry| {
+                    entry.ty == ty
+                        && entry.position == child_recipe_position(materializer.position, family)
+                        && entry.is_copy()
+                })
+        };
+        let ty = self.program.types.get(materializer.ty.index());
+        match (&materializer.copy, ty) {
+            (None, _)
+            | (
+                Some(RirCopyEvidence::Leaf),
+                Some(
+                    RirType::Int
+                    | RirType::Flag(_)
+                    | RirType::Float
+                    | RirType::Bool
+                    | RirType::Char,
+                ),
+            ) => true,
+            (Some(RirCopyEvidence::Leaf), Some(RirType::Lambda(sig))) => {
+                let policy = RirRustRepPolicy::new(self.program);
+                !policy.lambda_sig_has_heap_env(*sig) && policy.lambda_sig_copyable(*sig)
+            }
+            (Some(RirCopyEvidence::Leaf), Some(RirType::Struct(id))) => {
+                self.program.structs.get(id.index()).is_some_and(|strukt| {
+                    !strukt.native_ref
+                        && strukt.native.as_ref().is_some_and(|native| {
+                            native
+                                .validated_materializer(anvyx_runtime::ExternMaterialization::Copy)
+                                .is_some()
+                        })
+                })
+            }
+            (Some(RirCopyEvidence::Leaf), Some(RirType::Enum(id))) => self
+                .program
+                .enums
+                .get(id.index())
+                .and_then(|enm| enm.native.as_ref())
+                .is_some_and(|native| {
+                    native
+                        .validated_materializer(anvyx_runtime::ExternMaterialization::Copy)
+                        .is_some()
+                }),
+            (Some(RirCopyEvidence::Struct { family, fields }), Some(RirType::Struct(id))) => {
+                self.program.structs.get(id.index()).is_some_and(|strukt| {
+                    strukt.native.is_none()
+                        && fields.len() == strukt.fields.len()
+                        && fields
+                            .iter()
+                            .zip(&strukt.fields)
+                            .all(|(entry, field)| child(*entry, field.ty, *family))
+                })
+            }
+            (Some(RirCopyEvidence::Tuple { fields }), Some(RirType::Tuple(id))) => {
+                self.program.tuples.get(id.index()).is_some_and(|tuple| {
+                    fields.len() == tuple.fields.len()
+                        && fields.iter().zip(&tuple.fields).all(|(entry, field)| {
+                            child(*entry, field.ty, LambdaStorageFamily::TupleField)
+                        })
+                })
+            }
+            (Some(RirCopyEvidence::Array { elem }), Some(RirType::Array { elem: ty, .. })) => {
+                child(*elem, *ty, LambdaStorageFamily::FixedArrayElement)
+            }
+            (Some(RirCopyEvidence::Optional { payload }), Some(RirType::Option(ty))) => {
+                child(*payload, *ty, LambdaStorageFamily::OptionalPayload)
+            }
+            (Some(RirCopyEvidence::Enum { variants }), Some(RirType::Enum(id))) => {
+                self.program.enums.get(id.index()).is_some_and(|enm| {
+                    self.program.dyn_carrier_for_enum(*id).is_none()
+                        && variants.len() == enm.variants.len()
+                        && variants
+                            .iter()
+                            .zip(&enm.variants)
+                            .all(|(entries, variant)| {
+                                entries.len() == variant.fields.len()
+                                    && entries.iter().zip(&variant.fields).all(|(entry, field)| {
+                                        child(*entry, field.ty, LambdaStorageFamily::EnumPayload)
+                                    })
+                            })
+                })
+            }
+            (Some(_), _) => false,
+        }
     }
 
     fn materializer_action_valid(&self, materializer: &RirMaterializer) -> bool {
@@ -5247,8 +4266,43 @@ impl VerifyCx<'_> {
             self.materializer_matches(ty, id, child_recipe_position(materializer.position, family))
         };
         let ty = self.program.types.get(materializer.ty.index());
+        let position_valid = match materializer.position {
+            RustRecipePosition::Value => true,
+            RustRecipePosition::StoredPayload(family) => match ty {
+                Some(RirType::Lambda(_)) => family.allows_function_payload(),
+                Some(RirType::Enum(id)) if self.program.dyn_carrier_for_enum(*id).is_some() => {
+                    family.allows_dynamic_owned()
+                }
+                Some(RirType::Void | RirType::Slice(_)) | None => false,
+                Some(_) => true,
+            },
+            RustRecipePosition::MapKey => match ty {
+                Some(
+                    RirType::Int
+                    | RirType::Bool
+                    | RirType::String
+                    | RirType::Char
+                    | RirType::Flag(_)
+                    | RirType::Tuple(_),
+                ) => true,
+                Some(RirType::Struct(id)) => self.program.structs[id.index()].native.is_none(),
+                Some(RirType::Enum(id)) => self.program.dyn_carrier_for_enum(*id).is_none(),
+                _ => false,
+            },
+            RustRecipePosition::Global => {
+                !matches!(ty, Some(RirType::Void | RirType::Slice(_)) | None)
+            }
+        };
+        if !position_valid
+            || materializer.is_copy() != matches!(materializer.action, RirMaterializerAction::Copy)
+            || !self.copy_evidence_valid(materializer)
+            || !self.support_evidence_valid(materializer)
+        {
+            return false;
+        }
+        let ty = self.program.types.get(materializer.ty.index());
         match &materializer.action {
-            RirMaterializerAction::Copy => ty.is_some() && self.copyable_type(materializer.ty),
+            RirMaterializerAction::Copy => ty.is_some(),
             RirMaterializerAction::ManagedShare => {
                 matches!(
                     ty,
@@ -5273,21 +4327,21 @@ impl VerifyCx<'_> {
                 if binding.mode != anvyx_runtime::ExternMaterialization::Materialize {
                     return false;
                 }
-                let native_path = std::iter::once(binding.rust_type.crate_name.clone())
-                    .chain(binding.rust_type.segments.iter().cloned())
-                    .collect::<Vec<_>>();
                 let native_matches = match ty {
                     Some(RirType::Struct(id)) => {
                         self.program.structs.get(id.index()).is_some_and(|strukt| {
                             !strukt.native_ref
-                                && !strukt.copyable
-                                && strukt.native_path.as_deref() == Some(native_path.as_slice())
+                                && strukt
+                                    .native
+                                    .as_ref()
+                                    .is_some_and(|native| native.path == binding.rust_type)
                         })
                     }
                     Some(RirType::Enum(id)) => {
                         self.program.enums.get(id.index()).is_some_and(|enm| {
-                            !enm.copyable
-                                && enm.native_path.as_deref() == Some(native_path.as_slice())
+                            enm.native
+                                .as_ref()
+                                .is_some_and(|native| native.path == binding.rust_type)
                         })
                     }
                     _ => false,
@@ -5310,7 +4364,7 @@ impl VerifyCx<'_> {
                 let Some(strukt) = self.program.structs.get(id.index()) else {
                     return false;
                 };
-                if strukt.native_path.is_some() {
+                if strukt.native.is_some() {
                     return false;
                 }
                 let expected = &strukt.fields;
@@ -5353,7 +4407,7 @@ impl VerifyCx<'_> {
                 let Some(enm) = self.program.enums.get(id.index()) else {
                     return false;
                 };
-                if enm.native_path.is_some() || self.program.dyn_carrier_for_enum(*id).is_some() {
+                if enm.native.is_some() || self.program.dyn_carrier_for_enum(*id).is_some() {
                     return false;
                 }
                 let expected = &enm.variants;
@@ -5374,31 +4428,22 @@ impl VerifyCx<'_> {
                                 )
                         })
             }
-            RirMaterializerAction::DynamicMaterialize { surface, variants } => {
-                let Some(carrier) = self
-                    .program
-                    .dyn_carriers
-                    .iter()
-                    .find(|carrier| carrier.air_surface == *surface)
-                else {
+            RirMaterializerAction::DynamicMaterialize { carrier, variants } => {
+                let Some(carrier) = self.program.dyn_carriers.get(carrier.index()) else {
                     return false;
                 };
                 materializer.ty == carrier.storage_ty
                     && variants.len() == carrier.variants.len()
-                    && carrier.variants.iter().all(|variant| {
-                        variants
-                            .iter()
-                            .filter(|materializer| {
-                                materializer.witness == variant.air_witness
-                                    && child(
-                                        materializer.payload,
-                                        variant.concrete_ty,
-                                        LambdaStorageFamily::DynamicPayload,
-                                    )
-                            })
-                            .count()
-                            == 1
-                    })
+                    && variants
+                        .iter()
+                        .zip(&carrier.variants)
+                        .all(|(payload, variant)| {
+                            child(
+                                *payload,
+                                variant.concrete_ty,
+                                LambdaStorageFamily::DynamicPayload,
+                            )
+                        })
             }
         }
     }
@@ -5518,18 +4563,6 @@ impl VerifyCx<'_> {
         }
     }
 
-    fn check_lambda_container_type_family(
-        &mut self,
-        site: RirVerifySite,
-        ty: RirTypeId,
-        family: LambdaStorageFamily,
-    ) {
-        let policy = RirRustRepPolicy::new(self.program);
-        if policy.contains_function_payload(ty) && policy.storage_supported(ty, family).is_err() {
-            self.push(site, RirVerifyErrorKind::UnsupportedRValueType);
-        }
-    }
-
     fn check_lambda_sigs(&mut self) {
         for (index, sig) in self.program.lambda_sigs.iter().enumerate() {
             let id = RirLambdaSigId::from_index(index);
@@ -5539,26 +4572,15 @@ impl VerifyCx<'_> {
             }
             for param in &sig.params {
                 self.check_type_id(site, param.ty);
-                self.check_abi(site, param.ty, param.semantic, param.abi);
+                self.check_pass_mode(site, param.ty, param.mode);
                 if matches!(
-                    (param.semantic, param.abi),
-                    (
-                        RirParamSemantic::ScopedLambda
-                            | RirParamSemantic::EscapingLambda
-                            | RirParamSemantic::AnvCallback
-                            | RirParamSemantic::StackCell
-                            | RirParamSemantic::HeapCell
-                            | RirParamSemantic::ScopedPlaceCell,
-                        _
-                    ) | (
-                        _,
-                        RirParamAbi::ScopedLambda
-                            | RirParamAbi::EscapingLambda
-                            | RirParamAbi::AnvCallback
-                            | RirParamAbi::StackCell
-                            | RirParamAbi::HeapCell
-                            | RirParamAbi::ScopedPlaceCell,
-                    )
+                    param.mode,
+                    RirPassMode::ScopedLambda
+                        | RirPassMode::EscapingLambda
+                        | RirPassMode::AnvCallback
+                        | RirPassMode::StackCell
+                        | RirPassMode::HeapCell
+                        | RirPassMode::ScopedPlaceCell
                 ) {
                     self.push(site, RirVerifyErrorKind::UnsupportedAbi);
                 }
@@ -5688,12 +4710,11 @@ impl VerifyCx<'_> {
         let heap_env = matches!(lambda.storage, RirLambdaStorage::HeapEnv { .. });
         for capture in &lambda.captures {
             self.check_type_id(site, capture.ty);
-            self.check_abi(site, capture.ty, capture.semantic, capture.abi);
+            self.check_pass_mode(site, capture.ty, capture.mode);
             match capture.kind {
                 RirLambdaCaptureKind::Param => {
                     if heap_env {
-                        if capture.semantic != RirParamSemantic::Value
-                            || capture.abi != RirParamAbi::Value
+                        if capture.mode != RirPassMode::Value
                             || (self.ty(capture.ty).is_some()
                                 && !self.value_from_ref_supported(capture.ty))
                         {
@@ -5701,32 +4722,18 @@ impl VerifyCx<'_> {
                         }
                     } else {
                         if matches!(
-                            (capture.semantic, capture.abi),
-                            (
-                                RirParamSemantic::MutBorrow
-                                    | RirParamSemantic::ScopedLambda
-                                    | RirParamSemantic::EscapingLambda
-                                    | RirParamSemantic::AnvCallback
-                                    | RirParamSemantic::StackCell
-                                    | RirParamSemantic::HeapCell
-                                    | RirParamSemantic::ScopedPlaceCell,
-                                _
-                            ) | (
-                                _,
-                                RirParamAbi::MutBorrow
-                                    | RirParamAbi::ScopedLambda
-                                    | RirParamAbi::EscapingLambda
-                                    | RirParamAbi::AnvCallback
-                                    | RirParamAbi::StackCell
-                                    | RirParamAbi::HeapCell
-                                    | RirParamAbi::ScopedPlaceCell
-                            )
+                            capture.mode,
+                            RirPassMode::MutBorrow
+                                | RirPassMode::ScopedLambda
+                                | RirPassMode::EscapingLambda
+                                | RirPassMode::AnvCallback
+                                | RirPassMode::StackCell
+                                | RirPassMode::HeapCell
+                                | RirPassMode::ScopedPlaceCell
                         ) {
                             self.push(site, RirVerifyErrorKind::UnsupportedLambdaCapture);
                         }
-                        if capture.semantic == RirParamSemantic::Value
-                            && !self.copyable_type(capture.ty)
-                        {
+                        if capture.mode == RirPassMode::Value && !self.copyable_type(capture.ty) {
                             self.push(site, RirVerifyErrorKind::NonCopyValueRequired);
                         }
                     }
@@ -5749,9 +4756,7 @@ impl VerifyCx<'_> {
                     self.check_lambda_cell_capture_decl(site, capture, cell, RirCellStorage::Heap);
                 }
                 RirLambdaCaptureKind::ScopedPlaceCell { cell } => {
-                    if capture.semantic != RirParamSemantic::ScopedPlaceCell
-                        || capture.abi != RirParamAbi::ScopedPlaceCell
-                    {
+                    if capture.mode != RirPassMode::ScopedPlaceCell {
                         self.push(site, RirVerifyErrorKind::UnsupportedLambdaCapture);
                     }
                     if lambda.escape != RirLambdaEscape::NonEscaping {
@@ -5780,8 +4785,8 @@ impl VerifyCx<'_> {
         cell: RirCellId,
         storage: RirCellStorage,
     ) {
-        let (semantic, abi) = Self::cell_capture_modes(storage);
-        if capture.semantic != semantic || capture.abi != abi {
+        let mode = Self::cell_capture_mode(storage);
+        if capture.mode != mode {
             self.push(site, RirVerifyErrorKind::UnsupportedLambdaCapture);
         }
         if let Some(decl) = self.check_cell_ref(site, RirCellRef::Owner(cell), storage)
@@ -5797,17 +4802,17 @@ impl VerifyCx<'_> {
         }
     }
 
-    fn cell_capture_modes(storage: RirCellStorage) -> (RirParamSemantic, RirParamAbi) {
+    fn cell_capture_mode(storage: RirCellStorage) -> RirPassMode {
         match storage {
-            RirCellStorage::StackScoped => (RirParamSemantic::StackCell, RirParamAbi::StackCell),
-            RirCellStorage::Heap => (RirParamSemantic::HeapCell, RirParamAbi::HeapCell),
+            RirCellStorage::StackScoped => RirPassMode::StackCell,
+            RirCellStorage::Heap => RirPassMode::HeapCell,
         }
     }
 
     fn check_collection_storages(&mut self) {
         let mut seen = HashSet::new();
         for (index, storage) in self.program.collection_storages.iter().enumerate() {
-            if storage.id != RirCollectionStorageId::from_index(index) {
+            if storage.id.index() != index {
                 self.push(RirVerifySite::Program, RirVerifyErrorKind::BadId);
             }
             if !seen.insert(storage.value_ty) {
@@ -5896,8 +4901,7 @@ impl VerifyCx<'_> {
                             *value_ty,
                             *value_materializer,
                             RustRecipePosition::StoredPayload(LambdaStorageFamily::MapValue),
-                        )
-                        && RirRustRepPolicy::new(self.program).map_key_supported(*key_ty);
+                        );
                     if !valid {
                         self.push(RirVerifySite::Program, RirVerifyErrorKind::BadId);
                     }
@@ -5969,10 +4973,10 @@ impl VerifyCx<'_> {
                     RirVerifyErrorKind::ImmutableCellSourceLocal(cell.source_local),
                 );
             }
-            Some(local) if local.payload_ref => {
+            Some(local) if !matches!(local.binding, RirLocalBinding::Value) => {
                 self.push(
                     site,
-                    RirVerifyErrorKind::CellSourceLocalPayloadRef(cell.source_local),
+                    RirVerifyErrorKind::CellSourcePayloadBinding(cell.source_local),
                 );
             }
             Some(_) => {}
@@ -6027,22 +5031,24 @@ impl VerifyCx<'_> {
         if owner.locals.iter().any(|local| local.symbol == cell.symbol) {
             self.push(site, RirVerifyErrorKind::DuplicateSymbol);
         }
-        if cell.source.place().ty != cell.payload_ty {
-            self.push(
-                site,
-                RirVerifyErrorKind::TypeMismatch {
-                    expected: cell.payload_ty,
-                    found: cell.source.place().ty,
-                },
-            );
-        }
-        self.check_mut_place_arg(
+        let source_ty = self.check_mut_place_arg(
             site,
             cell.owner,
             owner,
             cell.source.place(),
             MutPlaceUse::ScopedPlaceSource,
         );
+        if let Some(found) = source_ty
+            && found != cell.payload_ty
+        {
+            self.push(
+                site,
+                RirVerifyErrorKind::TypeMismatch {
+                    expected: cell.payload_ty,
+                    found,
+                },
+            );
+        }
         match &cell.source {
             RirScopedPlaceSource::SourceMutParam { place }
             | RirScopedPlaceSource::RefSelf { place } => {
@@ -6065,10 +5071,22 @@ impl VerifyCx<'_> {
                 }
             }
             RirScopedPlaceSource::PatternAlias { place } => {
-                if !matches!(
-                    &place.access,
-                    RirMutPlaceAccess::Handle(RirMutPlaceHandle::Param { .. })
-                ) {
+                let valid = match place.access {
+                    RirMutPlaceAccess::Handle(RirMutPlaceHandle::Param { local }) => {
+                        Self::function_local_is_mut_place_param(owner, local)
+                    }
+                    RirMutPlaceAccess::Handle(RirMutPlaceHandle::Local { local }) => {
+                        owner.locals.get(local.index()).is_some_and(|local| {
+                            matches!(
+                                local.binding,
+                                RirLocalBinding::DirectPayload
+                                    | RirLocalBinding::ScopedPlacePayload
+                            )
+                        })
+                    }
+                    _ => false,
+                };
+                if !valid {
                     self.push(site, RirVerifyErrorKind::UnsupportedLambdaCapture);
                 }
             }
@@ -6145,42 +5163,44 @@ impl VerifyCx<'_> {
             return;
         }
         for (param, capture) in function.params.iter().zip(&lambda.captures) {
-            if param.ty != capture.ty {
+            let Some((ty, mode, escape)) = function.parameter_data(*param) else {
+                self.push(site, RirVerifyErrorKind::ParamLocalMissing);
+                continue;
+            };
+            if ty != capture.ty {
                 self.push(
                     site,
                     RirVerifyErrorKind::TypeMismatch {
                         expected: capture.ty,
-                        found: param.ty,
+                        found: ty,
                     },
                 );
             }
-            if param.semantic != capture.semantic {
+            if mode != capture.mode {
                 self.push(site, RirVerifyErrorKind::CallArgMode);
             }
-            if param.abi != capture.abi {
-                self.push(site, RirVerifyErrorKind::UnsupportedAbi);
-            }
-            if param.escape != RirParamEscape::NonEscaping {
+            if escape != RirParamEscape::NonEscaping {
                 self.push(site, RirVerifyErrorKind::CallArgEscape);
             }
         }
         for (param, sig_param) in function.params.iter().skip(hidden_params).zip(&sig.params) {
-            if param.ty != sig_param.ty {
+            let Some((ty, mode, escape)) = function.parameter_data(*param) else {
+                self.push(site, RirVerifyErrorKind::ParamLocalMissing);
+                continue;
+            };
+            if ty != sig_param.ty {
                 self.push(
                     site,
                     RirVerifyErrorKind::TypeMismatch {
                         expected: sig_param.ty,
-                        found: param.ty,
+                        found: ty,
                     },
                 );
             }
-            if param.semantic != sig_param.semantic {
+            if mode != sig_param.mode {
                 self.push(site, RirVerifyErrorKind::CallArgMode);
             }
-            if param.abi != sig_param.abi {
-                self.push(site, RirVerifyErrorKind::UnsupportedAbi);
-            }
-            if param.escape != sig_param.escape {
+            if escape != sig_param.escape {
                 self.push(site, RirVerifyErrorKind::CallArgEscape);
             }
         }
@@ -6221,14 +5241,6 @@ impl VerifyCx<'_> {
                 }
                 field_symbols.push(field.symbol.clone());
                 self.check_stored_payload_family(site, field.ty, LambdaStorageFamily::StructField);
-                self.check_lambda_container_type_family(
-                    site,
-                    field.ty,
-                    LambdaStorageFamily::StructField,
-                );
-                if strukt.copyable && !self.copyable_type(field.ty) {
-                    self.push(site, RirVerifyErrorKind::NonCopyValueRequired);
-                }
             }
         }
     }
@@ -6268,11 +5280,6 @@ impl VerifyCx<'_> {
                 }
                 field_symbols.push(field.symbol.clone());
                 self.check_stored_payload_family(
-                    site,
-                    field.ty,
-                    LambdaStorageFamily::DataRefProjection,
-                );
-                self.check_lambda_container_type_family(
                     site,
                     field.ty,
                     LambdaStorageFamily::DataRefProjection,
@@ -6334,25 +5341,12 @@ impl VerifyCx<'_> {
                             field.ty,
                             LambdaStorageFamily::DynamicPayload,
                         );
-                        self.check_lambda_container_type_family(
-                            site,
-                            field.ty,
-                            LambdaStorageFamily::DynamicPayload,
-                        );
                     } else {
                         self.check_stored_payload_family(
                             site,
                             field.ty,
                             LambdaStorageFamily::EnumPayload,
                         );
-                        self.check_lambda_container_type_family(
-                            site,
-                            field.ty,
-                            LambdaStorageFamily::EnumPayload,
-                        );
-                    }
-                    if enm.copyable && !self.copyable_type(field.ty) {
-                        self.push(site, RirVerifyErrorKind::NonCopyValueRequired);
                     }
                 }
             }
@@ -6384,7 +5378,7 @@ impl VerifyCx<'_> {
             let mut values = HashSet::new();
             let mut known_bits = 0;
             for (member_index, member) in flag.members.iter().enumerate() {
-                if member.id != RirFlagMemberId::from_index(member_index) {
+                if member.id.index() != member_index {
                     self.push(site, RirVerifyErrorKind::BadId);
                 }
                 if member.symbol.as_str().is_empty()
@@ -6447,14 +5441,6 @@ impl VerifyCx<'_> {
                 }
                 field_symbols.push(field.symbol.clone());
                 self.check_stored_payload_family(site, field.ty, LambdaStorageFamily::TupleField);
-                self.check_lambda_container_type_family(
-                    site,
-                    field.ty,
-                    LambdaStorageFamily::TupleField,
-                );
-                if tuple.copyable && !self.copyable_type(field.ty) {
-                    self.push(site, RirVerifyErrorKind::NonCopyValueRequired);
-                }
             }
         }
     }
@@ -6550,7 +5536,7 @@ impl VerifyCx<'_> {
         let mut helper_refs = vec![0; self.program.stringify_helpers.len()];
         for (index, req) in self.program.stringify_reqs.iter().enumerate() {
             let site = RirVerifySite::Type(req.ty);
-            if req.id != RirStringifyReqId::from_index(index) {
+            if req.id.index() != index {
                 self.push(site, RirVerifyErrorKind::BadId);
             }
             self.check_type_id(site, req.ty);
@@ -6604,16 +5590,17 @@ impl VerifyCx<'_> {
                         continue;
                     }
                     let param = &function.params[0];
-                    if param.ty != req.ty || param.semantic != mode {
+                    let Some((ty, param_mode, _)) = function.parameter_data(*param) else {
+                        self.push(site, RirVerifyErrorKind::ParamLocalMissing);
+                        continue;
+                    };
+                    if ty != req.ty || param_mode != mode {
                         self.push(site, RirVerifyErrorKind::UnsupportedRValueType);
                     }
-                    if !matches!(
-                        mode,
-                        RirParamSemantic::Value | RirParamSemantic::SharedBorrow
-                    ) {
+                    if !matches!(mode, RirPassMode::Value | RirPassMode::SharedBorrow) {
                         self.push(site, RirVerifyErrorKind::UnsupportedRValueType);
                     }
-                    if mode == RirParamSemantic::Value && !self.copyable_type(req.ty) {
+                    if mode == RirPassMode::Value && !self.copyable_type(req.ty) {
                         self.push(site, RirVerifyErrorKind::NonCopyValueRequired);
                     }
                 }
@@ -6742,83 +5729,78 @@ impl VerifyCx<'_> {
         }
     }
 
-    fn check_extern(&mut self, id: RirExternId, ext: &RirExtern) {
+    fn check_extern(&mut self, id: RirExternId, ext: &RirExtern, retained_callbacks: bool) {
         self.check_type_id(RirVerifySite::Extern(id), ext.ret);
-        self.check_extern_signature(id, ext);
+        self.check_extern_signature(id, ext, retained_callbacks);
         for param in &ext.params {
             self.check_type_id(RirVerifySite::Extern(id), param.ty);
-            self.check_abi(
-                RirVerifySite::Extern(id),
-                param.ty,
-                param.semantic,
-                param.abi,
-            );
+            self.check_pass_mode(RirVerifySite::Extern(id), param.ty, param.mode);
         }
     }
 
-    fn check_extern_signature(&mut self, id: RirExternId, ext: &RirExtern) {
-        let site = RirVerifySite::Extern(id);
-        let void = self.type_id(RirType::Void);
-        let ok = match &ext.kind {
-            RirExternKind::Native(native) => {
-                native_extern_signature_ok(self.program, native, ext, void)
-            }
-        };
-        if !ok {
-            self.push(site, RirVerifyErrorKind::UnsupportedRValueType);
+    fn check_extern_signature(
+        &mut self,
+        id: RirExternId,
+        ext: &RirExtern,
+        retained_callbacks: bool,
+    ) {
+        if !native_extern_signature_ok(self.program, ext, retained_callbacks) {
+            self.push(
+                RirVerifySite::Extern(id),
+                RirVerifyErrorKind::UnsupportedRValueType,
+            );
         }
     }
 
     fn check_function(&mut self, id: RirFunctionId, function: &RirFunction) {
         self.check_type_id(RirVerifySite::Function(id), function.ret.ty);
+        let mut seen_params = vec![false; function.locals.len()];
         for (index, param) in function.params.iter().enumerate() {
             let site = RirVerifySite::Param(id, index);
-            self.check_local_id(site, function, param.local);
-            self.check_type_id(site, param.ty);
-            self.check_abi(site, param.ty, param.semantic, param.abi);
-            if (param.semantic == RirParamSemantic::DynBorrow
-                || param.abi == RirParamAbi::DynBorrow)
-                && param.escape != RirParamEscape::NonEscaping
-            {
+            self.check_local_id(site, function, *param);
+            let Some(local) = function.locals.get(param.index()) else {
+                self.push(site, RirVerifyErrorKind::ParamLocalMissing);
+                continue;
+            };
+            if std::mem::replace(&mut seen_params[param.index()], true) {
+                self.push(site, RirVerifyErrorKind::BadId);
+            }
+            let RirLocalBinding::Parameter { mode, escape } = local.binding else {
+                self.push(site, RirVerifyErrorKind::ParamLocalNotInitialized);
+                continue;
+            };
+            self.check_type_id(site, local.ty);
+            self.check_pass_mode(site, local.ty, mode);
+            if mode == RirPassMode::DynBorrow && escape != RirParamEscape::NonEscaping {
                 self.push(site, RirVerifyErrorKind::CallArgEscape);
             }
             for storage in [RirCellStorage::StackScoped, RirCellStorage::Heap] {
-                if Self::param_uses_cell_mode(*param, storage)
+                if mode == Self::cell_capture_mode(storage)
                     && !self.function_param_is_cell_capture(id, index, *param, storage)
                 {
                     self.push(site, RirVerifyErrorKind::UnsupportedAbi);
                 }
             }
             if matches!(
-                param.semantic,
-                RirParamSemantic::ScopedLambda
-                    | RirParamSemantic::EscapingLambda
-                    | RirParamSemantic::AnvCallback
-            ) || matches!(
-                param.abi,
-                RirParamAbi::ScopedLambda | RirParamAbi::EscapingLambda | RirParamAbi::AnvCallback
+                mode,
+                RirPassMode::ScopedLambda | RirPassMode::EscapingLambda | RirPassMode::AnvCallback
             ) {
                 self.push(site, RirVerifyErrorKind::UnsupportedAbi);
             }
-            if (matches!(param.semantic, RirParamSemantic::ScopedPlaceCell)
-                || matches!(param.abi, RirParamAbi::ScopedPlaceCell))
+            if mode == RirPassMode::ScopedPlaceCell
                 && !self.function_param_is_scoped_place_cell_capture(id, index, *param)
             {
                 self.push(site, RirVerifyErrorKind::UnsupportedAbi);
             }
-            match function.locals.get(param.local.index()) {
-                Some(local) if local.ty != param.ty => self.push(
-                    site,
-                    RirVerifyErrorKind::TypeMismatch {
-                        expected: param.ty,
-                        found: local.ty,
-                    },
-                ),
-                Some(local) if !local.initialized => {
-                    self.push(site, RirVerifyErrorKind::ParamLocalNotInitialized);
-                }
-                Some(_) => {}
-                None => self.push(site, RirVerifyErrorKind::ParamLocalMissing),
+        }
+        for local in &function.locals {
+            if matches!(local.binding, RirLocalBinding::Parameter { .. })
+                && !seen_params[local.id.index()]
+            {
+                self.push(
+                    RirVerifySite::Local(id, local.id),
+                    RirVerifyErrorKind::ParamLocalMissing,
+                );
             }
         }
         for (index, local) in function.locals.iter().enumerate() {
@@ -6833,7 +5815,7 @@ impl VerifyCx<'_> {
         }
         let previous_initialized = std::mem::take(&mut self.initialized);
         let previous_possible = std::mem::take(&mut self.possibly_initialized);
-        let previous_payload_ref_owned = std::mem::take(&mut self.payload_ref_owned);
+        let previous_payload_bound = std::mem::take(&mut self.payload_bound);
         let previous_lambda_escapes = std::mem::take(&mut self.lambda_escapes);
         let previous_lambda_values = std::mem::take(&mut self.lambda_values);
         let previous_loop_lambda_scopes = std::mem::take(&mut self.loop_lambda_scopes);
@@ -6846,10 +5828,10 @@ impl VerifyCx<'_> {
         self.initialized = function
             .locals
             .iter()
-            .map(|local| local.initialized)
+            .map(|local| matches!(local.binding, RirLocalBinding::Parameter { .. }))
             .collect();
         self.possibly_initialized.clone_from(&self.initialized);
-        self.payload_ref_owned = vec![false; function.locals.len()];
+        self.payload_bound = vec![false; function.locals.len()];
         self.lambda_escapes = vec![None; function.locals.len()];
         self.lambda_values = function
             .locals
@@ -6860,7 +5842,7 @@ impl VerifyCx<'_> {
         self.local_decl_scopes = function
             .locals
             .iter()
-            .map(|local| local.initialized.then_some(0))
+            .map(|local| matches!(local.binding, RirLocalBinding::Parameter { .. }).then_some(0))
             .collect();
         self.initialized_cells = vec![false; self.program.cells.len()];
         self.possibly_initialized_cells = vec![false; self.program.cells.len()];
@@ -6886,41 +5868,36 @@ impl VerifyCx<'_> {
                 }
             }
         }
-        for param in &function.params {
-            if let Some(initialized) = self.initialized.get_mut(param.local.index()) {
-                *initialized = true;
-            }
-            if let Some(possible) = self.possibly_initialized.get_mut(param.local.index()) {
-                *possible = true;
-            }
-            let value = if matches!(self.ty(param.ty), Some(RirType::Lambda(_))) {
-                let escape = Some(RirLambdaEscape::from_param_escape(param.escape));
-                if let Some(slot) = self.lambda_escapes.get_mut(param.local.index()) {
-                    *slot = escape;
-                }
+        for local in &function.locals {
+            let Some((_, escape)) = local.binding.parameter() else {
+                continue;
+            };
+            let value = if matches!(self.ty(local.ty), Some(RirType::Lambda(_))) {
+                let escape = Some(RirLambdaEscape::from_param_escape(escape));
+                self.lambda_escapes[local.id.index()] = escape;
                 RirFunctionValueState::Lambda(escape)
             } else {
-                self.source_call_return_state(param.ty)
+                self.source_call_return_state(local.ty)
             };
-            if let Some(slot) = self.lambda_values.get_mut(param.local.index()) {
-                *slot = value;
-            }
+            self.lambda_values[local.id.index()] = value;
         }
         for (stmt_index, stmt) in function.body.stmts.iter().enumerate() {
             self.check_stmt(id, function, stmt_index, stmt);
         }
         self.check_term(id, function, &function.body.term);
         for local in &function.locals {
-            if local.payload_ref
-                && !self
-                    .payload_ref_owned
-                    .get(local.id.index())
-                    .copied()
-                    .unwrap_or(false)
+            if matches!(
+                local.binding,
+                RirLocalBinding::DirectPayload | RirLocalBinding::ScopedPlacePayload
+            ) && !self
+                .payload_bound
+                .get(local.id.index())
+                .copied()
+                .unwrap_or(false)
             {
                 self.push(
                     RirVerifySite::Local(id, local.id),
-                    RirVerifyErrorKind::OptionPayloadRefWithoutOwner,
+                    RirVerifyErrorKind::PayloadBindingWithoutProducer,
                 );
             }
         }
@@ -6934,7 +5911,7 @@ impl VerifyCx<'_> {
         }
         self.initialized = previous_initialized;
         self.possibly_initialized = previous_possible;
-        self.payload_ref_owned = previous_payload_ref_owned;
+        self.payload_bound = previous_payload_bound;
         self.lambda_escapes = previous_lambda_escapes;
         self.lambda_values = previous_lambda_values;
         self.loop_lambda_scopes = previous_loop_lambda_scopes;
@@ -6974,7 +5951,7 @@ impl VerifyCx<'_> {
                     source,
                     MutPlaceUse::CallArg,
                 );
-                if ty != carrier.storage_ty {
+                if ty != Some(carrier.storage_ty) {
                     self.push(site, RirVerifyErrorKind::InvalidDynStorage);
                 }
                 (true, false)
@@ -6991,41 +5968,96 @@ impl VerifyCx<'_> {
                 (aliases, true)
             }
         };
+        let expected_mappings = std::iter::once(carrier.id)
+            .chain(
+                self.program
+                    .dyn_weakenings
+                    .iter()
+                    .filter(|weakening| weakening.target == carrier.id)
+                    .map(|weakening| weakening.source),
+            )
+            .collect::<std::collections::BTreeSet<_>>();
+        let mappings_valid = match_.mappings.first().is_some_and(|mapping| {
+            mapping.carrier == carrier.id
+                && match_.mappings.len() == expected_mappings.len()
+                && match_.mappings.iter().all(|mapping| {
+                    mapping.variants.len() == match_.arms.len()
+                        && self
+                            .program
+                            .dyn_carriers
+                            .get(mapping.carrier.index())
+                            .is_some_and(|mapped| {
+                                mapping.targets.len() == mapped.variants.len()
+                                    && mapping.targets.iter().enumerate().all(|(index, target)| {
+                                        let variant = RirDynVariantId::new(mapped.id, index);
+                                        let expected = mapping.variants.iter().position(|set| {
+                                            self.program
+                                                .dyn_variant_sets
+                                                .get(set.index())
+                                                .is_some_and(|set| set.variants.contains(&variant))
+                                        });
+                                        *target == expected
+                                    })
+                            })
+                })
+                && match_
+                    .mappings
+                    .iter()
+                    .map(|mapping| mapping.carrier)
+                    .collect::<std::collections::BTreeSet<_>>()
+                    == expected_mappings
+        });
+        if !mappings_valid {
+            self.push(site, RirVerifyErrorKind::InvalidDynVariant);
+        }
+        let direct_mapping = match_.mappings.first();
         let entry = self.block_entry_state();
         let mut states = vec![];
         let mut seen = vec![];
-        for arm in &match_.arms {
-            self.check_type_id(site, arm.target);
-            let expected = carrier
-                .variants
-                .iter()
-                .filter(|variant| variant.concrete_ty == arm.target)
-                .map(|variant| variant.id)
-                .collect::<Vec<_>>();
-            if arm.variants != expected || arm.variants.iter().any(|variant| seen.contains(variant))
+        for (arm_index, arm) in match_.arms.iter().enumerate() {
+            let Some(set) = direct_mapping
+                .and_then(|mapping| mapping.variants.get(arm_index))
+                .and_then(|id| self.program.dyn_variant_sets.get(id.index()))
+            else {
+                self.push(site, RirVerifyErrorKind::InvalidDynVariant);
+                continue;
+            };
+            let target = set.target;
+            self.check_type_id(site, target);
+            if set.carrier != carrier.id
+                || set.variants.iter().any(|variant| seen.contains(variant))
+                || match_.mappings.iter().any(|mapping| {
+                    mapping
+                        .variants
+                        .get(arm_index)
+                        .and_then(|id| self.program.dyn_variant_sets.get(id.index()))
+                        .is_none_or(|mapped| {
+                            mapped.carrier != mapping.carrier || mapped.target != target
+                        })
+                })
             {
                 self.push(site, RirVerifyErrorKind::InvalidDynVariant);
             }
-            seen.extend(&arm.variants);
+            seen.extend(&set.variants);
             let binding = match arm.binding {
                 RirDynMatchBinding::Discard => None,
                 RirDynMatchBinding::Take(local) if !mutable && !borrowed => {
-                    self.check_dyn_match_local(site, function, local, arm.target, false, false);
+                    self.check_dyn_match_local(site, function, local, target, false, false);
                     Some(local)
                 }
                 RirDynMatchBinding::Materialize {
                     local,
                     materializer,
                 } if !mutable && borrowed => {
-                    self.check_dyn_match_local(site, function, local, arm.target, false, false);
-                    if !self.canonical_value_materializer(arm.target, materializer) {
+                    self.check_dyn_match_local(site, function, local, target, false, false);
+                    if !self.canonical_value_materializer(target, materializer) {
                         self.push(site, RirVerifyErrorKind::BadId);
                     }
                     Some(local)
                 }
                 RirDynMatchBinding::Alias(local) if mutable => {
-                    self.check_dyn_match_local(site, function, local, arm.target, true, false);
-                    if let Some(slot) = self.payload_ref_owned.get_mut(local.index()) {
+                    self.check_dyn_match_local(site, function, local, target, true, false);
+                    if let Some(slot) = self.payload_bound.get_mut(local.index()) {
                         *slot = true;
                     }
                     Some(local)
@@ -7033,14 +6065,14 @@ impl VerifyCx<'_> {
                 RirDynMatchBinding::Take(local)
                 | RirDynMatchBinding::Materialize { local, .. }
                 | RirDynMatchBinding::Alias(local) => {
-                    self.push(site, RirVerifyErrorKind::InvalidDynOrigin);
+                    self.push(site, RirVerifyErrorKind::InvalidDynPlan);
                     Some(local)
                 }
             };
             let mut arm_entry = entry.clone();
             Self::init_entry_locals(&mut arm_entry, binding);
             if let Some(binding) = binding {
-                let value = self.source_call_return_state(arm.target);
+                let value = self.source_call_return_state(target);
                 arm_entry.lambda_escapes[binding.index()] = value.escape();
                 arm_entry.lambda_values[binding.index()] = value;
             }
@@ -7064,14 +6096,14 @@ impl VerifyCx<'_> {
             }
             RirDynMatchFallbackBinding::Alias(local) if mutable && !borrowed => {
                 self.check_dyn_match_local(site, function, local, carrier.storage_ty, true, false);
-                if let Some(slot) = self.payload_ref_owned.get_mut(local.index()) {
+                if let Some(slot) = self.payload_bound.get_mut(local.index()) {
                     *slot = true;
                 }
             }
             RirDynMatchFallbackBinding::Take(local)
             | RirDynMatchFallbackBinding::Preserve(local)
             | RirDynMatchFallbackBinding::Alias(local) => {
-                self.push(site, RirVerifyErrorKind::InvalidDynOrigin);
+                self.push(site, RirVerifyErrorKind::InvalidDynPlan);
                 self.check_dyn_match_local(site, function, local, carrier.storage_ty, false, false);
             }
         }
@@ -7105,15 +6137,16 @@ impl VerifyCx<'_> {
         function: &RirFunction,
         local: RirLocalId,
         ty: RirTypeId,
-        payload_ref: bool,
+        borrows_payload: bool,
         invalid_mode: bool,
     ) {
         self.check_local_id(site, function, local);
         if invalid_mode
             || !function.locals.get(local.index()).is_some_and(|local| {
                 local.ty == ty
-                    && local.payload_ref == payload_ref
-                    && (!payload_ref || local.mutable)
+                    && matches!(local.binding, RirLocalBinding::ScopedPlacePayload)
+                        == borrows_payload
+                    && (!borrows_payload || local.mutable)
             })
         {
             self.push(site, RirVerifyErrorKind::OptionPayloadRefLocalMismatch);
@@ -7141,7 +6174,9 @@ impl VerifyCx<'_> {
                 self.push(site, RirVerifyErrorKind::ImmutableAssign);
             }
         }
-        let subject_ty = match_.subject.ty;
+        let Some(subject_ty) = self.program.place_ty(function, &match_.subject) else {
+            return;
+        };
         let subject_value = self.place_function_value_state(function, &match_.subject);
         let entry = self.block_entry_state();
         let mut states = vec![];
@@ -7207,12 +6242,17 @@ impl VerifyCx<'_> {
         let mut value = subject.clone();
         for step in &path.steps {
             value = match step {
-                RirPatternPathStep::Field(field) => value.project(RirProjection::Field(*field)),
-                RirPatternPathStep::TupleField(field) => value.project(RirProjection::TupleField(
-                    RirFieldId::from_index(*field as usize),
-                )),
-                RirPatternPathStep::OptionalSome => {
-                    value.project(RirProjection::TupleField(RirFieldId::from_index(0)))
+                RirPatternPathStep::Place(step) => match step.kind {
+                    RirPlaceStepKind::StructField(field)
+                    | RirPlaceStepKind::DataRefField(field)
+                    | RirPlaceStepKind::ExternField(field)
+                    | RirPlaceStepKind::TupleField(field) => value.project_field(field),
+                    RirPlaceStepKind::ArrayIndex { .. }
+                    | RirPlaceStepKind::ListIndex { .. }
+                    | RirPlaceStepKind::SliceIndex { .. } => RirFunctionValueState::Unknown,
+                },
+                RirPatternPathStep::OptionalSome { .. } => {
+                    value.project_field(RirFieldId::from_index(0))
                 }
                 RirPatternPathStep::EnumTupleField { variant, field, .. }
                 | RirPatternPathStep::EnumStructField { variant, field, .. } => {
@@ -7312,7 +6352,11 @@ impl VerifyCx<'_> {
                 path.steps.iter().all(|step| {
                     matches!(
                         step,
-                        RirPatternPathStep::Field(_) | RirPatternPathStep::TupleField(_)
+                        RirPatternPathStep::Place(RirPlaceStep {
+                            kind: RirPlaceStepKind::StructField(_)
+                                | RirPlaceStepKind::TupleField(_),
+                            ..
+                        })
                     )
                 })
             }
@@ -7432,15 +6476,17 @@ impl VerifyCx<'_> {
         entry: &RirBlockEntryState,
     ) {
         self.check_local_id(site, function, binding.local);
-        if function
-            .params
-            .iter()
-            .any(|param| param.local == binding.local)
-            || entry
-                .possible
+        if matches!(
+            function
+                .locals
                 .get(binding.local.index())
-                .copied()
-                .unwrap_or(false)
+                .map(|local| local.binding),
+            Some(RirLocalBinding::Parameter { .. })
+        ) || entry
+            .possible
+            .get(binding.local.index())
+            .copied()
+            .unwrap_or(false)
         {
             self.push(site, RirVerifyErrorKind::InitParamLocal);
         }
@@ -7469,11 +6515,14 @@ impl VerifyCx<'_> {
                 );
             }
             match binding.mode {
-                RirPatternBindingMode::Alias if !local.mutable || !local.payload_ref => {
+                RirPatternBindingMode::Alias
+                    if !local.mutable
+                        || !matches!(local.binding, RirLocalBinding::DirectPayload) =>
+                {
                     self.push(site, RirVerifyErrorKind::OptionPayloadRefLocalMismatch);
                 }
                 RirPatternBindingMode::Owned { .. } => {
-                    if local.payload_ref {
+                    if !matches!(local.binding, RirLocalBinding::Value) {
                         self.push(site, RirVerifyErrorKind::OptionPayloadRefLocalMismatch);
                     }
                 }
@@ -7489,7 +6538,7 @@ impl VerifyCx<'_> {
             if !Self::pattern_alias_path_supported(&binding.path) {
                 self.push(site, RirVerifyErrorKind::UnsupportedRValueType);
             }
-            if let Some(slot) = self.payload_ref_owned.get_mut(binding.local.index()) {
+            if let Some(slot) = self.payload_bound.get_mut(binding.local.index()) {
                 *slot = true;
             }
         }
@@ -7540,75 +6589,91 @@ impl VerifyCx<'_> {
         prefix: &[RirPatternPathStep],
         step: &RirPatternPathStep,
     ) -> Option<RirTypeId> {
-        match *step {
-            RirPatternPathStep::Field(field) => match self.ty(source_ty) {
-                Some(RirType::Struct(strukt)) => self
-                    .program
-                    .structs
-                    .get(strukt.index())
-                    .and_then(|strukt| strukt.fields.get(field.index()))
-                    .map(|field| field.ty),
-                _ => None,
-            },
-            RirPatternPathStep::TupleField(field) => match self.ty(source_ty) {
-                Some(RirType::Tuple(tuple)) => self
-                    .program
-                    .tuples
-                    .get(tuple.index())
-                    .and_then(|tuple| tuple.fields.get(field as usize))
-                    .map(|field| field.ty),
-                _ => None,
-            },
-            RirPatternPathStep::OptionalSome => {
-                if !optional_guards.iter().any(|guard| guard == prefix) {
-                    self.push(site, RirVerifyErrorKind::PatternPayloadWithoutVariantTest);
-                    return None;
-                }
-                match self.ty(source_ty) {
-                    Some(RirType::Option(inner)) => Some(inner),
+        let target = match step {
+            RirPatternPathStep::Place(step) if step.source_ty == source_ty => {
+                match (self.ty(source_ty), step.kind) {
+                    (
+                        Some(RirType::Struct(strukt)),
+                        RirPlaceStepKind::StructField(field) | RirPlaceStepKind::ExternField(field),
+                    ) => self
+                        .program
+                        .structs
+                        .get(strukt.index())
+                        .and_then(|strukt| strukt.fields.get(field.index()))
+                        .map(|field| field.ty),
+                    (Some(RirType::DataRef(dataref)), RirPlaceStepKind::DataRefField(field)) => {
+                        self.program
+                            .datarefs
+                            .get(dataref.index())
+                            .and_then(|dataref| dataref.fields.get(field.index()))
+                            .map(|field| field.ty)
+                    }
+                    (Some(RirType::Tuple(tuple)), RirPlaceStepKind::TupleField(field)) => self
+                        .program
+                        .tuples
+                        .get(tuple.index())
+                        .and_then(|tuple| tuple.fields.get(field.index()))
+                        .map(|field| field.ty),
                     _ => None,
+                }
+                .filter(|target| *target == step.target_ty)
+            }
+            RirPatternPathStep::Place(_) => None,
+            RirPatternPathStep::OptionalSome {
+                source_ty: expected_source,
+                target_ty,
+            } => {
+                if *expected_source != source_ty
+                    || !optional_guards.iter().any(|guard| guard == prefix)
+                {
+                    if !optional_guards.iter().any(|guard| guard == prefix) {
+                        self.push(site, RirVerifyErrorKind::PatternPayloadWithoutVariantTest);
+                    }
+                    None
+                } else {
+                    match self.ty(source_ty) {
+                        Some(RirType::Option(inner)) if inner == *target_ty => Some(inner),
+                        _ => None,
+                    }
                 }
             }
             RirPatternPathStep::EnumTupleField {
+                source_ty: expected_source,
+                target_ty,
+                enum_id,
+                variant,
+                field,
+            }
+            | RirPatternPathStep::EnumStructField {
+                source_ty: expected_source,
+                target_ty,
                 enum_id,
                 variant,
                 field,
             } => {
-                if !guards.iter().any(|(path, guard_enum, guard_variant)| {
-                    path == prefix && *guard_enum == enum_id && *guard_variant == variant
-                }) {
-                    self.push(site, RirVerifyErrorKind::PatternPayloadWithoutVariantTest);
-                    return None;
+                if *expected_source != source_ty
+                    || !guards.iter().any(|(path, guard_enum, guard_variant)| {
+                        path == prefix && *guard_enum == *enum_id && *guard_variant == *variant
+                    })
+                {
+                    if !guards.iter().any(|(path, guard_enum, guard_variant)| {
+                        path == prefix && *guard_enum == *enum_id && *guard_variant == *variant
+                    }) {
+                        self.push(site, RirVerifyErrorKind::PatternPayloadWithoutVariantTest);
+                    }
+                    None
+                } else {
+                    let kind = match step {
+                        RirPatternPathStep::EnumTupleField { .. } => RirVariantKind::Tuple,
+                        RirPatternPathStep::EnumStructField { .. } => RirVariantKind::Struct,
+                        _ => unreachable!(),
+                    };
+                    self.enum_payload_field_ty(source_ty, *enum_id, *variant, kind, *field)
+                        .filter(|found| *found == *target_ty)
                 }
-                self.enum_payload_field_ty(
-                    source_ty,
-                    enum_id,
-                    variant,
-                    RirVariantKind::Tuple,
-                    field,
-                )
             }
-            RirPatternPathStep::EnumStructField {
-                enum_id,
-                variant,
-                field,
-            } => {
-                if !guards.iter().any(|(path, guard_enum, guard_variant)| {
-                    path == prefix && *guard_enum == enum_id && *guard_variant == variant
-                }) {
-                    self.push(site, RirVerifyErrorKind::PatternPayloadWithoutVariantTest);
-                    return None;
-                }
-                self.enum_payload_field_ty(
-                    source_ty,
-                    enum_id,
-                    variant,
-                    RirVariantKind::Struct,
-                    field,
-                )
-            }
-        }
-        .or_else(|| {
+        };
+        target.or_else(|| {
             self.push(site, RirVerifyErrorKind::BadId);
             None
         })
@@ -7673,23 +6738,27 @@ impl VerifyCx<'_> {
         match stmt {
             RirStmt::Init { local, value } => {
                 self.check_local_id(site, function, *local);
-                if function.params.iter().any(|param| param.local == *local) {
-                    self.push(site, RirVerifyErrorKind::InitParamLocal);
-                }
-                if function
+                match function
                     .locals
                     .get(local.index())
-                    .is_some_and(|local| local.payload_ref)
+                    .map(|local| local.binding)
                 {
-                    self.push(site, RirVerifyErrorKind::InitPayloadRefLocal);
-                }
-                if self
-                    .possibly_initialized
-                    .get(local.index())
-                    .copied()
-                    .unwrap_or(false)
-                {
-                    self.push(site, RirVerifyErrorKind::InitParamLocal);
+                    Some(RirLocalBinding::Parameter { .. }) => {
+                        self.push(site, RirVerifyErrorKind::InitParamLocal);
+                    }
+                    Some(RirLocalBinding::DirectPayload | RirLocalBinding::ScopedPlacePayload) => {
+                        self.push(site, RirVerifyErrorKind::InitPayloadRefLocal);
+                    }
+                    Some(RirLocalBinding::Value)
+                        if self
+                            .possibly_initialized
+                            .get(local.index())
+                            .copied()
+                            .unwrap_or(false) =>
+                    {
+                        self.push(site, RirVerifyErrorKind::InitParamLocal);
+                    }
+                    Some(RirLocalBinding::Value) | None => {}
                 }
                 if let Some(expected) = function.locals.get(local.index()).map(|local| local.ty) {
                     self.check_rvalue(function_id, function, index, value, Some(expected));
@@ -7778,7 +6847,7 @@ impl VerifyCx<'_> {
                     place,
                     MutPlaceUse::Write,
                 );
-                self.check_rvalue(function_id, function, index, value, Some(ty));
+                self.check_rvalue(function_id, function, index, value, ty);
                 self.check_stack_loop_lambda_rvalue(site, function, value);
                 let value_state = self.rvalue_function_value_state(function, value);
                 self.set_mut_place_function_value(function, place, value_state);
@@ -7786,7 +6855,13 @@ impl VerifyCx<'_> {
             RirStmt::Assign { dst, value } => {
                 self.check_place(site, function, dst);
                 let Some(dst_local) = self.local_root(site, dst) else {
-                    self.check_rvalue(function_id, function, index, value, Some(dst.ty));
+                    self.check_rvalue(
+                        function_id,
+                        function,
+                        index,
+                        value,
+                        self.program.place_ty(function, dst),
+                    );
                     self.check_stack_loop_lambda_rvalue(site, function, value);
                     return;
                 };
@@ -7794,12 +6869,16 @@ impl VerifyCx<'_> {
                 if self.assignment_replaces_active_collection_root(dst) {
                     self.push(site, RirVerifyErrorKind::UnsupportedRValueType);
                 }
-                if let Some(local) = function.locals.get(dst_local.index())
-                    && !self.projected_mut_place_arg_supported(local.ty, &dst.projections, true)
-                {
+                if !Self::assignment_projection_supported(&dst.projections) {
                     self.push(site, RirVerifyErrorKind::UnsupportedRValueType);
                 }
-                self.check_rvalue(function_id, function, index, value, Some(dst.ty));
+                self.check_rvalue(
+                    function_id,
+                    function,
+                    index,
+                    value,
+                    self.program.place_ty(function, dst),
+                );
                 self.check_hidden_stack_loop_lambda_rvalue(site, function, value);
                 let value_state = self.rvalue_function_value_state(function, value);
                 let loop_scope = self.rvalue_loop_lambda_scope(function, value);
@@ -7876,44 +6955,36 @@ impl VerifyCx<'_> {
             }
             RirStmt::DataRefSet {
                 object,
-                dataref,
-                projections,
+                place,
+                suffix,
                 value,
-                ty,
             } => {
-                self.check_type_id(site, *ty);
                 if let Some(expected) = self.check_dataref_access(
                     site,
                     function,
                     object,
-                    *dataref,
-                    projections,
+                    *place,
+                    suffix,
                     StorageProjectionMode::Ordinary,
                 ) {
-                    if *ty != expected {
-                        self.push(
-                            site,
-                            RirVerifyErrorKind::TypeMismatch {
-                                expected,
-                                found: *ty,
-                            },
-                        );
-                    }
                     self.check_rvalue(function_id, function, index, value, Some(expected));
                     self.check_stack_loop_lambda_rvalue(site, function, value);
                 }
             }
             RirStmt::SequenceSlotSet {
                 collection,
-                index,
+                step,
                 value,
             } => {
+                if let Some(collection_ty) = self.program.collection_ty(function, collection) {
+                    self.check_place_step(site, function, collection_ty, step, true);
+                }
                 let value_ty = self.check_sequence_slot(
                     site,
                     function_id,
                     function,
                     collection,
-                    *index,
+                    step.index_local().expect("sequence slot step"),
                     None,
                     true,
                 );
@@ -8064,7 +7135,7 @@ impl VerifyCx<'_> {
                     &match_.map,
                     MutPlaceUse::IndexedMapAssignment,
                 );
-                let (key_ty, value_ty) = match self.ty(map_ty) {
+                let (key_ty, value_ty) = match map_ty.and_then(|ty| self.ty(ty)) {
                     Some(RirType::Map { key, value }) => (Some(key), Some(value)),
                     _ => {
                         self.push(site, RirVerifyErrorKind::UnsupportedRValueType);
@@ -8073,7 +7144,7 @@ impl VerifyCx<'_> {
                 };
                 if let Some(key_ty) = key_ty {
                     self.check_value_operand_ty(site, function, &match_.key, key_ty);
-                } else {
+                } else if let Some(map_ty) = map_ty {
                     self.check_value_operand_ty(site, function, &match_.key, map_ty);
                 }
                 let entry = self.block_entry_state();
@@ -8083,19 +7154,22 @@ impl VerifyCx<'_> {
                 }
                 if let Some(payload) = match_.payload {
                     if let Some(local) = function.locals.get(payload.index()) {
-                        if function.params.iter().any(|param| param.local == payload)
-                            || entry
-                                .possible
-                                .get(payload.index())
-                                .copied()
-                                .unwrap_or(false)
+                        if function.locals.get(payload.index()).is_some_and(|local| {
+                            matches!(local.binding, RirLocalBinding::Parameter { .. })
+                        }) || entry
+                            .possible
+                            .get(payload.index())
+                            .copied()
+                            .unwrap_or(false)
                         {
                             self.push(site, RirVerifyErrorKind::InitParamLocal);
                         }
-                        if !local.mutable || !local.payload_ref {
+                        if !local.mutable
+                            || !matches!(local.binding, RirLocalBinding::ScopedPlacePayload)
+                        {
                             self.push(site, RirVerifyErrorKind::OptionPayloadRefLocalMismatch);
                         }
-                        if let Some(slot) = self.payload_ref_owned.get_mut(payload.index()) {
+                        if let Some(slot) = self.payload_bound.get_mut(payload.index()) {
                             *slot = true;
                         }
                         if let Some(value_ty) = value_ty
@@ -8163,13 +7237,13 @@ impl VerifyCx<'_> {
                 self.merge_structured_states([some_state, none_state]);
             }
             RirStmt::OptionMatch(match_) => {
-                let payload_ref = match_.payload.is_some_and(RirOptionPayloadBinding::is_ref);
+                let borrows_payload = match_.payload.is_some_and(RirOptionPayloadBinding::is_ref);
                 let payload_escapes = match_.payload.is_some_and(RirOptionPayloadBinding::escapes);
                 let payload_local = match_.payload.map(RirOptionPayloadBinding::local);
                 let subject_ty = match &match_.subject {
                     RirOptionSubject::Place(place) => {
                         self.check_place(site, function, place);
-                        place.ty
+                        self.program.place_ty(function, place)
                     }
                     RirOptionSubject::MutPlace(place) => {
                         let ty = self.check_mut_place_arg(
@@ -8179,7 +7253,7 @@ impl VerifyCx<'_> {
                             place,
                             MutPlaceUse::CallArg,
                         );
-                        if !payload_ref {
+                        if !borrows_payload {
                             self.push(site, RirVerifyErrorKind::UnsupportedRValueType);
                         }
                         ty
@@ -8189,7 +7263,7 @@ impl VerifyCx<'_> {
                     RirOptionSubject::Place(place) => self.local_root(site, place),
                     RirOptionSubject::MutPlace(_) => None,
                 };
-                let inner = match self.ty(subject_ty) {
+                let inner = match subject_ty.and_then(|ty| self.ty(ty)) {
                     Some(RirType::Option(inner)) => Some(inner),
                     _ => {
                         self.push(site, RirVerifyErrorKind::UnsupportedRValueType);
@@ -8206,7 +7280,9 @@ impl VerifyCx<'_> {
                 let mut some_entry = entry.clone();
                 if let Some(payload) = payload_local {
                     if let Some(local) = function.locals.get(payload.index()) {
-                        if function.params.iter().any(|param| param.local == payload) {
+                        if function.locals.get(payload.index()).is_some_and(|local| {
+                            matches!(local.binding, RirLocalBinding::Parameter { .. })
+                        }) {
                             self.push(site, RirVerifyErrorKind::InitParamLocal);
                         }
                         if entry
@@ -8217,14 +7293,23 @@ impl VerifyCx<'_> {
                         {
                             self.push(site, RirVerifyErrorKind::InitParamLocal);
                         }
-                        if local.mutable != payload_ref {
+                        if local.mutable != borrows_payload {
                             self.push(site, RirVerifyErrorKind::ImmutableAssign);
                         }
-                        if local.payload_ref != payload_ref {
+                        let expected_binding = match match_.subject {
+                            RirOptionSubject::Place(_) if borrows_payload => {
+                                RirLocalBinding::DirectPayload
+                            }
+                            RirOptionSubject::MutPlace(_) if borrows_payload => {
+                                RirLocalBinding::ScopedPlacePayload
+                            }
+                            _ => RirLocalBinding::Value,
+                        };
+                        if local.binding != expected_binding {
                             self.push(site, RirVerifyErrorKind::OptionPayloadRefLocalMismatch);
                         }
-                        if payload_ref
-                            && let Some(slot) = self.payload_ref_owned.get_mut(payload.index())
+                        if borrows_payload
+                            && let Some(slot) = self.payload_bound.get_mut(payload.index())
                         {
                             *slot = true;
                         }
@@ -8263,7 +7348,7 @@ impl VerifyCx<'_> {
                         self.push(site, RirVerifyErrorKind::BadId);
                     }
                 }
-                if payload_ref
+                if borrows_payload
                     && discr_local.is_some_and(|local| Self::local_root_immutable(function, local))
                 {
                     self.push(
@@ -8279,7 +7364,7 @@ impl VerifyCx<'_> {
                     some_entry,
                     escaping_payload,
                 );
-                if payload_ref
+                if borrows_payload
                     && !payload_escapes
                     && let (Some(payload), Some(state)) = (payload_local, &mut some_state)
                 {
@@ -8374,26 +7459,26 @@ impl VerifyCx<'_> {
     ) {
         match &place.access {
             RirMutPlaceAccess::Handle(
-                RirMutPlaceHandle::Local { local, .. } | RirMutPlaceHandle::Param { local, .. },
+                RirMutPlaceHandle::Local { local } | RirMutPlaceHandle::Param { local },
             ) if place.projections.is_empty() => {
                 self.set_local_lambda_escape(function, *local, value.escape());
                 self.set_local_lambda_value(*local, value);
             }
             RirMutPlaceAccess::Handle(
-                RirMutPlaceHandle::Local { local, .. } | RirMutPlaceHandle::Param { local, .. },
+                RirMutPlaceHandle::Local { local } | RirMutPlaceHandle::Param { local },
             ) if local.index() < self.lambda_values.len() => {
                 if !self.lambda_values[local.index()].assign_projection(&place.projections, value) {
                     self.clear_local_lambda_value(*local);
                 }
             }
-            RirMutPlaceAccess::Handle(RirMutPlaceHandle::Global { global, .. })
+            RirMutPlaceAccess::Handle(RirMutPlaceHandle::Global { global })
                 if place.projections.is_empty() =>
             {
                 if let Some(slot) = self.global_values.get_mut(global.index()) {
                     *slot = value;
                 }
             }
-            RirMutPlaceAccess::Handle(RirMutPlaceHandle::Global { global, .. })
+            RirMutPlaceAccess::Handle(RirMutPlaceHandle::Global { global })
                 if global.index() < self.global_values.len() =>
             {
                 if !self.global_values[global.index()].assign_projection(&place.projections, value)
@@ -8436,13 +7521,13 @@ impl VerifyCx<'_> {
     ) {
         match &place.access {
             RirMutPlaceAccess::Handle(
-                RirMutPlaceHandle::Local { local, .. } | RirMutPlaceHandle::Param { local, .. },
+                RirMutPlaceHandle::Local { local } | RirMutPlaceHandle::Param { local },
             ) if local.index() < self.lambda_values.len() => {
                 if !self.lambda_values[local.index()].push_projection(&place.projections, value) {
                     self.clear_local_lambda_value(*local);
                 }
             }
-            RirMutPlaceAccess::Handle(RirMutPlaceHandle::Global { global, .. })
+            RirMutPlaceAccess::Handle(RirMutPlaceHandle::Global { global })
                 if global.index() < self.global_values.len() =>
             {
                 if !self.global_values[global.index()].push_projection(&place.projections, value) {
@@ -8658,12 +7743,13 @@ impl VerifyCx<'_> {
         let RirPlaceRoot::Local(local) = place.root else {
             return None;
         };
+        let ty = self.program.place_ty(function, place);
         if !place.projections.is_empty()
-            || !matches!(self.ty(place.ty), Some(RirType::Lambda(_)))
+            || !matches!(ty.and_then(|ty| self.ty(ty)), Some(RirType::Lambda(_)))
             || function
                 .locals
                 .get(local.index())
-                .is_none_or(|local_decl| local_decl.ty != place.ty)
+                .is_none_or(|local_decl| Some(local_decl.ty) != ty)
         {
             return None;
         }
@@ -8863,8 +7949,7 @@ impl VerifyCx<'_> {
         &mut self,
         place: &RirMutPlaceArg,
     ) -> Option<RirLambdaEscape> {
-        let RirMutPlaceAccess::Handle(RirMutPlaceHandle::Global { global, .. }) = place.access
-        else {
+        let RirMutPlaceAccess::Handle(RirMutPlaceHandle::Global { global }) = place.access else {
             return None;
         };
         self.global_initializer_projection_escape(global, &place.projections)
@@ -8873,7 +7958,7 @@ impl VerifyCx<'_> {
     fn global_initializer_projection_escape(
         &mut self,
         global: RirGlobalId,
-        projections: &[RirProjection],
+        projections: &[RirPlaceStep],
     ) -> Option<RirLambdaEscape> {
         if self
             .global_initialized
@@ -8916,8 +8001,8 @@ impl VerifyCx<'_> {
                 }
                 _ => RirFunctionValueState::Unknown,
             },
-            RirRValue::SequenceSlotAt { ty, .. }
-            | RirRValue::MapEntryAt { ty, .. }
+            RirRValue::SequenceSlotAt { step, .. } => self.source_call_return_state(step.target_ty),
+            RirRValue::MapEntryAt { ty, .. }
             | RirRValue::MapKeyAt { ty, .. }
             | RirRValue::MapValueAt { ty, .. } => self.source_call_return_state(*ty),
             RirRValue::Struct { fields, .. }
@@ -8993,7 +8078,7 @@ impl VerifyCx<'_> {
     ) -> RirFunctionValueState {
         match &owned.value {
             RirOwnedOperand::Value(value) => self.operand_function_value_state(function, value),
-            RirOwnedOperand::Access(place) => self.mut_place_function_value_state(place),
+            RirOwnedOperand::Access(place) => self.mut_place_function_value_state(function, place),
             RirOwnedOperand::DynBorrow(borrow) => self
                 .program
                 .dyn_carriers
@@ -9004,22 +8089,38 @@ impl VerifyCx<'_> {
         }
     }
 
-    fn mut_place_function_value_state(&self, place: &RirMutPlaceArg) -> RirFunctionValueState {
+    fn mut_place_function_value_state(
+        &self,
+        function: &RirFunction,
+        place: &RirMutPlaceArg,
+    ) -> RirFunctionValueState {
         let mut value = match &place.access {
             RirMutPlaceAccess::Handle(
-                RirMutPlaceHandle::Local { local, .. } | RirMutPlaceHandle::Param { local, .. },
+                RirMutPlaceHandle::Local { local } | RirMutPlaceHandle::Param { local },
             ) => self
                 .lambda_values
                 .get(local.index())
                 .cloned()
                 .unwrap_or(RirFunctionValueState::Unknown),
-            RirMutPlaceAccess::Handle(RirMutPlaceHandle::Global { global, .. }) => self
+            RirMutPlaceAccess::Handle(RirMutPlaceHandle::Global { global }) => self
                 .global_values
                 .get(global.index())
                 .cloned()
                 .unwrap_or(RirFunctionValueState::Unknown),
-            RirMutPlaceAccess::Handle(handle) => self.source_call_return_state(handle.ty()),
-            RirMutPlaceAccess::DataRef { .. } => return self.source_call_return_state(place.ty),
+            RirMutPlaceAccess::Handle(_) => self
+                .program
+                .mut_place_root_ty(function, &place.access)
+                .map_or(RirFunctionValueState::Unknown, |ty| {
+                    self.source_call_return_state(ty)
+                }),
+            RirMutPlaceAccess::DataRef { .. } => {
+                return self
+                    .program
+                    .mut_place_ty(function, place)
+                    .map_or(RirFunctionValueState::Unknown, |ty| {
+                        self.source_call_return_state(ty)
+                    });
+            }
         };
         for projection in &place.projections {
             value = value.project(*projection);
@@ -9153,12 +8254,13 @@ impl VerifyCx<'_> {
         let RirPlaceRoot::Local(local) = place.root else {
             return None;
         };
+        let ty = self.program.place_ty(function, place);
         if !place.projections.is_empty()
-            || !matches!(self.ty(place.ty), Some(RirType::Lambda(_)))
+            || !matches!(ty.and_then(|ty| self.ty(ty)), Some(RirType::Lambda(_)))
             || function
                 .locals
                 .get(local.index())
-                .is_none_or(|local| local.ty != place.ty)
+                .is_none_or(|local| Some(local.ty) != ty)
         {
             return None;
         }
@@ -9172,7 +8274,7 @@ impl VerifyCx<'_> {
         site: RirVerifySite,
         scope: &RirCollectionLoanScope,
     ) {
-        self.check_collection_access(
+        let root_ty = self.check_collection_access(
             site,
             function_id,
             function,
@@ -9183,9 +8285,15 @@ impl VerifyCx<'_> {
             RirCollectionAccess::Direct(root) => {
                 self.check_collection_loan_root(site, function, root);
             }
-            RirCollectionAccess::MutPlace(_) => {}
+            RirCollectionAccess::MutPlace(arg) => {
+                if matches!(&arg.access, RirMutPlaceAccess::Handle(_))
+                    && let Some(root_ty) = self.program.mut_place_root_ty(function, &arg.access)
+                {
+                    self.check_collection_loan_steps(site, root_ty, &arg.projections);
+                }
+            }
         }
-        let root_ty = self.ty(scope.root.ty());
+        let root_ty = root_ty.and_then(|ty| self.ty(ty));
         let compatible_root = matches!(
             (scope.root_kind, root_ty),
             (RirCollectionRootKind::List, Some(RirType::List(_)))
@@ -9203,9 +8311,20 @@ impl VerifyCx<'_> {
         if matches!(
             scope.mode,
             RirCollectionLoanMode::MutableSequenceElement | RirCollectionLoanMode::MutableMapValue
-        ) && !self.collection_loan_root_mutable(function, &scope.root)
-        {
-            self.push(site, RirVerifyErrorKind::ImmutableAssign);
+        ) {
+            if !self.collection_loan_root_mutable(function, &scope.root) {
+                self.push(site, RirVerifyErrorKind::ImmutableAssign);
+            }
+            let steps = match &scope.root {
+                RirCollectionAccess::Direct(place) => &place.projections,
+                RirCollectionAccess::MutPlace(place) => &place.projections,
+            };
+            if steps
+                .iter()
+                .any(|step| matches!(step.kind, RirPlaceStepKind::ExternField(_)))
+            {
+                self.push(site, RirVerifyErrorKind::UnsupportedRValueType);
+            }
         }
         self.collection_loans.push(ActiveRirCollectionLoan {
             root: scope.root.clone(),
@@ -9247,13 +8366,14 @@ impl VerifyCx<'_> {
         function: &RirFunction,
         root: &RirCollectionAccess,
         use_: MutPlaceUse,
-    ) {
+    ) -> Option<RirTypeId> {
         match root {
             RirCollectionAccess::Direct(root) => {
                 self.check_place(site, function, root);
+                self.program.place_ty(function, root)
             }
             RirCollectionAccess::MutPlace(root) => {
-                self.check_mut_place_arg(site, function_id, function, root, use_);
+                self.check_mut_place_arg(site, function_id, function, root, use_)
             }
         }
     }
@@ -9266,8 +8386,8 @@ impl VerifyCx<'_> {
         map: &RirCollectionAccess,
         use_: MutPlaceUse,
     ) -> Option<(RirTypeId, RirTypeId)> {
-        self.check_collection_access(site, function_id, function, map, use_);
-        let Some(RirType::Map { key, value }) = self.ty(map.ty()) else {
+        let ty = self.check_collection_access(site, function_id, function, map, use_)?;
+        let Some(RirType::Map { key, value }) = self.ty(ty) else {
             self.push(site, RirVerifyErrorKind::UnsupportedRValueType);
             return None;
         };
@@ -9340,7 +8460,7 @@ impl VerifyCx<'_> {
         expected_ty: Option<RirTypeId>,
         write: bool,
     ) -> Option<RirTypeId> {
-        self.check_collection_access(
+        let collection_ty = self.check_collection_access(
             site,
             function_id,
             function,
@@ -9348,23 +8468,25 @@ impl VerifyCx<'_> {
             MutPlaceUse::CallArg,
         );
         self.check_sequence_index_local(site, function, index);
+        let collection_ty = collection_ty?;
+        let ty = self.ty(collection_ty);
         if matches!(collection, RirCollectionAccess::MutPlace(_))
             && !matches!(
-                self.ty(collection.ty()),
+                ty,
                 Some(RirType::Array { .. } | RirType::List(_) | RirType::Slice(_))
             )
         {
             self.push(site, RirVerifyErrorKind::UnsupportedRValueType);
         }
-        let elem_ty = self.sequence_elem(collection.ty());
+        let elem_ty = self.sequence_elem(collection_ty);
         if elem_ty.is_none() {
             self.push(site, RirVerifyErrorKind::UnsupportedRValueType);
         }
         if !write
-            && matches!(self.ty(collection.ty()), Some(RirType::Array { .. }))
+            && matches!(ty, Some(RirType::Array { .. }))
             && self
                 .program
-                .collection_storage_for(collection.ty())
+                .collection_storage_for(collection_ty)
                 .is_none_or(|storage| {
                     !matches!(
                         storage.kind,
@@ -9422,7 +8544,11 @@ impl VerifyCx<'_> {
                 else {
                     return;
                 };
-                if !self.global_payload_supported(root.ty) {
+                if !self
+                    .program
+                    .place_ty(function, root)
+                    .is_some_and(|ty| self.global_payload_supported(ty))
+                {
                     self.push(site, RirVerifyErrorKind::UnsupportedRValueType);
                 }
                 if !self
@@ -9436,11 +8562,35 @@ impl VerifyCx<'_> {
                 Some(root_ty)
             }
         };
-        if let Some(root_ty) = root_ty
-            && !RirPlaceModel::new(self.program)
-                .collection_loan_projection_supported(root_ty, &root.projections)
-        {
-            self.push(site, RirVerifyErrorKind::UnsupportedRValueType);
+        if let Some(root_ty) = root_ty {
+            self.check_collection_loan_steps(site, root_ty, &root.projections);
+        }
+    }
+
+    fn check_collection_loan_steps(
+        &mut self,
+        site: RirVerifySite,
+        root_ty: RirTypeId,
+        steps: &[RirPlaceStep],
+    ) {
+        let mut ty = root_ty;
+        for step in steps {
+            let supported = matches!(
+                (self.ty(ty), step.kind),
+                (
+                    Some(RirType::Struct(_)),
+                    RirPlaceStepKind::StructField(_) | RirPlaceStepKind::ExternField(_),
+                ) | (Some(RirType::Tuple(_)), RirPlaceStepKind::TupleField(_))
+                    | (
+                        Some(RirType::Array { .. }),
+                        RirPlaceStepKind::ArrayIndex { .. }
+                    )
+            );
+            if !supported || step.source_ty != ty {
+                self.push(site, RirVerifyErrorKind::UnsupportedRValueType);
+                return;
+            }
+            ty = step.target_ty;
         }
     }
 
@@ -9496,11 +8646,10 @@ impl VerifyCx<'_> {
     }
 
     fn mut_place_set_replaces_active_collection_root(&self, place: &RirMutPlaceArg) -> bool {
-        let RirMutPlaceAccess::Handle(RirMutPlaceHandle::Global { global, .. }) = &place.access
-        else {
+        let RirMutPlaceAccess::Handle(RirMutPlaceHandle::Global { global }) = &place.access else {
             return false;
         };
-        let dst = RirPlace::global(*global, place.projections.clone(), place.ty);
+        let dst = RirPlace::global(*global, place.projections.clone());
         self.assignment_replaces_active_collection_root(&dst)
     }
 
@@ -9622,14 +8771,16 @@ impl VerifyCx<'_> {
             let globals = self.global_initialized.clone();
             let global_values = self.global_values.clone();
             for local in &function.locals {
-                let payload_ref_owned = self
-                    .payload_ref_owned
+                let payload_bound = self
+                    .payload_bound
                     .get(local.id.index())
                     .copied()
                     .unwrap_or(false);
-                if local.payload_ref
-                    && Some(local.id) != preserved_payload_ref
-                    && !payload_ref_owned
+                if matches!(
+                    local.binding,
+                    RirLocalBinding::DirectPayload | RirLocalBinding::ScopedPlacePayload
+                ) && Some(local.id) != preserved_payload_ref
+                    && !payload_bound
                 {
                     if let Some(slot) = definite.get_mut(local.id.index()) {
                         *slot = false;
@@ -9761,8 +8912,8 @@ impl VerifyCx<'_> {
             return;
         }
         for (arg, decl) in captures.iter().zip(&lambda.captures) {
-            match (arg, decl.semantic) {
-                (RirLambdaCaptureArg::Owned { value }, RirParamSemantic::Value) => {
+            match (arg, decl.mode) {
+                (RirLambdaCaptureArg::Owned { value }, RirPassMode::Value) => {
                     let found =
                         self.check_owned_value(site, function, value, RustRecipePosition::Value);
                     if found != Some(decl.ty) {
@@ -9782,15 +8933,10 @@ impl VerifyCx<'_> {
                         self.push(site, RirVerifyErrorKind::CallArgEscape);
                     }
                 }
-                (RirLambdaCaptureArg::Shared { place }, RirParamSemantic::SharedBorrow) => {
+                (RirLambdaCaptureArg::Shared { place }, RirPassMode::SharedBorrow) => {
                     self.check_lambda_capture_place(site, function, place, decl.ty);
                 }
-                (RirLambdaCaptureArg::Scoped { place }, RirParamSemantic::MutBorrow) => {
-                    let local = self.local_root(site, place);
-                    self.check_lambda_capture_place(site, function, place, decl.ty);
-                    self.check_mutable_local_root(site, function, local);
-                }
-                (RirLambdaCaptureArg::StackCell { cell }, RirParamSemantic::StackCell) => {
+                (RirLambdaCaptureArg::StackCell { cell }, RirPassMode::StackCell) => {
                     let Some(expected) =
                         Self::lambda_capture_kind_cell(decl.kind, RirCellStorage::StackScoped)
                     else {
@@ -9806,7 +8952,7 @@ impl VerifyCx<'_> {
                         RirCellStorage::StackScoped,
                     );
                 }
-                (RirLambdaCaptureArg::HeapCell { cell }, RirParamSemantic::HeapCell) => {
+                (RirLambdaCaptureArg::HeapCell { cell }, RirPassMode::HeapCell) => {
                     let Some(expected) =
                         Self::lambda_capture_kind_cell(decl.kind, RirCellStorage::Heap)
                     else {
@@ -9822,10 +8968,7 @@ impl VerifyCx<'_> {
                         RirCellStorage::Heap,
                     );
                 }
-                (
-                    RirLambdaCaptureArg::ScopedPlaceCell { cell },
-                    RirParamSemantic::ScopedPlaceCell,
-                ) => {
+                (RirLambdaCaptureArg::ScopedPlaceCell { cell }, RirPassMode::ScopedPlaceCell) => {
                     let RirLambdaCaptureKind::ScopedPlaceCell { cell: expected } = decl.kind else {
                         self.push(site, RirVerifyErrorKind::UnsupportedLambdaCapture);
                         continue;
@@ -9904,14 +9047,10 @@ impl VerifyCx<'_> {
         if !place.projections.is_empty() {
             self.push(site, RirVerifyErrorKind::UnsupportedLambdaCapture);
         }
-        if place.ty != expected {
-            self.push(
-                site,
-                RirVerifyErrorKind::TypeMismatch {
-                    expected,
-                    found: place.ty,
-                },
-            );
+        if let Some(found) = self.program.place_ty(function, place)
+            && found != expected
+        {
+            self.push(site, RirVerifyErrorKind::TypeMismatch { expected, found });
         }
     }
 
@@ -9941,21 +9080,21 @@ impl VerifyCx<'_> {
             RirOwnedSource::Reuse(materializer) => {
                 let found = match &owned.value {
                     RirOwnedOperand::Value(value) => self.value_operand_ty(site, function, value),
-                    RirOwnedOperand::Access(access) => Some(self.check_mut_place_arg(
+                    RirOwnedOperand::Access(access) => self.check_mut_place_arg(
                         site,
                         function.id,
                         function,
                         access,
                         MutPlaceUse::OwnedRead,
-                    )),
+                    ),
                     RirOwnedOperand::DynBorrow(borrow) => {
                         let direct_reborrow = matches!(
                             &borrow.source,
                             RirDynBorrowSource::Reborrowed { carrier, .. }
                                 if *carrier == borrow.target
-                        ) && borrow.air_weakening.is_none();
+                        ) && borrow.weakening.is_none();
                         if !direct_reborrow {
-                            self.push(site, RirVerifyErrorKind::InvalidDynOrigin);
+                            self.push(site, RirVerifyErrorKind::InvalidDynPlan);
                         }
                         self.check_dyn_borrow(site, function.id, function, borrow);
                         self.program
@@ -9971,9 +9110,9 @@ impl VerifyCx<'_> {
                 }
                 found
             }
-            RirOwnedSource::Transfer { air_local } => match &owned.value {
+            RirOwnedSource::Transfer { local } => match &owned.value {
                 RirOwnedOperand::Value(value) => {
-                    self.check_moved_value(site, function, value, air_local)
+                    self.check_moved_value(site, function, value, local)
                 }
                 RirOwnedOperand::Access(_) | RirOwnedOperand::DynBorrow(_) => {
                     self.push(site, RirVerifyErrorKind::UnsupportedRValueType);
@@ -10005,11 +9144,13 @@ impl VerifyCx<'_> {
                     return;
                 };
                 let valid = place.projections.is_empty()
+                    && function.locals.get(local.index()).is_some_and(|decl| {
+                        !decl.mutable && Some(decl.ty) == self.program.place_ty(function, place)
+                    })
                     && function
                         .locals
                         .get(local.index())
-                        .is_some_and(|decl| !decl.mutable && decl.ty == place.ty)
-                    && function.params.iter().all(|param| param.local != local);
+                        .is_some_and(|local| matches!(local.binding, RirLocalBinding::Value));
                 if !valid {
                     self.push(site, RirVerifyErrorKind::UnsupportedRValueType);
                 } else if let Some(initialized) = self.initialized.get_mut(local.index()) {
@@ -10020,22 +9161,13 @@ impl VerifyCx<'_> {
             RirRValue::Materialize(owned) => {
                 self.check_owned_value(site, function, owned, RustRecipePosition::Value)
             }
-            RirRValue::DynPack {
-                carrier,
-                variant,
-                air_witness,
-                value,
-                ty,
-            } => {
+            RirRValue::DynPack { variant, value, ty } => {
                 self.check_type_id(site, *ty);
-                let Some(carrier) = self.program.dyn_carriers.get(carrier.index()) else {
+                let Some(carrier) = self.program.dyn_carriers.get(variant.carrier().index()) else {
                     self.push(site, RirVerifyErrorKind::InvalidDynCarrier);
                     return;
                 };
-                if carrier.storage_ty != *ty {
-                    self.push(site, RirVerifyErrorKind::InvalidDynStorage);
-                }
-                let Some(variant) = carrier.variants.iter().find(|decl| decl.id == *variant) else {
+                let Some(decl) = carrier.variants.get(variant.index()) else {
                     self.push(site, RirVerifyErrorKind::InvalidDynVariant);
                     return;
                 };
@@ -10046,130 +9178,78 @@ impl VerifyCx<'_> {
                     RustRecipePosition::StoredPayload(LambdaStorageFamily::DynamicPayload),
                 );
                 let payload_matches = match value.source {
-                    RirOwnedSource::Reuse(materializer) => materializer == variant.payload,
+                    RirOwnedSource::Reuse(materializer) => materializer == decl.payload,
                     RirOwnedSource::Transfer { .. } => true,
                 };
-                if variant.air_witness != *air_witness
-                    || !payload_matches
-                    || found != Some(variant.concrete_ty)
+                if carrier.storage_ty != *ty || !payload_matches || found != Some(decl.concrete_ty)
                 {
                     self.push(site, RirVerifyErrorKind::InvalidDynVariant);
                 }
                 Some(*ty)
             }
             RirRValue::DynWeaken {
-                source,
-                target,
-                air_weakening,
+                weakening,
                 value,
-                arms,
                 ty,
             } => {
                 self.check_type_id(site, *ty);
-                let weakening_origin = self
-                    .program
-                    .dyn_origins
-                    .weakenings
-                    .iter()
-                    .find(|origin| origin.air_weakening == *air_weakening);
+                let Some(decl) = self.program.dyn_weakenings.get(weakening.index()) else {
+                    self.push(site, RirVerifyErrorKind::InvalidDynStorage);
+                    return;
+                };
                 let (Some(source), Some(target)) = (
-                    self.program.dyn_carriers.get(source.index()),
-                    self.program.dyn_carriers.get(target.index()),
+                    self.program.dyn_carriers.get(decl.source.index()),
+                    self.program.dyn_carriers.get(decl.target.index()),
                 ) else {
                     self.push(site, RirVerifyErrorKind::InvalidDynCarrier);
                     return;
                 };
-                if !weakening_origin.is_some_and(|origin| {
-                    origin.source == source.air_surface && origin.target == target.air_surface
-                }) {
-                    self.push(site, RirVerifyErrorKind::InvalidDynOrigin);
-                }
                 if target.storage_ty != *ty
                     || self.check_owned_value(site, function, value, RustRecipePosition::Value)
                         != Some(source.storage_ty)
                 {
                     self.push(site, RirVerifyErrorKind::InvalidDynStorage);
                 }
-                let valid = arms.len() == source.variants.len()
-                    && source.variants.iter().all(|source_variant| {
-                        arms.iter()
-                            .filter(|arm| arm.source == source_variant.id)
-                            .count()
-                            == 1
-                            && arms
-                                .iter()
-                                .find(|arm| arm.source == source_variant.id)
-                                .is_some_and(|arm| {
-                                    target
-                                        .variants
-                                        .iter()
-                                        .find(|target_variant| target_variant.id == arm.target)
-                                        .is_some_and(|target_variant| {
-                                            target_variant.concrete_ty == source_variant.concrete_ty
-                                                && target_variant.storage == source_variant.storage
-                                        })
-                                })
-                    });
-                if !valid {
-                    self.push(site, RirVerifyErrorKind::InvalidDynStorage);
-                }
                 Some(*ty)
             }
             RirRValue::DynDowncast {
-                carrier,
-                air_surface,
-                value,
-                target,
                 variants,
+                value,
                 ty,
             } => {
-                self.check_type_id(site, *target);
                 self.check_type_id(site, *ty);
-                let Some(carrier) = self.program.dyn_carriers.get(carrier.index()) else {
+                let Some(set) = self.program.dyn_variant_sets.get(variants.index()) else {
+                    self.push(site, RirVerifyErrorKind::InvalidDynVariant);
+                    return;
+                };
+                let Some(carrier) = self.program.dyn_carriers.get(set.carrier.index()) else {
                     self.push(site, RirVerifyErrorKind::InvalidDynCarrier);
                     return;
                 };
-                if carrier.air_surface != *air_surface
-                    || !self.program.dyn_origins.surfaces.contains(air_surface)
-                {
-                    self.push(site, RirVerifyErrorKind::InvalidDynOrigin);
-                }
                 if self.check_owned_value(site, function, value, RustRecipePosition::Value)
                     != Some(carrier.storage_ty)
-                    || self.ty(*ty) != Some(RirType::Option(*target))
+                    || self.ty(*ty) != Some(RirType::Option(set.target))
                 {
                     self.push(site, RirVerifyErrorKind::InvalidDynStorage);
-                }
-                let expected = carrier
-                    .variants
-                    .iter()
-                    .filter(|variant| variant.concrete_ty == *target)
-                    .map(|variant| variant.id)
-                    .collect::<Vec<_>>();
-                if *variants != expected {
-                    self.push(site, RirVerifyErrorKind::InvalidDynVariant);
                 }
                 Some(*ty)
             }
             RirRValue::DynCall {
-                carrier,
-                air_slot,
+                dispatch,
+                exact_variant,
                 receiver,
                 args,
-                arms,
                 ty,
-                ..
             } => {
                 self.check_type_id(site, *ty);
-                let Some(carrier) = self.program.dyn_carriers.get(carrier.index()) else {
+                let Some(dispatch) = self.program.dyn_dispatches.get(dispatch.index()) else {
+                    self.push(site, RirVerifyErrorKind::InvalidDynDispatch);
+                    return;
+                };
+                let Some(carrier) = self.program.dyn_carriers.get(dispatch.carrier.index()) else {
                     self.push(site, RirVerifyErrorKind::InvalidDynCarrier);
                     return;
                 };
-                if !self.program.dyn_origins.slots.iter().any(|origin| {
-                    origin.air_slot == *air_slot && origin.surface == carrier.air_surface
-                }) {
-                    self.push(site, RirVerifyErrorKind::InvalidDynOrigin);
-                }
                 let receiver_ty = match receiver {
                     RirDynReceiver::Owned(value) => {
                         self.check_owned_value(site, function, value, RustRecipePosition::Value)
@@ -10181,55 +9261,31 @@ impl VerifyCx<'_> {
                             .get(borrow.target.index())
                             .map(|carrier| carrier.storage_ty)
                     }
-                    RirDynReceiver::MutPlace(place) => Some(self.check_mut_place_arg(
+                    RirDynReceiver::MutPlace(place) => self.check_mut_place_arg(
                         site,
                         function_id,
                         function,
                         place,
                         MutPlaceUse::ReadCopy,
-                    )),
+                    ),
                 };
-                if receiver_ty != Some(carrier.storage_ty) {
+                if receiver_ty != Some(carrier.storage_ty)
+                    || dispatch.result_ty != *ty
+                    || exact_variant.is_some_and(|variant| variant.carrier() != carrier.id)
+                {
                     self.push(site, RirVerifyErrorKind::InvalidDynStorage);
                 }
                 for (arg_index, arg) in args.iter().enumerate() {
                     self.check_untyped_dyn_arg(function_id, function, index, arg_index, arg);
                 }
-                let uniform_receiver = arms.first().is_some_and(|first| {
-                    arms.iter().all(|arm| {
-                        arm.receiver.is_readonly_receiver() == first.receiver.is_readonly_receiver()
-                    })
-                });
-                let valid = arms.len() == carrier.variants.len()
-                    && uniform_receiver
-                    && carrier.variants.iter().all(|variant| {
-                        arms.iter().filter(|arm| arm.variant == variant.id).count() == 1
-                    })
-                    && arms
-                        .iter()
-                        .all(|arm| Self::dyn_receiver_abi_valid(receiver, arm.receiver))
-                    && arms.iter().all(|arm| {
-                        carrier
-                            .variants
-                            .iter()
-                            .find(|variant| variant.id == arm.variant)
-                            .is_some_and(|variant| {
-                                self.program.dyn_origins.dispatches.iter().any(|origin| {
-                                    origin.air_witness == variant.air_witness
-                                        && origin.air_slot == *air_slot
-                                        && origin.receiver == arm.receiver
-                                        && origin.target == arm.target
-                                }) && self.dyn_dispatch_target_valid(
-                                    function,
-                                    receiver,
-                                    variant.concrete_ty,
-                                    arm,
-                                    args,
-                                    *ty,
-                                )
-                            })
-                    });
-                if !valid {
+                if dispatch.arms.iter().any(|arm| {
+                    !self.dyn_dispatch_args_valid(function, args, &dispatch.params)
+                        || !Self::dyn_receiver_mode_valid(receiver, arm.receiver)
+                        || matches!(arm.target.base(), RirResolvedCallTarget::Extern(id)
+                        if args.iter().enumerate().any(|(index, arg)| {
+                            self.program.externs[id.index()].rejects_reentry_arg(index + 1, arg)
+                        }))
+                }) {
                     self.push(site, RirVerifyErrorKind::InvalidDynDispatch);
                 }
                 Some(*ty)
@@ -10529,7 +9585,9 @@ impl VerifyCx<'_> {
             RirRValue::Len { source } => {
                 self.check_place(site, function, source);
                 if !matches!(
-                    self.ty(source.ty),
+                    self.program
+                        .place_ty(function, source)
+                        .and_then(|ty| self.ty(ty)),
                     Some(
                         RirType::String
                             | RirType::Array { .. }
@@ -10543,7 +9601,7 @@ impl VerifyCx<'_> {
                 self.type_id(RirType::Int)
             }
             RirRValue::CollectionLen { source } => {
-                self.check_collection_access(
+                let source_ty = self.check_collection_access(
                     site,
                     function_id,
                     function,
@@ -10551,7 +9609,7 @@ impl VerifyCx<'_> {
                     MutPlaceUse::CallArg,
                 );
                 if !matches!(
-                    self.ty(source.ty()),
+                    source_ty.and_then(|ty| self.ty(ty)),
                     Some(
                         RirType::Array { .. }
                             | RirType::List(_)
@@ -10563,25 +9621,24 @@ impl VerifyCx<'_> {
                 }
                 self.type_id(RirType::Int)
             }
-            RirRValue::SequenceSlotAt {
-                collection,
-                index,
-                ty,
-            } => {
-                self.check_type_id(site, *ty);
+            RirRValue::SequenceSlotAt { collection, step } => {
+                self.check_type_id(site, step.target_ty);
+                if let Some(collection_ty) = self.program.collection_ty(function, collection) {
+                    self.check_place_step(site, function, collection_ty, step, true);
+                }
                 self.check_sequence_slot(
                     site,
                     function_id,
                     function,
                     collection,
-                    *index,
-                    Some(*ty),
+                    step.index_local().expect("sequence slot step"),
+                    Some(step.target_ty),
                     false,
                 );
-                Some(*ty)
+                Some(step.target_ty)
             }
             RirRValue::ListPush { list, value } => {
-                self.check_collection_access(
+                let list_ty = self.check_collection_access(
                     site,
                     function_id,
                     function,
@@ -10591,7 +9648,7 @@ impl VerifyCx<'_> {
                 if !self.collection_loan_root_mutable(function, list) {
                     self.push(site, RirVerifyErrorKind::ImmutableAssign);
                 }
-                let Some(RirType::List(elem)) = self.ty(list.ty()) else {
+                let Some(RirType::List(elem)) = list_ty.and_then(|ty| self.ty(ty)) else {
                     self.push(site, RirVerifyErrorKind::UnsupportedRValueType);
                     return;
                 };
@@ -10622,7 +9679,7 @@ impl VerifyCx<'_> {
                 ) {
                     self.push(site, RirVerifyErrorKind::UnsupportedRValueType);
                 }
-                self.check_collection_access(
+                let source_ty = self.check_collection_access(
                     site,
                     function_id,
                     function,
@@ -10640,7 +9697,7 @@ impl VerifyCx<'_> {
                 if *mutable && !self.collection_loan_root_mutable(function, source) {
                     self.push(site, RirVerifyErrorKind::ImmutableAssign);
                 }
-                if self.sequence_elem(source.ty()) != Some(elem) {
+                if source_ty.and_then(|ty| self.sequence_elem(ty)) != Some(elem) {
                     self.push(site, RirVerifyErrorKind::UnsupportedRValueType);
                 }
                 Some(*ty)
@@ -10657,7 +9714,12 @@ impl VerifyCx<'_> {
                     self.push(site, RirVerifyErrorKind::UnsupportedRValueType);
                     return;
                 };
-                if self.sequence_elem(source.ty) != Some(elem) {
+                if self
+                    .program
+                    .place_ty(function, source)
+                    .and_then(|ty| self.sequence_elem(ty))
+                    != Some(elem)
+                {
                     self.push(site, RirVerifyErrorKind::UnsupportedRValueType);
                 } else if !RirRustRepPolicy::new(self.program).value_from_ref_supported(elem) {
                     self.push(site, RirVerifyErrorKind::NonCopyValueRequired);
@@ -10819,7 +9881,8 @@ impl VerifyCx<'_> {
                             map,
                             MutPlaceUse::IndexedMapAssignment,
                         );
-                        let Some(RirType::Map { key, value }) = self.ty(map_ty) else {
+                        let Some(RirType::Map { key, value }) = map_ty.and_then(|ty| self.ty(ty))
+                        else {
                             self.push(site, RirVerifyErrorKind::UnsupportedRValueType);
                             return;
                         };
@@ -10878,7 +9941,9 @@ impl VerifyCx<'_> {
             } => self.owned_value_lambda_escape(function, operand),
             RirCallArg::SharedBorrow(place)
                 if matches!(
-                    self.program.types.get(place.ty.index()),
+                    self.program
+                        .place_ty(function, place)
+                        .and_then(|ty| self.program.types.get(ty.index())),
                     Some(RirType::Lambda(_))
                 ) =>
             {
@@ -10895,23 +9960,27 @@ impl VerifyCx<'_> {
 
     fn dyn_dispatch_target_valid(
         &self,
-        caller: &RirFunction,
-        receiver_value: &RirDynReceiver,
         mut receiver_ty: RirTypeId,
         arm: &RirDynDispatchArm,
-        args: &[RirCallArg],
+        params: &[RirDynDispatchParam],
         ret: RirTypeId,
     ) -> bool {
         let mut target = &arm.target;
         while let RirResolvedCallTarget::Promoted {
-            fields,
+            projections,
             target: next,
         } = target
         {
-            if fields.is_empty() {
+            if projections.is_empty() {
                 return false;
             }
-            for field in fields {
+            for projection in projections {
+                let RirPlaceStepKind::StructField(field) = projection.kind else {
+                    return false;
+                };
+                if projection.source_ty != receiver_ty {
+                    return false;
+                }
                 let Some(RirType::Struct(id)) = self.program.types.get(receiver_ty.index()) else {
                     return false;
                 };
@@ -10920,7 +9989,9 @@ impl VerifyCx<'_> {
                     .structs
                     .get(id.index())
                     .and_then(|decl| decl.fields.get(field.index()))
-                    .filter(|projected| projected.id == *field)
+                    .filter(|projected| {
+                        projected.id == field && projected.ty == projection.target_ty
+                    })
                 else {
                     return false;
                 };
@@ -10928,7 +9999,7 @@ impl VerifyCx<'_> {
             }
             target = next;
         }
-        let (params, target_ret, native) = match target {
+        let (target_params, target_ret, native) = match target {
             RirResolvedCallTarget::Function(id) => {
                 let Some(function) = self.program.functions.get(id.index()) else {
                     return false;
@@ -10937,7 +10008,7 @@ impl VerifyCx<'_> {
                     function
                         .params
                         .iter()
-                        .map(|param| (param.ty, param.semantic, param.abi, param.escape))
+                        .filter_map(|param| function.parameter_data(*param))
                         .collect::<Vec<_>>(),
                     function.ret.ty,
                     None,
@@ -10951,7 +10022,7 @@ impl VerifyCx<'_> {
                     function
                         .params
                         .iter()
-                        .map(|param| (param.ty, param.semantic, param.abi, param.escape))
+                        .map(|param| (param.ty, param.mode, param.escape))
                         .collect::<Vec<_>>(),
                     function.ret,
                     Some(*id),
@@ -10959,100 +10030,87 @@ impl VerifyCx<'_> {
             }
             RirResolvedCallTarget::Promoted { .. } => unreachable!(),
         };
-        let Some((receiver, params)) = params.split_first() else {
+        let Some((receiver, target_params)) = target_params.split_first() else {
             return false;
         };
-        if params.len() != args.len() {
-            return false;
-        }
-        let receiver_present = Self::dyn_receiver_abi_valid(receiver_value, arm.receiver);
-        let source_receiver_valid = arm.receiver != RirParamAbi::MutBorrow || native.is_some();
         let native_valid = native.is_none_or(|id| {
-            let plan = self.program.native_call_plan(id);
             let resource = native_ty_is_resource_ref(self.program, receiver.0);
-            receiver_present
-                && match arm.receiver {
-                    RirParamAbi::MutBorrow => resource,
-                    RirParamAbi::MutPlace => !resource,
-                    _ => true,
-                }
-                && !plan.rejects_reentry_arg(
-                    0,
-                    native_dynamic_arg_facts(self.program, receiver.0, receiver.1),
-                )
-                && !args.iter().enumerate().any(|(index, arg)| {
-                    self.program.native_call_plan(id).rejects_reentry_arg(
-                        index + 1,
-                        native_arg_facts(self.program, params[index].0, arg),
-                    )
+            self.program.externs[id.index()]
+                .params
+                .first()
+                .is_some_and(|param| {
+                    param.action != native_call::NativeArgAction::RejectLiveBoundary
+                        && match arm.receiver {
+                            RirPassMode::MutBorrow => resource,
+                            RirPassMode::MutPlace => !resource,
+                            _ => true,
+                        }
                 })
         });
-        let params_valid = params
-            .iter()
-            .zip(args)
-            .all(|((ty, semantic, abi, escape), arg)| {
-                let callback_sig = match arg {
-                    RirCallArg::ScopedLambda { sig, .. }
-                    | RirCallArg::EscapingLambda { sig, .. }
-                    | RirCallArg::AnvCallback { sig, .. } => {
-                        matches!(self.program.types.get(ty.index()), Some(RirType::Lambda(expected)) if expected == sig)
-                    }
-                    _ => true,
-                };
-                let adaptable = arg.adapted_to(*semantic, self.program).is_some_and(|_| {
-                    !matches!(
-                        (semantic, arg),
-                        (RirParamSemantic::Value, RirCallArg::SharedBorrow(_))
-                    ) || RirRustRepPolicy::new(self.program).value_from_ref_supported(*ty)
-                });
-                adaptable
-                    && self.dyn_arg_ty(arg) == Some(*ty)
-                    && callback_sig
-                    && (*escape != RirParamEscape::Escaping
-                        || !matches!(
-                            self.program.types.get(ty.index()),
-                            Some(RirType::Lambda(_))
-                        )
-                        || self.call_arg_lambda_escape(caller, arg)
-                            == Some(RirLambdaEscape::Escaping))
-                    && RirRustRepPolicy::new(self.program)
-                        .call_arg_abi(*ty, *semantic)
-                        .is_some_and(|found| found == *abi)
-            });
-        source_receiver_valid
-            && native_valid
-            && receiver.0 == receiver_ty
-            && receiver.2 == arm.receiver
+        receiver.0 == receiver_ty
+            && receiver.1 == arm.receiver
             && target_ret == ret
-            && params_valid
+            && target_params.len() == params.len()
+            && target_params
+                .iter()
+                .zip(params)
+                .all(|((ty, mode, escape), param)| {
+                    *ty == param.ty
+                        && *mode == param.mode
+                        && *escape == param.escape
+                        && RirRustRepPolicy::new(self.program).supports_param(*ty, *mode)
+                })
+            && native_valid
     }
 
-    fn dyn_receiver_abi_valid(receiver: &RirDynReceiver, abi: RirParamAbi) -> bool {
+    fn dyn_dispatch_args_valid(
+        &self,
+        caller: &RirFunction,
+        args: &[RirCallArg],
+        params: &[RirDynDispatchParam],
+    ) -> bool {
+        args.len() == params.len() && params.iter().zip(args).all(|(param, arg)| {
+            let callback_sig = match arg {
+                RirCallArg::ScopedLambda { sig, .. }
+                | RirCallArg::EscapingLambda { sig, .. }
+                | RirCallArg::AnvCallback { sig, .. } => matches!(self.program.types.get(param.ty.index()), Some(RirType::Lambda(expected)) if *expected == *sig),
+                _ => true,
+            };
+            arg.mode() == param.mode
+                && self.dyn_arg_ty(caller, arg) == Some(param.ty)
+                && callback_sig
+                && (param.escape != RirParamEscape::Escaping
+                    || !matches!(self.program.types.get(param.ty.index()), Some(RirType::Lambda(_)))
+                    || self.call_arg_lambda_escape(caller, arg) == Some(RirLambdaEscape::Escaping))
+        })
+    }
+
+    fn dyn_receiver_mode_valid(receiver: &RirDynReceiver, mode: RirPassMode) -> bool {
         match receiver {
             RirDynReceiver::Owned(_) => {
-                matches!(abi, RirParamAbi::Value | RirParamAbi::SharedBorrow)
+                matches!(mode, RirPassMode::Value | RirPassMode::SharedBorrow)
             }
             RirDynReceiver::Borrowed(_) => matches!(
-                abi,
-                RirParamAbi::Value
-                    | RirParamAbi::SharedBorrow
-                    | RirParamAbi::MutBorrow
-                    | RirParamAbi::MutPlace
+                mode,
+                RirPassMode::Value
+                    | RirPassMode::SharedBorrow
+                    | RirPassMode::MutBorrow
+                    | RirPassMode::MutPlace
             ),
             RirDynReceiver::MutPlace(_) => {
-                matches!(abi, RirParamAbi::MutBorrow | RirParamAbi::MutPlace)
+                matches!(mode, RirPassMode::MutBorrow | RirPassMode::MutPlace)
             }
         }
     }
 
-    fn dyn_arg_ty(&self, arg: &RirCallArg) -> Option<RirTypeId> {
+    fn dyn_arg_ty(&self, function: &RirFunction, arg: &RirCallArg) -> Option<RirTypeId> {
         let operand_ty = |operand: &RirOperand| match operand {
             RirOperand::Const(id) => self.program.consts.get(id.index()).map(|konst| konst.ty),
-            RirOperand::Place(place) => Some(place.ty),
+            RirOperand::Place(place) => self.program.place_ty(function, place),
         };
         let owned_ty = |owned: &RirOwnedValue| match &owned.value {
             RirOwnedOperand::Value(operand) => operand_ty(operand),
-            RirOwnedOperand::Access(place) => Some(place.ty),
+            RirOwnedOperand::Access(place) => self.program.mut_place_ty(function, place),
             RirOwnedOperand::DynBorrow(borrow) => self
                 .program
                 .dyn_carriers
@@ -11064,9 +10122,11 @@ impl VerifyCx<'_> {
                 owned_ty(operand)
             }
             RirCallArg::InitFieldOmitted => None,
-            RirCallArg::SharedBorrow(place) | RirCallArg::MutBorrow(place) => Some(place.ty),
+            RirCallArg::SharedBorrow(place) | RirCallArg::MutBorrow(place) => {
+                self.program.place_ty(function, place)
+            }
             RirCallArg::SharedStringConst(_) => self.string_ty(),
-            RirCallArg::MutPlace(place) => Some(place.ty),
+            RirCallArg::MutPlace(place) => self.program.mut_place_ty(function, place),
             RirCallArg::DynBorrow(borrow) => self
                 .program
                 .dyn_carriers
@@ -11083,14 +10143,14 @@ impl VerifyCx<'_> {
         site: RirVerifySite,
         function: &RirFunction,
         value: &RirOperand,
-        air_local: air::LocalId,
+        local: RirLocalId,
     ) -> Option<RirTypeId> {
         let ty = self.operand_ty(site, function, value);
         let RirOperand::Place(place) = value else {
             self.push(site, RirVerifyErrorKind::CallArgMode);
             return ty;
         };
-        let valid = matches!(place.root, RirPlaceRoot::Local(local) if local.index() == air_local.index())
+        let valid = matches!(place.root, RirPlaceRoot::Local(root) if root == local)
             && place.projections.is_empty();
         if !valid {
             self.push(site, RirVerifyErrorKind::CallArgMode);
@@ -11104,18 +10164,13 @@ impl VerifyCx<'_> {
         function_id: RirFunctionId,
         function: &RirFunction,
         borrow: &RirDynBorrow,
-    ) -> Option<RirTypeId> {
-        let target_surface = self
-            .program
-            .dyn_carriers
-            .get(borrow.target.index())?
-            .air_surface;
-        let (source_carrier, source_surface, source_ty) = match &borrow.source {
-            RirDynBorrowSource::Concrete {
-                place,
-                carrier,
-                air_witness,
-            } => {
+    ) {
+        let Some(target) = self.program.dyn_carriers.get(borrow.target.index()) else {
+            self.push(site, RirVerifyErrorKind::InvalidDynCarrier);
+            return;
+        };
+        let (source, _) = match &borrow.source {
+            RirDynBorrowSource::Concrete { place, variant } => {
                 let ty = self.check_mut_place_arg(
                     site,
                     function_id,
@@ -11123,20 +10178,16 @@ impl VerifyCx<'_> {
                     place,
                     MutPlaceUse::CallArg,
                 );
-                let source = self.program.dyn_carriers.get(carrier.index());
-                let valid = source.is_some_and(|source| {
-                    source.variants.iter().any(|variant| {
-                        variant.air_witness == *air_witness && variant.concrete_ty == ty
-                    })
-                });
-                if !valid {
-                    self.push(site, RirVerifyErrorKind::InvalidDynOrigin);
+                let source = self.program.dyn_carriers.get(variant.carrier().index());
+                if source.is_none_or(|source| {
+                    source
+                        .variants
+                        .get(variant.index())
+                        .is_none_or(|decl| Some(decl.concrete_ty) != ty)
+                }) {
+                    self.push(site, RirVerifyErrorKind::InvalidDynVariant);
                 }
-                (
-                    Some(*carrier),
-                    source.map(|source| source.air_surface),
-                    Some(ty),
-                )
+                (source.map(|source| source.id), ty)
             }
             RirDynBorrowSource::Owned { place, carrier } => {
                 let ty = self.check_mut_place_arg(
@@ -11147,74 +10198,46 @@ impl VerifyCx<'_> {
                     MutPlaceUse::CallArg,
                 );
                 let source = self.program.dyn_carriers.get(carrier.index());
-                if source.is_none_or(|source| source.storage_ty != ty) {
+                if source.is_none_or(|source| Some(source.storage_ty) != ty) {
                     self.push(site, RirVerifyErrorKind::InvalidDynStorage);
                 }
-                (
-                    Some(*carrier),
-                    source.map(|source| source.air_surface),
-                    Some(ty),
-                )
+                (Some(*carrier), ty)
             }
             RirDynBorrowSource::Borrowed { local, carrier } => {
                 self.check_local_id(site, function, *local);
                 let source = self.program.dyn_carriers.get(carrier.index());
-                let valid = source.is_some_and(|source| {
-                    function.params.iter().any(|param| {
-                        param.local == *local
-                            && param.semantic == RirParamSemantic::DynBorrow
-                            && param.abi == RirParamAbi::DynBorrow
-                            && param.ty == source.storage_ty
-                            && param.escape == RirParamEscape::NonEscaping
-                    })
-                });
-                if !valid {
-                    self.push(site, RirVerifyErrorKind::InvalidDynOrigin);
-                }
-                (
-                    Some(*carrier),
-                    source.map(|source| source.air_surface),
-                    source.map(|source| source.storage_ty),
-                )
+                if !source.is_some_and(|source| matches!(function.parameter_data(*local), Some((ty, RirPassMode::DynBorrow, RirParamEscape::NonEscaping)) if ty == source.storage_ty)) { self.push(site, RirVerifyErrorKind::InvalidDynStorage); }
+                (Some(*carrier), source.map(|source| source.storage_ty))
             }
             RirDynBorrowSource::Reborrowed { local, carrier } => {
                 self.check_local_id(site, function, *local);
                 let source = self.program.dyn_carriers.get(carrier.index());
-                let valid =
-                    source.is_some_and(|source| {
-                        function.locals.get(local.index()).is_some_and(|local| {
-                            local.ty == source.storage_ty && !local.payload_ref
-                        }) && self.initialized.get(local.index()).copied() == Some(true)
-                            && self.active_dyn_reborrows.contains(&(*local, *carrier))
-                    });
-                if !valid {
-                    self.push(site, RirVerifyErrorKind::InvalidDynOrigin);
+                if !source.is_some_and(|source| {
+                    self.initialized.get(local.index()).copied() == Some(true)
+                        && self.active_dyn_reborrows.contains(&(*local, *carrier))
+                        && function
+                            .locals
+                            .get(local.index())
+                            .is_some_and(|local| local.ty == source.storage_ty)
+                }) {
+                    self.push(site, RirVerifyErrorKind::InvalidDynStorage);
                 }
-                (
-                    Some(*carrier),
-                    source.map(|source| source.air_surface),
-                    source.map(|source| source.storage_ty),
-                )
+                (Some(*carrier), source.map(|source| source.storage_ty))
             }
         };
-        let projection_valid = match borrow.air_weakening {
-            Some(id) => {
-                self.program.dyn_origins.weakenings.iter().any(|origin| {
-                    origin.air_weakening == id
-                        && Some(origin.source) == source_surface
-                        && origin.target == target_surface
-                }) && self.program.dyn_weakenings.iter().any(|weakening| {
-                    weakening.air_id == id
-                        && Some(weakening.source) == source_carrier
-                        && weakening.target == borrow.target
-                })
-            }
-            None => source_surface == Some(target_surface) && source_carrier == Some(borrow.target),
+        let valid = match borrow.weakening {
+            Some(id) => self
+                .program
+                .dyn_weakenings
+                .get(id.index())
+                .is_some_and(|weakening| {
+                    Some(weakening.source) == source && weakening.target == target.id
+                }),
+            None => source == Some(target.id),
         };
-        if !projection_valid {
-            self.push(site, RirVerifyErrorKind::InvalidDynOrigin);
+        if !valid {
+            self.push(site, RirVerifyErrorKind::InvalidDynStorage);
         }
-        source_ty
     }
 
     fn check_untyped_dyn_arg(
@@ -11242,10 +10265,13 @@ impl VerifyCx<'_> {
                     self.push(site, RirVerifyErrorKind::CallArgMode);
                     return;
                 };
-                let direct_local = function
-                    .locals
-                    .get(local.index())
-                    .is_some_and(|local| local.mutable && !local.payload_ref);
+                let direct_local = function.locals.get(local.index()).is_some_and(|local| {
+                    local.mutable
+                        && !matches!(
+                            local.binding,
+                            RirLocalBinding::DirectPayload | RirLocalBinding::ScopedPlacePayload
+                        )
+                });
                 if Self::function_local_is_mut_place_param(function, local)
                     || !place.projections.is_empty()
                     || !direct_local
@@ -11279,7 +10305,7 @@ impl VerifyCx<'_> {
         ret: RirTypeId,
     ) {
         let native_call = matches!(callee, RirCallTarget::Extern(_));
-        let (expected, callee_ret, init_fields, native_plan) = match callee {
+        let (expected, callee_ret, init_fields, native_ext) = match callee {
             RirCallTarget::Function(id) => {
                 self.check_function_id(RirVerifySite::RValue(function_id, stmt), id);
                 match self.program.functions.get(id.index()) {
@@ -11287,7 +10313,7 @@ impl VerifyCx<'_> {
                         function
                             .params
                             .iter()
-                            .map(|param| (param.ty, param.semantic, param.abi, param.escape))
+                            .filter_map(|param| function.parameter_data(*param))
                             .collect::<Vec<_>>(),
                         function.ret.ty,
                         vec![false; function.params.len()],
@@ -11300,24 +10326,19 @@ impl VerifyCx<'_> {
                 self.check_extern_id(RirVerifySite::RValue(function_id, stmt), id);
                 match self.program.externs.get(id.index()) {
                     Some(ext) => {
-                        let init_fields = match &ext.kind {
-                            RirExternKind::Native(native) => native
-                                .abi
-                                .params
-                                .iter()
-                                .map(|param| matches!(param, RustParamAbi::InitField(_)))
-                                .collect(),
-                        };
+                        let init_fields = ext
+                            .params
+                            .iter()
+                            .map(|param| matches!(param.abi, RustParamAbi::InitField(_)))
+                            .collect();
                         (
                             ext.params
                                 .iter()
-                                .map(|param| (param.ty, param.semantic, param.abi, param.escape))
+                                .map(|param| (param.ty, param.mode, param.escape))
                                 .collect::<Vec<_>>(),
                             ext.ret,
                             init_fields,
-                            Some(match &ext.kind {
-                                RirExternKind::Native(_) => self.program.native_call_plan(id),
-                            }),
+                            Some(id),
                         )
                     }
                     None => return,
@@ -11344,7 +10365,7 @@ impl VerifyCx<'_> {
                     sig_decl
                         .params
                         .iter()
-                        .map(|param| (param.ty, param.semantic, param.abi, param.escape))
+                        .map(|param| (param.ty, param.mode, param.escape))
                         .collect::<Vec<_>>(),
                     sig_decl.ret,
                     vec![false; sig_decl.params.len()],
@@ -11371,16 +10392,16 @@ impl VerifyCx<'_> {
                 },
             );
         }
-        for (index, (arg, (ty, mode, abi, escape))) in args.iter().zip(expected).enumerate() {
+        for (index, (arg, (ty, mode, escape))) in args.iter().zip(expected).enumerate() {
             let site = RirVerifySite::CallArg(function_id, stmt, index);
             let found_init_field = matches!(
                 arg,
                 RirCallArg::InitFieldProvided(_) | RirCallArg::InitFieldOmitted
             );
-            if found_init_field != init_fields.get(index).copied().unwrap_or(false) {
+            if found_init_field != init_fields[index] {
                 self.push(site, RirVerifyErrorKind::CallArgMode);
             }
-            if arg.semantic() != mode
+            if arg.mode() != mode
                 || matches!(
                     arg,
                     RirCallArg::ScopedLambda { .. }
@@ -11390,12 +10411,12 @@ impl VerifyCx<'_> {
             {
                 self.push(site, RirVerifyErrorKind::CallArgMode);
             }
-            if native_plan.as_ref().is_some_and(|plan| {
-                plan.rejects_reentry_arg(index, native_arg_facts(self.program, ty, arg))
-            }) {
+            if native_ext
+                .is_some_and(|id| self.program.externs[id.index()].rejects_reentry_arg(index, arg))
+            {
                 self.push(site, RirVerifyErrorKind::CallArgMode);
             }
-            if RirRustRepPolicy::new(self.program).call_arg_abi(ty, arg.semantic()) != Some(abi) {
+            if !RirRustRepPolicy::new(self.program).supports_param(ty, arg.mode()) {
                 self.push(site, RirVerifyErrorKind::UnsupportedAbi);
             }
             if escape == RirParamEscape::Escaping
@@ -11418,7 +10439,11 @@ impl VerifyCx<'_> {
                             }
                         }
                         RirPlaceRoot::Global(global) => {
-                            if !self.global_payload_supported(place.ty) {
+                            if !self
+                                .program
+                                .place_ty(function, place)
+                                .is_some_and(|ty| self.global_payload_supported(ty))
+                            {
                                 self.push(site, RirVerifyErrorKind::UnsupportedRValueType);
                             }
                             if !self
@@ -11431,7 +10456,7 @@ impl VerifyCx<'_> {
                             }
                         }
                     }
-                    Some(place.ty)
+                    self.program.place_ty(function, place)
                 }
                 RirCallArg::MutBorrow(place) => {
                     let RirPlaceRoot::Local(local) = place.root else {
@@ -11440,25 +10465,25 @@ impl VerifyCx<'_> {
                         return;
                     };
                     self.check_place(site, function, place);
-                    let direct_local = function
-                        .locals
-                        .get(local.index())
-                        .is_some_and(|local| local.mutable && !local.payload_ref);
+                    let direct_local = function.locals.get(local.index()).is_some_and(|local| {
+                        local.mutable
+                            && !matches!(
+                                local.binding,
+                                RirLocalBinding::DirectPayload
+                                    | RirLocalBinding::ScopedPlacePayload
+                            )
+                    });
                     if Self::function_local_is_mut_place_param(function, local)
                         || !place.projections.is_empty()
                         || !direct_local
                     {
                         self.push(site, RirVerifyErrorKind::CallArgMode);
                     }
-                    Some(place.ty)
+                    self.program.place_ty(function, place)
                 }
-                RirCallArg::MutPlace(arg) => Some(self.check_mut_place_arg(
-                    site,
-                    function_id,
-                    function,
-                    arg,
-                    MutPlaceUse::CallArg,
-                )),
+                RirCallArg::MutPlace(arg) => {
+                    self.check_mut_place_arg(site, function_id, function, arg, MutPlaceUse::CallArg)
+                }
                 RirCallArg::DynBorrow(borrow) => {
                     if escape != RirParamEscape::NonEscaping {
                         self.push(site, RirVerifyErrorKind::CallArgEscape);
@@ -11522,13 +10547,26 @@ impl VerifyCx<'_> {
         function: &RirFunction,
         arg: &RirMutPlaceArg,
         use_: MutPlaceUse,
-    ) -> RirTypeId {
-        self.check_type_id(site, arg.ty);
+    ) -> Option<RirTypeId> {
+        let Some(root_ty) = self.program.mut_place_root_ty(function, &arg.access) else {
+            self.push(site, RirVerifyErrorKind::BadId);
+            return None;
+        };
+        let final_ty = arg.final_ty(root_ty);
+        self.check_type_id(site, final_ty);
         match &arg.access {
             RirMutPlaceAccess::Handle(handle) => {
-                self.check_mut_place_handle(site, function_id, function, handle, arg, use_)
+                self.check_mut_place_handle(
+                    site,
+                    function_id,
+                    function,
+                    handle,
+                    arg,
+                    root_ty,
+                    use_,
+                );
             }
-            RirMutPlaceAccess::DataRef { object, dataref } => {
+            RirMutPlaceAccess::DataRef { object, place } => {
                 if !use_.allow_dataref() {
                     self.push(site, RirVerifyErrorKind::UnsupportedRValueType);
                 }
@@ -11537,28 +10575,10 @@ impl VerifyCx<'_> {
                 } else {
                     StorageProjectionMode::Ordinary
                 };
-                let found = self.check_dataref_access(
-                    site,
-                    function,
-                    object,
-                    *dataref,
-                    &arg.projections,
-                    mode,
-                );
-                if let Some(found) = found
-                    && found != arg.ty
-                {
-                    self.push(
-                        site,
-                        RirVerifyErrorKind::TypeMismatch {
-                            expected: found,
-                            found: arg.ty,
-                        },
-                    );
-                }
-                arg.ty
+                self.check_dataref_access(site, function, object, *place, &arg.projections, mode);
             }
         }
+        Some(final_ty)
     }
 
     fn check_mut_place_handle(
@@ -11568,17 +10588,18 @@ impl VerifyCx<'_> {
         function: &RirFunction,
         handle: &RirMutPlaceHandle,
         arg: &RirMutPlaceArg,
+        root_ty: RirTypeId,
         use_: MutPlaceUse,
-    ) -> RirTypeId {
+    ) {
         match handle {
-            RirMutPlaceHandle::Local { local, ty } => {
+            RirMutPlaceHandle::Local { local } => {
                 if use_ == MutPlaceUse::ScopedPlaceSource {
-                    self.check_scoped_place_source_projection(site, function, *ty, arg);
+                    self.check_scoped_place_source_projection(site, function, root_ty, arg);
                 } else {
                     self.check_place(
                         site,
                         function,
-                        &RirPlace::local(*local, arg.projections.clone(), arg.ty),
+                        &RirPlace::local(*local, arg.projections.clone()),
                     );
                     if Self::function_local_is_mut_place_param(function, *local) {
                         self.push(site, RirVerifyErrorKind::CallArgMode);
@@ -11586,138 +10607,96 @@ impl VerifyCx<'_> {
                 }
                 match function.locals.get(local.index()) {
                     Some(local) => {
-                        if local.ty != *ty {
-                            self.push(
-                                site,
-                                RirVerifyErrorKind::TypeMismatch {
-                                    expected: local.ty,
-                                    found: *ty,
-                                },
-                            );
-                        }
-                        if use_ == MutPlaceUse::OwnedRead && !local.payload_ref {
+                        if use_ == MutPlaceUse::OwnedRead
+                            && !matches!(
+                                local.binding,
+                                RirLocalBinding::DirectPayload
+                                    | RirLocalBinding::ScopedPlacePayload
+                            )
+                        {
                             self.push(site, RirVerifyErrorKind::UnsupportedRValueType);
                         } else if !matches!(
                             use_,
                             MutPlaceUse::OwnedRead | MutPlaceUse::SliceViewRead
                         ) && !local.mutable
-                            && !local.payload_ref
+                            && !matches!(
+                                local.binding,
+                                RirLocalBinding::DirectPayload
+                                    | RirLocalBinding::ScopedPlacePayload
+                            )
                         {
                             self.push(site, RirVerifyErrorKind::ImmutableAssign);
                         }
                     }
                     None => self.push(site, RirVerifyErrorKind::BadId),
                 }
-                if !self.projected_mut_place_arg_supported(*ty, &arg.projections, true) {
+                if !Self::projected_mut_place_arg_supported(root_ty, &arg.projections, true) {
                     self.push(site, RirVerifyErrorKind::UnsupportedRValueType);
                 }
-                arg.ty
             }
-            RirMutPlaceHandle::Param { local, ty } => {
+            RirMutPlaceHandle::Param { local } => {
                 self.check_local_id(site, function, *local);
                 if use_ != MutPlaceUse::ScopedPlaceSource
                     && self.function_local_is_scoped_place_source(function_id, *local)
                 {
                     self.push(site, RirVerifyErrorKind::CallArgMode);
                 }
-                match function.params.iter().find(|param| param.local == *local) {
-                    Some(param)
-                        if param.semantic == RirParamSemantic::MutPlace
-                            && param.abi == RirParamAbi::MutPlace =>
-                    {
-                        if param.ty != *ty {
-                            self.push(
-                                site,
-                                RirVerifyErrorKind::TypeMismatch {
-                                    expected: param.ty,
-                                    found: *ty,
-                                },
-                            );
-                        }
-                    }
+                match function.parameter_data(*local) {
+                    Some((_, RirPassMode::MutPlace, _)) => {}
                     Some(_) => self.push(site, RirVerifyErrorKind::CallArgMode),
                     None => self.push(site, RirVerifyErrorKind::ParamLocalMissing),
                 }
-                if arg.projections.is_empty() {
-                    if arg.ty != *ty {
-                        self.push(
-                            site,
-                            RirVerifyErrorKind::TypeMismatch {
-                                expected: *ty,
-                                found: arg.ty,
-                            },
-                        );
-                    }
-                } else if use_ == MutPlaceUse::ScopedPlaceSource {
-                    self.check_scoped_place_source_projection(site, function, *ty, arg);
-                } else {
+                if !arg.projections.is_empty() && use_ == MutPlaceUse::ScopedPlaceSource {
+                    self.check_scoped_place_source_projection(site, function, root_ty, arg);
+                } else if !arg.projections.is_empty() {
                     self.check_place(
                         site,
                         function,
-                        &RirPlace::local(*local, arg.projections.clone(), arg.ty),
+                        &RirPlace::local(*local, arg.projections.clone()),
                     );
-                    if !self.projected_mut_place_arg_supported(*ty, &arg.projections, true) {
+                    if !Self::projected_mut_place_arg_supported(root_ty, &arg.projections, true) {
                         self.push(site, RirVerifyErrorKind::UnsupportedRValueType);
                     }
                 }
-                arg.ty
             }
-            RirMutPlaceHandle::StackCell { cell, ty } => {
+            RirMutPlaceHandle::StackCell { cell } => {
                 self.check_cell_mut_place_arg(
                     site,
                     function_id,
                     *cell,
-                    *ty,
                     RirCellStorage::StackScoped,
                 );
                 self.check_projected_cell_mut_place_root(
                     site,
                     function,
-                    *ty,
+                    root_ty,
                     &arg.projections,
-                    arg.ty,
                     use_,
                 );
-                arg.ty
             }
-            RirMutPlaceHandle::HeapCell { cell, ty } => {
-                self.check_cell_mut_place_arg(site, function_id, *cell, *ty, RirCellStorage::Heap);
+            RirMutPlaceHandle::HeapCell { cell } => {
+                self.check_cell_mut_place_arg(site, function_id, *cell, RirCellStorage::Heap);
                 self.check_projected_cell_mut_place_root(
                     site,
                     function,
-                    *ty,
+                    root_ty,
                     &arg.projections,
-                    arg.ty,
                     use_,
                 );
-                arg.ty
             }
-            RirMutPlaceHandle::ScopedPlaceCell { cell, ty } => {
-                if let Some(decl) =
-                    self.check_function_scoped_place_cell_ref(site, function_id, *cell)
-                    && decl.payload_ty != *ty
-                {
-                    self.push(
-                        site,
-                        RirVerifyErrorKind::TypeMismatch {
-                            expected: decl.payload_ty,
-                            found: *ty,
-                        },
-                    );
-                }
+            RirMutPlaceHandle::ScopedPlaceCell { cell } => {
+                self.check_function_scoped_place_cell_ref(site, function_id, *cell);
                 self.check_projected_cell_mut_place_root(
                     site,
                     function,
-                    *ty,
+                    root_ty,
                     &arg.projections,
-                    arg.ty,
                     use_,
                 );
-                arg.ty
             }
-            RirMutPlaceHandle::Global { global, ty } => {
+            RirMutPlaceHandle::Global { global } => {
                 let Some(decl) = self.check_global_id(site, *global).cloned() else {
-                    return arg.ty;
+                    return;
                 };
                 if !matches!(use_, MutPlaceUse::OwnedRead | MutPlaceUse::SliceViewRead)
                     && !self
@@ -11733,33 +10712,10 @@ impl VerifyCx<'_> {
                 {
                     self.push(site, RirVerifyErrorKind::ImmutableAssign);
                 }
-                if decl.ty != *ty {
-                    self.push(
-                        site,
-                        RirVerifyErrorKind::TypeMismatch {
-                            expected: decl.ty,
-                            found: *ty,
-                        },
-                    );
-                }
-                let Some(found) =
-                    self.check_projection_chain(site, function, *ty, &arg.projections, true)
-                else {
-                    return arg.ty;
-                };
-                if found != arg.ty {
-                    self.push(
-                        site,
-                        RirVerifyErrorKind::TypeMismatch {
-                            expected: found,
-                            found: arg.ty,
-                        },
-                    );
-                }
-                if !self.projected_mut_place_arg_supported(*ty, &arg.projections, true) {
+                self.check_projection_chain(site, function, root_ty, &arg.projections, true);
+                if !Self::projected_mut_place_arg_supported(root_ty, &arg.projections, true) {
                     self.push(site, RirVerifyErrorKind::UnsupportedRValueType);
                 }
-                arg.ty
             }
         }
     }
@@ -11769,27 +10725,22 @@ impl VerifyCx<'_> {
         site: RirVerifySite,
         function: &RirFunction,
         root_ty: RirTypeId,
-        projections: &[RirProjection],
-        final_ty: RirTypeId,
+        projections: &[RirPlaceStep],
         use_: MutPlaceUse,
     ) {
-        let Some(expected) = self.check_projection_chain(
+        self.check_projection_chain(
             site,
             function,
             root_ty,
             projections,
             use_.allow_cell_collection_projection(),
-        ) else {
-            return;
-        };
-        if expected != final_ty {
-            self.push(
-                site,
-                RirVerifyErrorKind::TypeMismatch {
-                    expected,
-                    found: final_ty,
-                },
-            );
+        );
+        if !Self::projected_mut_place_arg_supported(
+            root_ty,
+            projections,
+            use_.allow_cell_collection_projection(),
+        ) {
+            self.push(site, RirVerifyErrorKind::UnsupportedRValueType);
         }
     }
 
@@ -11798,37 +10749,212 @@ impl VerifyCx<'_> {
         site: RirVerifySite,
         function: &RirFunction,
         root_ty: RirTypeId,
-        projections: &[RirProjection],
+        projections: &[RirPlaceStep],
         allow_collections: bool,
     ) -> Option<RirTypeId> {
-        let model = RirPlaceModel::new(self.program);
         let mut ty = root_ty;
-        for projection in projections {
-            let step = match model.step(ty, *projection, allow_collections) {
-                Ok(step) => step,
-                Err(error) => {
-                    self.push_place_error(site, error);
-                    return None;
-                }
-            };
-            match step.kind {
-                RirProjectionKind::SequenceIndex { local } => {
-                    self.check_sequence_index_local(site, function, local)?;
-                }
-                RirProjectionKind::Field | RirProjectionKind::TupleField => {}
+        for step in projections {
+            if !self.check_place_step(site, function, ty, step, allow_collections) {
+                return None;
             }
-            ty = step.ty;
+            ty = step.target_ty;
         }
         Some(ty)
     }
 
-    fn push_place_error(&mut self, site: RirVerifySite, error: RirPlaceError) {
-        match error {
-            RirPlaceError::BadId => self.push(site, RirVerifyErrorKind::BadId),
-            RirPlaceError::Unsupported => {
-                self.push(site, RirVerifyErrorKind::UnsupportedRValueType);
-            }
+    fn check_place_step(
+        &mut self,
+        site: RirVerifySite,
+        function: &RirFunction,
+        current: RirTypeId,
+        step: &RirPlaceStep,
+        allow_collections: bool,
+    ) -> bool {
+        if matches!(
+            step.kind,
+            RirPlaceStepKind::StructField(_)
+                | RirPlaceStepKind::ExternField(_)
+                | RirPlaceStepKind::DataRefField(_)
+                | RirPlaceStepKind::TupleField(_)
+        ) {
+            return self.check_field_place_step(site, current, step);
         }
+        if !self.check_place_step_source(site, current, step) {
+            return false;
+        }
+        let target = match step.kind {
+            RirPlaceStepKind::ArrayIndex {
+                index,
+                len,
+                elem_materializer,
+            } => {
+                self.check_sequence_index_local(site, function, index);
+                match self.ty(current) {
+                    Some(RirType::Array {
+                        elem,
+                        len: expected,
+                    }) if len == expected
+                        && self.program.sequence_elem_materializer(current)
+                            == Some(elem_materializer) =>
+                    {
+                        Some(elem)
+                    }
+                    _ => None,
+                }
+            }
+            RirPlaceStepKind::ListIndex {
+                index,
+                elem_materializer,
+            } => {
+                self.check_sequence_index_local(site, function, index);
+                if allow_collections {
+                    match self.ty(current) {
+                        Some(RirType::List(elem))
+                            if self.program.sequence_elem_materializer(current)
+                                == Some(elem_materializer) =>
+                        {
+                            Some(elem)
+                        }
+                        _ => None,
+                    }
+                } else {
+                    None
+                }
+            }
+            RirPlaceStepKind::SliceIndex {
+                index,
+                elem_materializer,
+            } => {
+                self.check_sequence_index_local(site, function, index);
+                if allow_collections {
+                    match self.ty(current) {
+                        Some(RirType::Slice(elem))
+                            if self.program.sequence_elem_materializer(current)
+                                == Some(elem_materializer) =>
+                        {
+                            Some(elem)
+                        }
+                        _ => None,
+                    }
+                } else {
+                    None
+                }
+            }
+            RirPlaceStepKind::StructField(_)
+            | RirPlaceStepKind::ExternField(_)
+            | RirPlaceStepKind::DataRefField(_)
+            | RirPlaceStepKind::TupleField(_) => unreachable!("checked field step"),
+        };
+        self.check_place_step_target(site, step, target)
+    }
+
+    fn check_field_place_step(
+        &mut self,
+        site: RirVerifySite,
+        current: RirTypeId,
+        step: &RirPlaceStep,
+    ) -> bool {
+        if !self.check_place_step_source(site, current, step) {
+            return false;
+        }
+        let target = match step.kind {
+            RirPlaceStepKind::StructField(field) => {
+                let Some(RirType::Struct(id)) = self.ty(current) else {
+                    self.push(site, RirVerifyErrorKind::UnsupportedRValueType);
+                    return false;
+                };
+                let Some(strukt) = self.program.structs.get(id.index()) else {
+                    self.push(site, RirVerifyErrorKind::BadId);
+                    return false;
+                };
+                if strukt.role != RirStructRole::Source {
+                    self.push(site, RirVerifyErrorKind::UnsupportedRValueType);
+                    return false;
+                }
+                strukt.fields.get(field.index()).map(|field| field.ty)
+            }
+            RirPlaceStepKind::ExternField(field) => {
+                let Some(RirType::Struct(id)) = self.ty(current) else {
+                    self.push(site, RirVerifyErrorKind::UnsupportedRValueType);
+                    return false;
+                };
+                let Some(strukt) = self.program.structs.get(id.index()) else {
+                    self.push(site, RirVerifyErrorKind::BadId);
+                    return false;
+                };
+                if strukt.native.is_none() {
+                    self.push(site, RirVerifyErrorKind::UnsupportedRValueType);
+                    return false;
+                }
+                strukt.fields.get(field.index()).map(|field| field.ty)
+            }
+            RirPlaceStepKind::DataRefField(field) => {
+                let Some(RirType::DataRef(id)) = self.ty(current) else {
+                    self.push(site, RirVerifyErrorKind::UnsupportedRValueType);
+                    return false;
+                };
+                self.program
+                    .datarefs
+                    .get(id.index())
+                    .and_then(|dataref| dataref.fields.get(field.index()))
+                    .map(|field| field.ty)
+            }
+            RirPlaceStepKind::TupleField(field) => {
+                let Some(RirType::Tuple(id)) = self.ty(current) else {
+                    self.push(site, RirVerifyErrorKind::UnsupportedRValueType);
+                    return false;
+                };
+                self.program
+                    .tuples
+                    .get(id.index())
+                    .and_then(|tuple| tuple.fields.get(field.index()))
+                    .map(|field| field.ty)
+            }
+            _ => unreachable!("expected field step"),
+        };
+        self.check_place_step_target(site, step, target)
+    }
+
+    fn check_place_step_source(
+        &mut self,
+        site: RirVerifySite,
+        current: RirTypeId,
+        step: &RirPlaceStep,
+    ) -> bool {
+        if step.source_ty == current {
+            return true;
+        }
+        self.push(
+            site,
+            RirVerifyErrorKind::TypeMismatch {
+                expected: current,
+                found: step.source_ty,
+            },
+        );
+        false
+    }
+
+    fn check_place_step_target(
+        &mut self,
+        site: RirVerifySite,
+        step: &RirPlaceStep,
+        target: Option<RirTypeId>,
+    ) -> bool {
+        let Some(target) = target else {
+            self.push(site, RirVerifyErrorKind::UnsupportedRValueType);
+            return false;
+        };
+        if target != step.target_ty {
+            self.push(
+                site,
+                RirVerifyErrorKind::TypeMismatch {
+                    expected: target,
+                    found: step.target_ty,
+                },
+            );
+            return false;
+        }
+        true
     }
 
     fn check_sequence_index_local(
@@ -11880,21 +11006,8 @@ impl VerifyCx<'_> {
         root_ty: RirTypeId,
         arg: &RirMutPlaceArg,
     ) {
-        let Some(found) =
-            self.check_projection_chain(site, function, root_ty, &arg.projections, true)
-        else {
-            return;
-        };
-        if found != arg.ty {
-            self.push(
-                site,
-                RirVerifyErrorKind::TypeMismatch {
-                    expected: found,
-                    found: arg.ty,
-                },
-            );
-        }
-        if !self.projected_mut_place_arg_supported(root_ty, &arg.projections, true) {
+        self.check_projection_chain(site, function, root_ty, &arg.projections, true);
+        if !Self::projected_mut_place_arg_supported(root_ty, &arg.projections, true) {
             self.push(site, RirVerifyErrorKind::UnsupportedRValueType);
         }
     }
@@ -11904,22 +11017,11 @@ impl VerifyCx<'_> {
         site: RirVerifySite,
         function_id: RirFunctionId,
         cell: RirCellRef,
-        ty: RirTypeId,
         storage: RirCellStorage,
     ) {
-        self.check_type_id(site, ty);
         if let Some(decl) = self.check_function_cell_ref(site, function_id, cell) {
             if decl.storage != storage {
                 self.push(site, RirVerifyErrorKind::CallArgMode);
-            }
-            if decl.payload_ty != ty {
-                self.push(
-                    site,
-                    RirVerifyErrorKind::TypeMismatch {
-                        expected: decl.payload_ty,
-                        found: ty,
-                    },
-                );
             }
             if !self.cell_initialized(decl.id) {
                 self.push(site, RirVerifyErrorKind::UninitializedCell(decl.id));
@@ -12013,20 +11115,8 @@ impl VerifyCx<'_> {
         }
     }
 
-    fn check_abi(
-        &mut self,
-        site: RirVerifySite,
-        ty: RirTypeId,
-        semantic: RirParamSemantic,
-        abi: RirParamAbi,
-    ) {
-        if self.ty(ty).is_none() {
-            self.push(site, RirVerifyErrorKind::UnsupportedAbi);
-            return;
-        }
-        let policy = RirRustRepPolicy::new(self.program);
-        let supported = policy.supports_param(ty, semantic) && abi == policy.param_abi(semantic);
-        if !supported {
+    fn check_pass_mode(&mut self, site: RirVerifySite, ty: RirTypeId, mode: RirPassMode) {
+        if self.ty(ty).is_none() || !RirRustRepPolicy::new(self.program).supports_param(ty, mode) {
             self.push(site, RirVerifyErrorKind::UnsupportedAbi);
         }
     }
@@ -12163,7 +11253,7 @@ impl VerifyCx<'_> {
         }
     }
 
-    fn format_ok(&self, source_ty: RirTypeId, spec: RirFormatSpec) -> bool {
+    fn format_ok(&self, source_ty: RirTypeId, spec: FormatSpec) -> bool {
         if self.scalar(source_ty).is_none() {
             return false;
         }
@@ -12171,12 +11261,10 @@ impl VerifyCx<'_> {
             .ty(source_ty)
             .expect("scalar type id has RIR type data");
         match spec.kind {
-            RirFormatKind::Hex | RirFormatKind::HexUpper | RirFormatKind::Binary
-                if ty != RirType::Int =>
-            {
+            FormatKind::Hex | FormatKind::HexUpper | FormatKind::Binary if ty != RirType::Int => {
                 return false;
             }
-            RirFormatKind::Exp | RirFormatKind::ExpUpper if ty != RirType::Float => {
+            FormatKind::Exp | FormatKind::ExpUpper if ty != RirType::Float => {
                 return false;
             }
             _ => {}
@@ -12184,7 +11272,7 @@ impl VerifyCx<'_> {
         if spec.precision.is_some() && !matches!(ty, RirType::Float | RirType::String) {
             return false;
         }
-        if spec.sign == RirFormatSign::Always && !matches!(ty, RirType::Int | RirType::Float) {
+        if spec.sign == FormatSign::Always && !matches!(ty, RirType::Int | RirType::Float) {
             return false;
         }
         true
@@ -12199,7 +11287,7 @@ impl VerifyCx<'_> {
         match operand {
             RirOperand::Place(place) => {
                 self.check_place(site, function, place);
-                Some(place.ty)
+                self.program.place_ty(function, place)
             }
             RirOperand::Const(id) => {
                 self.check_const_id(site, *id);
@@ -12316,41 +11404,139 @@ impl VerifyCx<'_> {
         site: RirVerifySite,
         function: &RirFunction,
         object: &RirOperand,
-        dataref_id: RirDataRefId,
-        projections: &[RirProjection],
+        place: RirDataRefPlaceId,
+        suffix: &[RirPlaceStep],
         mode: StorageProjectionMode,
     ) -> Option<RirTypeId> {
+        let Some((dataref, storage_ty, has_extern)) = self
+            .program
+            .dataref_places
+            .get(place.index())
+            .and_then(|descriptor| {
+                descriptor.storage.last().map(|step| {
+                    (
+                        descriptor.dataref,
+                        step.target_ty,
+                        descriptor
+                            .storage
+                            .iter()
+                            .any(|step| matches!(step.kind, RirPlaceStepKind::ExternField(_))),
+                    )
+                })
+            })
+        else {
+            self.push(site, RirVerifyErrorKind::BadId);
+            return None;
+        };
         let object_ty = self.value_operand_ty(site, function, object);
         self.check_short_region_operand(site, function, object);
-        if object_ty.and_then(|ty| self.ty(ty)) != Some(RirType::DataRef(dataref_id)) {
+        if object_ty.and_then(|ty| self.ty(ty)) != Some(RirType::DataRef(dataref)) {
             self.push(site, RirVerifyErrorKind::UnsupportedRValueType);
         }
-        self.check_dataref_id(site, dataref_id);
-        let model = RirPlaceModel::new(self.program);
-        let (path, consumed) = match model.dataref_storage_prefix(dataref_id, projections) {
-            Ok(path) => path,
-            Err(error) => {
-                self.push_place_error(site, error);
-                return None;
-            }
-        };
-        if !model.dataref_mut_place_payload_supported(path.ty()) {
+        if mode == StorageProjectionMode::MutPlace && has_extern {
             self.push(site, RirVerifyErrorKind::UnsupportedRValueType);
-            return None;
         }
-        let suffix = &projections[consumed..];
-        let found = self.check_projection_chain(site, function, path.ty(), suffix, true)?;
+        if suffix.first().is_some_and(|step| {
+            matches!(
+                step.kind,
+                RirPlaceStepKind::StructField(_)
+                    | RirPlaceStepKind::ExternField(_)
+                    | RirPlaceStepKind::TupleField(_)
+            )
+        }) || suffix
+            .iter()
+            .any(|step| matches!(step.kind, RirPlaceStepKind::DataRefField(_)))
+        {
+            self.push(site, RirVerifyErrorKind::UnsupportedRValueType);
+        }
+        let found = self.check_projection_chain(site, function, storage_ty, suffix, true)?;
         if mode == StorageProjectionMode::MutPlace
             && !suffix.is_empty()
-            && !self.projected_mut_place_arg_supported(path.ty(), suffix, true)
+            && !Self::projected_mut_place_arg_supported(storage_ty, suffix, true)
         {
             self.push(site, RirVerifyErrorKind::UnsupportedRValueType);
         }
         Some(found)
     }
 
+    fn check_dataref_places(&mut self) {
+        for index in 0..self.program.dataref_places.len() {
+            let site = RirVerifySite::Program;
+            let (dataref, materializer, storage_len) = {
+                let descriptor = &self.program.dataref_places[index];
+                (
+                    descriptor.dataref,
+                    descriptor.materializer,
+                    descriptor.storage.len(),
+                )
+            };
+            if self.program.dataref_places[..index].iter().any(|other| {
+                other.dataref == dataref
+                    && other.materializer == materializer
+                    && other.storage == self.program.dataref_places[index].storage
+            }) {
+                self.push(site, RirVerifyErrorKind::BadId);
+            }
+            self.check_dataref_id(site, dataref);
+            let Some(mut ty) = self.type_id(RirType::DataRef(dataref)) else {
+                self.push(site, RirVerifyErrorKind::BadId);
+                continue;
+            };
+            let Some(first) = self.program.dataref_places[index].storage.first().copied() else {
+                self.push(site, RirVerifyErrorKind::UnsupportedRValueType);
+                continue;
+            };
+            if !matches!(first.kind, RirPlaceStepKind::DataRefField(_)) {
+                self.push(site, RirVerifyErrorKind::UnsupportedRValueType);
+                continue;
+            }
+            if !self.check_field_place_step(site, ty, &first) {
+                continue;
+            }
+            ty = first.target_ty;
+            let mut valid = true;
+            for storage_index in 1..storage_len {
+                let step = self.program.dataref_places[index].storage[storage_index];
+                if !matches!(
+                    step.kind,
+                    RirPlaceStepKind::StructField(_)
+                        | RirPlaceStepKind::ExternField(_)
+                        | RirPlaceStepKind::TupleField(_)
+                ) {
+                    self.push(site, RirVerifyErrorKind::UnsupportedRValueType);
+                    valid = false;
+                    break;
+                }
+                if !self.check_field_place_step(site, ty, &step) {
+                    valid = false;
+                    break;
+                }
+                ty = step.target_ty;
+            }
+            if !valid {
+                continue;
+            }
+            let exact_materializer = self
+                .program
+                .materializers
+                .get(materializer.index())
+                .is_some_and(|entry| {
+                    entry.id == materializer
+                        && entry.ty == ty
+                        && entry.position
+                            == RustRecipePosition::StoredPayload(
+                                LambdaStorageFamily::DataRefProjection,
+                            )
+                });
+            if !exact_materializer
+                || matches!(self.ty(ty), None | Some(RirType::Void | RirType::Slice(_)))
+            {
+                self.push(site, RirVerifyErrorKind::UnsupportedRValueType);
+            }
+        }
+    }
+
     fn check_place(&mut self, site: RirVerifySite, function: &RirFunction, place: &RirPlace) {
-        self.check_type_id(site, place.ty);
         let current = match place.root {
             RirPlaceRoot::Local(local) => {
                 self.check_local_id(site, function, local);
@@ -12359,7 +11545,7 @@ impl VerifyCx<'_> {
                     .iter()
                     .any(|(reborrowed, _)| *reborrowed == local)
                 {
-                    self.push(site, RirVerifyErrorKind::InvalidDynOrigin);
+                    self.push(site, RirVerifyErrorKind::InvalidDynPlan);
                 }
                 let current = match function.locals.get(local.index()) {
                     Some(local) => local.ty,
@@ -12375,7 +11561,7 @@ impl VerifyCx<'_> {
                 }
                 if Self::function_local_is_mut_place_param(function, local)
                     && !place.projections.is_empty()
-                    && !self.projected_mut_place_arg_supported(current, &place.projections, true)
+                    && !Self::projected_mut_place_arg_supported(current, &place.projections, true)
                 {
                     self.push(site, RirVerifyErrorKind::UnsupportedRValueType);
                     return;
@@ -12398,20 +11584,7 @@ impl VerifyCx<'_> {
                 global_ty
             }
         };
-        let Some(current) =
-            self.check_projection_chain(site, function, current, &place.projections, true)
-        else {
-            return;
-        };
-        if current != place.ty {
-            self.push(
-                site,
-                RirVerifyErrorKind::TypeMismatch {
-                    expected: current,
-                    found: place.ty,
-                },
-            );
-        }
+        self.check_projection_chain(site, function, current, &place.projections, true);
     }
 
     fn ty(&self, id: RirTypeId) -> Option<RirType> {
@@ -12595,8 +11768,8 @@ impl VerifyCx<'_> {
 
     fn function_local_is_hidden_cell_param(function: &RirFunction, local: RirLocalId) -> bool {
         matches!(
-            Self::function_local_param_abi(function, local),
-            Some(RirParamAbi::StackCell | RirParamAbi::HeapCell | RirParamAbi::ScopedPlaceCell)
+            Self::function_local_pass_mode(function, local),
+            Some(RirPassMode::StackCell | RirPassMode::HeapCell | RirPassMode::ScopedPlaceCell)
         )
     }
 
@@ -12614,7 +11787,7 @@ impl VerifyCx<'_> {
                     }
                     RirScopedPlaceSource::PatternAlias { place } => matches!(
                         place.access,
-                        RirMutPlaceAccess::Handle(RirMutPlaceHandle::Param { local: found, .. })
+                        RirMutPlaceAccess::Handle(RirMutPlaceHandle::Param { local: found })
                             if found == local
                     ),
                     RirScopedPlaceSource::ForRefAlias { .. } => false,
@@ -12623,7 +11796,7 @@ impl VerifyCx<'_> {
     }
 
     fn function_local_is_mut_place_param(function: &RirFunction, local: RirLocalId) -> bool {
-        Self::function_local_param_abi(function, local) == Some(RirParamAbi::MutPlace)
+        Self::function_local_pass_mode(function, local) == Some(RirPassMode::MutPlace)
     }
 
     fn place_is_mut_place_param_root(function: &RirFunction, place: &RirPlace) -> bool {
@@ -12633,25 +11806,47 @@ impl VerifyCx<'_> {
         place.projections.is_empty() && Self::function_local_is_mut_place_param(function, local)
     }
 
-    fn projected_mut_place_arg_supported(
-        &self,
-        root_ty: RirTypeId,
-        projections: &[RirProjection],
-        allow_collections: bool,
-    ) -> bool {
-        RirPlaceModel::new(self.program).mut_place_supported(
-            root_ty,
-            projections,
-            allow_collections,
-        )
+    fn assignment_projection_supported(projections: &[RirPlaceStep]) -> bool {
+        projections
+            .iter()
+            .all(|step| !matches!(step.kind, RirPlaceStepKind::DataRefField(_)))
     }
 
-    fn function_local_param_abi(function: &RirFunction, local: RirLocalId) -> Option<RirParamAbi> {
+    fn projected_mut_place_arg_supported(
+        root_ty: RirTypeId,
+        projections: &[RirPlaceStep],
+        allow_collections: bool,
+    ) -> bool {
+        let mut ty = root_ty;
+        let mut slice_dynamic = false;
+        for step in projections {
+            if step.source_ty != ty {
+                return false;
+            }
+            let supported = match step.kind {
+                RirPlaceStepKind::StructField(_)
+                | RirPlaceStepKind::TupleField(_)
+                | RirPlaceStepKind::ArrayIndex { .. } => true,
+                RirPlaceStepKind::ExternField(_) | RirPlaceStepKind::DataRefField(_) => false,
+                RirPlaceStepKind::ListIndex { .. } => allow_collections && !slice_dynamic,
+                RirPlaceStepKind::SliceIndex { .. } => allow_collections,
+            };
+            if !supported {
+                return false;
+            }
+            slice_dynamic |= matches!(step.kind, RirPlaceStepKind::SliceIndex { .. });
+            ty = step.target_ty;
+        }
+        true
+    }
+
+    fn function_local_pass_mode(function: &RirFunction, local: RirLocalId) -> Option<RirPassMode> {
         function
-            .params
-            .iter()
-            .find(|param| param.local == local)
-            .map(|param| param.abi)
+            .locals
+            .get(local.index())?
+            .binding
+            .parameter()
+            .map(|(mode, _)| mode)
     }
 
     fn function_has_cell_capture(
@@ -12667,34 +11862,32 @@ impl VerifyCx<'_> {
             .params
             .iter()
             .enumerate()
-            .find(|(_, param)| param.local == local)
+            .find(|(_, param)| **param == local)
         else {
             return false;
         };
         self.function_param_maps_cell(function.id, param_index, cell)
     }
 
-    fn param_uses_cell_mode(param: RirParam, storage: RirCellStorage) -> bool {
-        let (semantic, abi) = Self::cell_capture_modes(storage);
-        param.semantic == semantic || param.abi == abi
-    }
-
     fn function_param_is_cell_capture(
         &self,
         function: RirFunctionId,
         param_index: usize,
-        param: RirParam,
+        param: RirLocalId,
         storage: RirCellStorage,
     ) -> bool {
-        let (semantic, abi) = Self::cell_capture_modes(storage);
-        param.semantic == semantic
-            && param.abi == abi
-            && param.escape == RirParamEscape::NonEscaping
+        let Some((ty, param_mode, escape)) =
+            self.program.functions[function.index()].parameter_data(param)
+        else {
+            return false;
+        };
+        let mode = Self::cell_capture_mode(storage);
+        param_mode == mode
+            && escape == RirParamEscape::NonEscaping
             && self.function_lambdas_match(function, |lambda| {
                 matches!(lambda.captures.get(param_index), Some(capture)
-                    if capture.ty == param.ty
-                        && capture.semantic == semantic
-                        && capture.abi == abi
+                    if capture.ty == ty
+                        && capture.mode == mode
                         && Self::lambda_capture_kind_cell(capture.kind, storage).is_some())
             })
     }
@@ -12744,7 +11937,7 @@ impl VerifyCx<'_> {
             .params
             .iter()
             .enumerate()
-            .find(|(_, param)| param.local == local)
+            .find(|(_, param)| **param == local)
         else {
             return false;
         };
@@ -12755,11 +11948,15 @@ impl VerifyCx<'_> {
         &self,
         function: RirFunctionId,
         param_index: usize,
-        param: RirParam,
+        param: RirLocalId,
     ) -> bool {
-        param.semantic == RirParamSemantic::ScopedPlaceCell
-            && param.abi == RirParamAbi::ScopedPlaceCell
-            && param.escape == RirParamEscape::NonEscaping
+        let Some((param_ty, mode, escape)) =
+            self.program.functions[function.index()].parameter_data(param)
+        else {
+            return false;
+        };
+        mode == RirPassMode::ScopedPlaceCell
+            && escape == RirParamEscape::NonEscaping
             && self
                 .program
                 .lambdas
@@ -12770,10 +11967,9 @@ impl VerifyCx<'_> {
                         lambda.captures.get(param_index),
                         Some(RirLambdaCapture {
                             ty,
-                            semantic: RirParamSemantic::ScopedPlaceCell,
-                            abi: RirParamAbi::ScopedPlaceCell,
+                            mode: RirPassMode::ScopedPlaceCell,
                             kind: RirLambdaCaptureKind::ScopedPlaceCell { .. },
-                        }) if *ty == param.ty
+                        }) if *ty == param_ty
                     )
                 })
             && self
@@ -12810,69 +12006,7 @@ impl VerifyCx<'_> {
     }
 
     fn copyable_type(&self, ty: RirTypeId) -> bool {
-        match self.ty(ty) {
-            Some(RirType::Struct(id)) if self.program.structs.get(id.index()).is_some() => {
-                RirRustRepPolicy::new(self.program).copyable(ty)
-                    && self.inherently_copyable_type(ty)
-            }
-            Some(RirType::Enum(id)) if self.program.enums.get(id.index()).is_some() => {
-                RirRustRepPolicy::new(self.program).copyable(ty)
-                    && self.inherently_copyable_type(ty)
-            }
-            Some(RirType::Tuple(id)) if self.program.tuples.get(id.index()).is_some() => {
-                RirRustRepPolicy::new(self.program).copyable(ty)
-                    && self.inherently_copyable_type(ty)
-            }
-            Some(RirType::Array { .. }) => self.inherently_copyable_type(ty),
-            Some(_) => RirRustRepPolicy::new(self.program).copyable(ty),
-            None => false,
-        }
-    }
-
-    fn inherently_copyable_type(&self, ty: RirTypeId) -> bool {
-        match self.ty(ty) {
-            Some(
-                RirType::Int
-                | RirType::Float
-                | RirType::Bool
-                | RirType::Char
-                | RirType::Void
-                | RirType::Flag(_),
-            ) => true,
-            Some(RirType::Struct(id)) => {
-                self.program.structs.get(id.index()).is_some_and(|strukt| {
-                    strukt
-                        .fields
-                        .iter()
-                        .all(|field| self.inherently_copyable_type(field.ty))
-                })
-            }
-            Some(RirType::Enum(id)) => self.program.enums.get(id.index()).is_some_and(|enm| {
-                enm.variants.iter().all(|variant| {
-                    variant
-                        .fields
-                        .iter()
-                        .all(|field| self.inherently_copyable_type(field.ty))
-                })
-            }),
-            Some(RirType::Tuple(id)) => self.program.tuples.get(id.index()).is_some_and(|tuple| {
-                tuple
-                    .fields
-                    .iter()
-                    .all(|field| self.inherently_copyable_type(field.ty))
-            }),
-            Some(RirType::Array { elem, .. }) => self.inherently_copyable_type(elem),
-            Some(RirType::Option(inner)) => self.inherently_copyable_type(inner),
-            Some(
-                RirType::DataRef(_)
-                | RirType::List(_)
-                | RirType::Map { .. }
-                | RirType::Slice(_)
-                | RirType::Lambda(_)
-                | RirType::String,
-            )
-            | None => false,
-        }
+        RirRustRepPolicy::new(self.program).copyable(ty)
     }
 
     fn string_ty(&self) -> Option<RirTypeId> {
@@ -12945,19 +12079,19 @@ impl VerifyCx<'_> {
     }
 }
 
-pub fn source_param_semantic(
+pub fn source_pass_mode(
     program: &air::Program,
     ty: air::TypeId,
     mode: air::ParamMode,
-) -> RirParamSemantic {
+) -> RirPassMode {
     match mode {
-        air::ParamMode::Value => RirParamSemantic::Value,
-        air::ParamMode::SharedBorrow => RirParamSemantic::SharedBorrow,
+        air::ParamMode::Value => RirPassMode::Value,
+        air::ParamMode::SharedBorrow => RirPassMode::SharedBorrow,
         air::ParamMode::MutBorrow
             if matches!(program.type_arena.data(ty), air::TypeData::Dyn(_)) =>
         {
-            RirParamSemantic::DynBorrow
+            RirPassMode::DynBorrow
         }
-        air::ParamMode::MutBorrow => RirParamSemantic::MutPlace,
+        air::ParamMode::MutBorrow => RirPassMode::MutPlace,
     }
 }

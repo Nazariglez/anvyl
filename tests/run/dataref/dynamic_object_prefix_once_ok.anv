@@ -1,0 +1,22 @@
+// @mode: run
+// @expect: success
+// @match-begin
+// 2
+// 1
+// @match-end
+
+dataref Node {
+    value: int,
+}
+
+fn pick(ref calls: int) -> int {
+    calls += 1;
+    1
+}
+
+fn main() {
+    var calls = 0;
+    let nodes = [Node { value: 1 }, Node { value: 2 }];
+    println(nodes[pick(calls)].value);
+    println(calls);
+}

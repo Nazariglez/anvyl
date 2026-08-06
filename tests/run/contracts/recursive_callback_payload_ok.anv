@@ -1,0 +1,27 @@
+// @mode: run
+// @expect: success
+// @match: 3
+
+contract Score {
+    fn score(self) -> int;
+}
+
+struct Leaf {
+    fn score(self) -> int { 1 }
+}
+
+struct Node {
+    next: (dyn Score)?,
+    callback: fn() -> int,
+
+    fn score(self) -> int { invoke(self.callback) + 1 }
+}
+
+fn invoke(callback: fn() -> int) -> int { callback() }
+
+fn two() -> int { 2 }
+
+fn main() {
+    let node: dyn Score = Node { next: Leaf {}, callback: two };
+    println(node.score());
+}

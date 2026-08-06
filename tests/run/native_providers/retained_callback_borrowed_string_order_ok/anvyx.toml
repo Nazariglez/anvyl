@@ -1,0 +1,6 @@
+[project]
+name = "retained_callback_borrowed_string_order"
+entry = "src/main.anv"
+
+[dependencies]
+host = { path = "provider" }

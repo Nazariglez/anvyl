@@ -1,0 +1,21 @@
+// @mode: run
+// @expect: success
+// @match: 2
+
+contract Sized {
+    fn size(self) -> int;
+}
+
+struct Pair {
+    first: string,
+    second: string,
+
+    fn size(self) -> int {
+        self.first.len() + self.second.len()
+    }
+}
+
+fn main() {
+    let value: dyn Sized = Pair { first: "a", second: "b" };
+    println(value.size());
+}

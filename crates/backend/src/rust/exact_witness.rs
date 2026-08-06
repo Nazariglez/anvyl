@@ -1,6 +1,6 @@
 use super::rir::{
-    RirDynCarrierId, RirDynReceiver, RirDynVariantId, RirOperand, RirPlace, RirPlaceRoot,
-    RirProgram, RirRValue, RirStmt, RirStructuredBlock, stmt_child_blocks_any,
+    RirDynCarrierId, RirDynReceiver, RirDynVariantId, RirDynWeakening, RirOperand, RirPlace,
+    RirPlaceRoot, RirProgram, RirRValue, RirStmt, RirStructuredBlock, stmt_child_blocks_any,
 };
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -10,9 +10,14 @@ struct ExactWitness {
 }
 
 pub(super) fn propagate(program: &mut RirProgram) {
-    for function in &mut program.functions {
+    let (functions, weakenings, dispatches) = (
+        &mut program.functions,
+        &program.dyn_weakenings,
+        &program.dyn_dispatches,
+    );
+    for function in functions {
         let mut state = vec![None; function.locals.len()];
-        visit_block(&mut function.body, &mut state);
+        visit_block(&mut function.body, &mut state, weakenings, dispatches);
     }
 }
 
@@ -113,17 +118,27 @@ fn clear_block(block: &mut RirStructuredBlock) {
     }
 }
 
-fn visit_block(block: &mut RirStructuredBlock, state: &mut [Option<ExactWitness>]) {
+fn visit_block(
+    block: &mut RirStructuredBlock,
+    state: &mut [Option<ExactWitness>],
+    weakenings: &[RirDynWeakening],
+    dispatches: &[super::rir::RirDynDispatch],
+) {
     for stmt in &mut block.stmts {
-        visit_stmt(stmt, state);
+        visit_stmt(stmt, state, weakenings, dispatches);
     }
 }
 
-fn visit_stmt(stmt: &mut RirStmt, state: &mut [Option<ExactWitness>]) {
+fn visit_stmt(
+    stmt: &mut RirStmt,
+    state: &mut [Option<ExactWitness>],
+    weakenings: &[RirDynWeakening],
+    dispatches: &[super::rir::RirDynDispatch],
+) {
     match stmt {
         RirStmt::Init { local, value } => {
-            visit_rvalue(value, state);
-            let exact = rvalue_exact(value, state);
+            visit_rvalue(value, state, dispatches);
+            let exact = rvalue_exact(value, state, weakenings);
             for source in transferred_locals(value) {
                 if source != *local {
                     state[source.index()] = None;
@@ -133,8 +148,8 @@ fn visit_stmt(stmt: &mut RirStmt, state: &mut [Option<ExactWitness>]) {
             invalidate_after_call(value, state);
         }
         RirStmt::Assign { dst, value } => {
-            visit_rvalue(value, state);
-            let exact = rvalue_exact(value, state);
+            visit_rvalue(value, state, dispatches);
+            let exact = rvalue_exact(value, state, weakenings);
             let destination = direct_local(dst);
             for source in transferred_locals(value) {
                 if Some(source) != destination {
@@ -149,37 +164,37 @@ fn visit_stmt(stmt: &mut RirStmt, state: &mut [Option<ExactWitness>]) {
             invalidate_after_call(value, state);
         }
         RirStmt::Eval(value) => {
-            visit_rvalue(value, state);
+            visit_rvalue(value, state, dispatches);
             for source in transferred_locals(value) {
                 state[source.index()] = None;
             }
             invalidate_after_call(value, state);
         }
         RirStmt::If(branch) => {
-            visit_nested(&mut branch.then_block, state);
+            visit_nested(&mut branch.then_block, state, weakenings, dispatches);
             if let Some(block) = &mut branch.else_block {
-                visit_nested(block, state);
+                visit_nested(block, state, weakenings, dispatches);
             }
             state.fill(None);
         }
         RirStmt::Loop(loop_) => {
-            visit_loop(&mut loop_.body, state.len());
+            visit_loop(&mut loop_.body, state.len(), weakenings, dispatches);
             state.fill(None);
         }
         RirStmt::RangeFor(range) => {
-            visit_loop(&mut range.body, state.len());
+            visit_loop(&mut range.body, state.len(), weakenings, dispatches);
             state.fill(None);
         }
         RirStmt::CollectionFor(for_) => {
-            visit_loop(&mut for_.body, state.len());
+            visit_loop(&mut for_.body, state.len(), weakenings, dispatches);
             state.fill(None);
         }
         RirStmt::CollectionLoanScope(scope) => {
-            visit_nested(&mut scope.body, state);
+            visit_nested(&mut scope.body, state, weakenings, dispatches);
             state.fill(None);
         }
         RirStmt::CollectionSlotScope(block) => {
-            visit_nested(block, state);
+            visit_nested(block, state, weakenings, dispatches);
             state.fill(None);
         }
         RirStmt::PatternMatch(match_) => {
@@ -195,7 +210,7 @@ fn visit_stmt(stmt: &mut RirStmt, state: &mut [Option<ExactWitness>]) {
                         }
                     }
                 }
-                visit_block(&mut arm.block, &mut nested);
+                visit_block(&mut arm.block, &mut nested, weakenings, dispatches);
             }
             state.fill(None);
         }
@@ -206,23 +221,23 @@ fn visit_stmt(stmt: &mut RirStmt, state: &mut [Option<ExactWitness>]) {
                 | super::rir::RirDynMatchSource::Borrowed(_) => None,
             };
             for arm in &mut match_.arms {
-                visit_nested(&mut arm.block, state);
+                visit_nested(&mut arm.block, state, weakenings, dispatches);
             }
             let mut fallback = state.to_vec();
             if let (Some(exact), Some(local)) = (exact, match_.fallback_binding.local()) {
                 fallback[local.index()] = Some(exact);
             }
-            visit_block(&mut match_.fallback, &mut fallback);
+            visit_block(&mut match_.fallback, &mut fallback, weakenings, dispatches);
             state.fill(None);
         }
         RirStmt::OptionMatch(match_) => {
-            visit_nested(&mut match_.some_block, state);
-            visit_nested(&mut match_.none_block, state);
+            visit_nested(&mut match_.some_block, state, weakenings, dispatches);
+            visit_nested(&mut match_.none_block, state, weakenings, dispatches);
             state.fill(None);
         }
         RirStmt::MapEntryMatch(match_) => {
-            visit_nested(&mut match_.some_block, state);
-            visit_nested(&mut match_.none_block, state);
+            visit_nested(&mut match_.some_block, state, weakenings, dispatches);
+            visit_nested(&mut match_.none_block, state, weakenings, dispatches);
             state.fill(None);
         }
         RirStmt::GlobalSetRoot { value, .. }
@@ -232,7 +247,7 @@ fn visit_stmt(stmt: &mut RirStmt, state: &mut [Option<ExactWitness>]) {
         | RirStmt::CellSet { value, .. }
         | RirStmt::ScopedPlaceCellSet { value, .. }
         | RirStmt::DataRefSet { value, .. } => {
-            visit_rvalue(value, state);
+            visit_rvalue(value, state, dispatches);
             state.fill(None);
         }
         RirStmt::GlobalEnsure { .. }
@@ -242,19 +257,33 @@ fn visit_stmt(stmt: &mut RirStmt, state: &mut [Option<ExactWitness>]) {
     }
 }
 
-fn visit_nested(block: &mut RirStructuredBlock, state: &[Option<ExactWitness>]) {
+fn visit_nested(
+    block: &mut RirStructuredBlock,
+    state: &[Option<ExactWitness>],
+    weakenings: &[RirDynWeakening],
+    dispatches: &[super::rir::RirDynDispatch],
+) {
     let mut nested = state.to_vec();
-    visit_block(block, &mut nested);
+    visit_block(block, &mut nested, weakenings, dispatches);
 }
 
-fn visit_loop(block: &mut RirStructuredBlock, locals: usize) {
+fn visit_loop(
+    block: &mut RirStructuredBlock,
+    locals: usize,
+    weakenings: &[RirDynWeakening],
+    dispatches: &[super::rir::RirDynDispatch],
+) {
     let mut state = vec![None; locals];
-    visit_block(block, &mut state);
+    visit_block(block, &mut state, weakenings, dispatches);
 }
 
-fn visit_rvalue(value: &mut RirRValue, state: &[Option<ExactWitness>]) {
+fn visit_rvalue(
+    value: &mut RirRValue,
+    state: &[Option<ExactWitness>],
+    dispatches: &[super::rir::RirDynDispatch],
+) {
     let RirRValue::DynCall {
-        carrier,
+        dispatch,
         exact_variant,
         receiver: RirDynReceiver::Owned(value),
         ..
@@ -262,32 +291,36 @@ fn visit_rvalue(value: &mut RirRValue, state: &[Option<ExactWitness>]) {
     else {
         return;
     };
-    *exact_variant = owned_exact(value, state)
-        .filter(|exact| exact.carrier == *carrier)
-        .map(|exact| exact.variant);
+    let Some(exact) = owned_exact(value, state) else {
+        return;
+    };
+    let Some(dispatch) = dispatches.get(dispatch.index()) else {
+        return;
+    };
+    *exact_variant = (exact.carrier == dispatch.carrier).then_some(exact.variant);
 }
 
-fn rvalue_exact(value: &RirRValue, state: &[Option<ExactWitness>]) -> Option<ExactWitness> {
+fn rvalue_exact(
+    value: &RirRValue,
+    state: &[Option<ExactWitness>],
+    weakenings: &[RirDynWeakening],
+) -> Option<ExactWitness> {
     match value {
-        RirRValue::DynPack {
-            carrier, variant, ..
-        } => Some(ExactWitness {
-            carrier: *carrier,
+        RirRValue::DynPack { variant, .. } => Some(ExactWitness {
+            carrier: variant.carrier(),
             variant: *variant,
         }),
         RirRValue::Use(value) => operand_exact(value, state),
         RirRValue::Materialize(owned) => owned_exact(owned, state),
         RirRValue::DynWeaken {
-            target,
-            value,
-            arms,
-            ..
+            weakening, value, ..
         } => {
             let source = owned_exact(value, state)?;
-            arms.iter()
-                .find(|arm| arm.source == source.variant)
+            let weakening = weakenings.get(weakening.index())?;
+            (weakening.source == source.carrier)
+                .then(|| weakening.arms.get(source.variant.index()))?
                 .map(|arm| ExactWitness {
-                    carrier: *target,
+                    carrier: weakening.target,
                     variant: arm.target,
                 })
         }
@@ -341,75 +374,5 @@ fn transferred_locals(value: &RirRValue) -> Vec<super::rir::RirLocalId> {
 fn invalidate_after_call(value: &RirRValue, state: &mut [Option<ExactWitness>]) {
     if matches!(value, RirRValue::Call { .. } | RirRValue::DynCall { .. }) {
         state.fill(None);
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use anvyx_frontend::air;
-
-    use super::*;
-    use crate::rust::rir::{
-        RirLocalId, RirLoop, RirLoopId, RirMaterializerId, RirOwnedOperand, RirOwnedSource,
-        RirOwnedValue, RirRValue, RirTerm, RirTypeId,
-    };
-
-    fn local(id: usize, ty: RirTypeId) -> RirOperand {
-        RirOperand::Place(RirPlace::local(RirLocalId::from_index(id), vec![], ty))
-    }
-
-    fn owned(value: RirOperand) -> RirOwnedValue {
-        RirOwnedValue {
-            value: RirOwnedOperand::Value(value),
-            source: RirOwnedSource::Reuse(RirMaterializerId::from_index(0)),
-        }
-    }
-
-    fn call(value: RirOperand, carrier: RirDynCarrierId, ty: RirTypeId) -> RirRValue {
-        RirRValue::DynCall {
-            carrier,
-            air_slot: air::ContractSlotId::from_index(0),
-            exact_variant: None,
-            receiver: RirDynReceiver::Owned(owned(value)),
-            args: vec![],
-            arms: vec![],
-            ty,
-        }
-    }
-
-    #[test]
-    fn loop_does_not_inherit_exact_witness() {
-        let ty = RirTypeId::from_index(0);
-        let carrier = RirDynCarrierId::from_index(0);
-        let mut block = RirStructuredBlock {
-            stmts: vec![
-                RirStmt::Init {
-                    local: RirLocalId::from_index(0),
-                    value: RirRValue::DynPack {
-                        carrier,
-                        variant: RirDynVariantId::from_index(0),
-                        air_witness: air::ContractWitnessId::from_index(0),
-                        value: owned(local(1, ty)),
-                        ty,
-                    },
-                },
-                RirStmt::Loop(RirLoop {
-                    id: RirLoopId::from_index(0),
-                    body: RirStructuredBlock {
-                        stmts: vec![RirStmt::Eval(call(local(0, ty), carrier, ty))],
-                        term: RirTerm::Continue(RirLoopId::from_index(0)),
-                    },
-                }),
-            ],
-            term: RirTerm::Unreachable,
-        };
-        visit_block(&mut block, &mut [None; 2]);
-        let RirStmt::Loop(loop_) = &block.stmts[1] else {
-            panic!("expected loop");
-        };
-        let RirStmt::Eval(RirRValue::DynCall { exact_variant, .. }) = &loop_.body.stmts[0] else {
-            panic!("expected dynamic call");
-        };
-        assert_eq!(*exact_variant, None);
     }
 }

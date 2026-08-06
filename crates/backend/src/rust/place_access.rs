@@ -1,16 +1,16 @@
+use std::ops::Range;
+
 use anvyx_frontend::air::{
     self, FunctionId, GlobalId, LocalId, Mutability, ParamMode, Place, PlaceRoot, Program,
-    TypeData, TypeId, TypePassClasses, place_model as air_place,
+    TypeData, TypeId, place_model as air_place,
 };
 
-use super::{mut_place::direct_native_mut_borrow_supported, rep_policy::RustRepresentationPlan};
+use super::mut_place::direct_native_mut_borrow_supported;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PlaceAccessIntent {
     ReadValue,
     OwnedRead,
-    SharedBorrow,
-    MutBorrow,
     Assign,
     MutPlaceArg,
     StructuralMutation,
@@ -23,8 +23,7 @@ pub enum PlaceAccessIntent {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlaceAccessPlan {
     pub root: PlaceAccessRoot,
-    pub ty: TypeId,
-    pub projection: Vec<PlaceProjection>,
+    path: air_place::PlacePath,
     dataref: Option<DataRefProjectionPlan>,
 }
 
@@ -40,6 +39,14 @@ impl PlaceAccessPlan {
         self.dataref.as_ref()
     }
 
+    pub fn path(&self) -> &air_place::PlacePath {
+        &self.path
+    }
+
+    pub fn steps(&self) -> &[air_place::ProjectionStep] {
+        self.path.steps()
+    }
+
     pub fn payload_alias_direct_place(&self) -> bool {
         matches!(
             self.root,
@@ -48,12 +55,12 @@ impl PlaceAccessPlan {
                 ..
             }
         ) && self.dataref.is_none()
-            && self.projection.iter().all(|projection| {
+            && self.steps().iter().all(|step| {
                 matches!(
-                    projection.kind,
-                    PlaceProjectionKind::Field(_)
-                        | PlaceProjectionKind::TupleField(_)
-                        | PlaceProjectionKind::ArrayIndex(_)
+                    step.kind(),
+                    air_place::ProjectionKind::Field(_)
+                        | air_place::ProjectionKind::TupleField(_)
+                        | air_place::ProjectionKind::ArrayIndex(_)
                 )
             })
     }
@@ -61,109 +68,108 @@ impl PlaceAccessPlan {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DataRefProjectionPlan {
-    pub(super) root_ty: TypeId,
-    pub(super) object_prefix: Vec<PlaceProjection>,
+    pub(super) object_prefix: Range<usize>,
     pub(super) object_prefix_can_fail: bool,
     pub(super) segments: Vec<DataRefSegmentPlan>,
-    pub(super) remaining: Vec<PlaceProjection>,
+    pub(super) remaining: Range<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DataRefSegmentPlan {
-    pub(super) object_prefix: Vec<PlaceProjection>,
+    pub(super) object_prefix: Range<usize>,
     pub(super) dataref_ty: TypeId,
     pub(super) dataref: air::AggregateId,
-    pub(super) storage: Vec<PlaceProjection>,
+    pub(super) storage: Range<usize>,
     pub(super) storage_ty: TypeId,
 }
 
 impl DataRefProjectionPlan {
     fn build(
         program: &Program,
-        classes: &TypePassClasses,
         path: &air_place::PlacePath,
         intent: PlaceAccessIntent,
     ) -> Result<Option<Self>, PlaceAccessGapKind> {
         if !path.crosses_dataref() {
             return Ok(None);
         }
-
-        let mut object_prefix = vec![];
+        let steps = path.steps();
+        let mut object_prefix_end = 0;
         let mut object_prefix_can_fail = false;
         let mut segments = vec![];
         let mut current = None;
-        let mut remaining = vec![];
+        let mut remaining_start = None;
         let mut materialized = false;
-
-        for step in path.steps() {
-            let projection = convert_projection(step);
+        for (index, step) in steps.iter().enumerate() {
+            if intent == PlaceAccessIntent::MutPlaceArg
+                && matches!(step.kind(), air_place::ProjectionKind::ExternField(_))
+            {
+                return Err(Self::projection_gap(intent));
+            }
             if materialized {
                 if let TypeData::DataRef(dataref) = program.type_arena.data(step.source_ty())
                     && matches!(step.kind(), air_place::ProjectionKind::DataRefField(_))
                 {
-                    let storage_ty = projection.ty;
+                    let object_prefix = remaining_start.take().expect("materialized range");
                     current = Some(DataRefSegmentPlan {
-                        object_prefix: std::mem::take(&mut remaining),
+                        object_prefix: object_prefix..index,
                         dataref_ty: step.source_ty(),
                         dataref: *dataref,
-                        storage: vec![projection],
-                        storage_ty,
+                        storage: index..index + 1,
+                        storage_ty: step.ty(),
                     });
                     materialized = false;
                     continue;
                 }
-                if dataref_remaining_projection_supported(step.kind()) {
-                    remaining.push(projection);
+                if ordinary_projection_supported(step.kind()) {
                     continue;
                 }
                 return Err(Self::projection_gap(intent));
             }
             match program.type_arena.data(step.source_ty()) {
-                TypeData::DataRef(dataref) => {
-                    let mut segment = DataRefSegmentPlan {
-                        object_prefix: vec![],
+                TypeData::DataRef(dataref)
+                    if matches!(step.kind(), air_place::ProjectionKind::DataRefField(_)) =>
+                {
+                    let segment = DataRefSegmentPlan {
+                        object_prefix: 0..0,
                         dataref_ty: step.source_ty(),
                         dataref: *dataref,
-                        storage: vec![],
-                        storage_ty: step.source_ty(),
+                        storage: index..index + 1,
+                        storage_ty: step.ty(),
                     };
-                    if matches!(step.kind(), air_place::ProjectionKind::DataRefField(_)) {
-                        segment.storage_ty = projection.ty;
-                        segment.storage.push(projection);
-                        if let Some(segment) = current.replace(segment) {
-                            segments.push(segment);
-                        }
-                    } else {
-                        return Err(Self::projection_gap(intent));
+                    if let Some(segment) = current.replace(segment) {
+                        segments.push(segment);
                     }
                 }
-                TypeData::Aggregate(_) if current.is_some() => {
-                    if matches!(step.kind(), air_place::ProjectionKind::Field(_)) {
-                        let segment = current.as_mut().expect("checked above");
-                        segment.storage_ty = projection.ty;
-                        segment.storage.push(projection);
-                    } else {
+                TypeData::DataRef(_) => return Err(Self::projection_gap(intent)),
+                TypeData::Aggregate(_) | TypeData::Extern(_) if current.is_some() => {
+                    if !matches!(
+                        step.kind(),
+                        air_place::ProjectionKind::Field(_)
+                            | air_place::ProjectionKind::ExternField(_)
+                    ) {
                         return Err(Self::projection_gap(intent));
                     }
+                    let segment = current.as_mut().expect("checked above");
+                    segment.storage.end = index + 1;
+                    segment.storage_ty = step.ty();
                 }
                 TypeData::Tuple(_) if current.is_some() => {
-                    if matches!(step.kind(), air_place::ProjectionKind::TupleField(_)) {
-                        let segment = current.as_mut().expect("checked above");
-                        segment.storage_ty = projection.ty;
-                        segment.storage.push(projection);
-                    } else {
+                    if !matches!(step.kind(), air_place::ProjectionKind::TupleField(_)) {
                         return Err(Self::projection_gap(intent));
                     }
+                    let segment = current.as_mut().expect("checked above");
+                    segment.storage.end = index + 1;
+                    segment.storage_ty = step.ty();
                 }
-                _ if current.is_some() && dataref_remaining_projection_supported(step.kind()) => {
+                _ if current.is_some() && ordinary_projection_supported(step.kind()) => {
                     segments.push(current.take().expect("checked above"));
-                    remaining.push(projection);
+                    remaining_start = Some(index);
                     materialized = true;
                 }
                 _ if current.is_some() => return Err(Self::projection_gap(intent)),
                 _ if ordinary_projection_supported(step.kind()) => {
-                    object_prefix_can_fail |= projection_is_dynamic(projection.kind);
-                    object_prefix.push(projection);
+                    object_prefix_can_fail |= projection_is_dynamic(step.kind());
+                    object_prefix_end = index + 1;
                 }
                 _ => return Err(Self::projection_gap(intent)),
             }
@@ -171,19 +177,12 @@ impl DataRefProjectionPlan {
         if let Some(segment) = current {
             segments.push(segment);
         }
-
-        if matches!(intent, PlaceAccessIntent::MutPlaceArg)
-            && !dataref_mut_place_payload_supported(program, classes, path.ty())
-        {
-            return Err(PlaceAccessGapKind::MutablePlaceDataRef);
-        }
-
+        let end = steps.len();
         Ok(Some(Self {
-            root_ty: path.root().ty,
-            object_prefix,
+            object_prefix: 0..object_prefix_end,
             object_prefix_can_fail,
             segments,
-            remaining,
+            remaining: remaining_start.map_or(end..end, |start| start..end),
         }))
     }
 
@@ -208,80 +207,26 @@ pub enum PlaceAccessRoot {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PlaceProjection {
-    pub source_ty: TypeId,
-    pub ty: TypeId,
-    pub kind: PlaceProjectionKind,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PlaceProjectionKind {
-    Field(air::FieldId),
-    DataRefField(air::FieldId),
-    ExternField(air::FieldId),
-    TupleField(u32),
-    ArrayIndex(LocalId),
-    ListIndex(LocalId),
-    SliceIndex(LocalId),
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PlaceAccessGapKind {
     PlaceProjection,
     GlobalAccess,
-    GlobalBorrow,
     GlobalProjection,
     GlobalValueRead,
     GlobalRooting,
-    GlobalType,
     MutablePlace,
     MutablePlaceProjection,
     MutablePlaceDataRef,
     MutablePlaceNativeBoundary,
     SliceView,
-    ReturnPlace,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum CollectionLoanBase {
-    Aggregate,
-    Tuple,
-    Array,
-    Other,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum CollectionLoanProjection {
-    Field,
-    TupleField,
-    Index,
-    Other,
-}
-
-pub(super) fn collection_loan_step_supported(
-    base: CollectionLoanBase,
-    projection: CollectionLoanProjection,
-) -> bool {
-    matches!(
-        (base, projection),
-        (
-            CollectionLoanBase::Aggregate,
-            CollectionLoanProjection::Field
-        ) | (
-            CollectionLoanBase::Tuple,
-            CollectionLoanProjection::TupleField
-        ) | (CollectionLoanBase::Array, CollectionLoanProjection::Index)
-    )
 }
 
 pub struct PlaceAccessCx<'a> {
     program: &'a Program,
-    classes: &'a TypePassClasses,
 }
 
 impl<'a> PlaceAccessCx<'a> {
-    pub fn new(program: &'a Program, classes: &'a TypePassClasses) -> Self {
-        Self { program, classes }
+    pub fn new(program: &'a Program) -> Self {
+        Self { program }
     }
 
     pub fn plan(
@@ -305,50 +250,17 @@ impl<'a> PlaceAccessCx<'a> {
         {
             return Err(PlaceAccessGapKind::SliceView);
         }
+        let dataref = DataRefProjectionPlan::build(self.program, &path, intent)?;
         if intent == PlaceAccessIntent::PayloadAlias {
-            self.check_payload_alias(function, &path)?;
+            self.check_payload_alias(function, &path, dataref.as_ref())?;
         }
-        let dataref = DataRefProjectionPlan::build(self.program, self.classes, &path, intent)?;
         let root = self.root(function, path.root());
         self.check_root_support(function, intent, place, &path, dataref.as_ref())?;
         Ok(PlaceAccessPlan {
             root,
-            ty: path.ty(),
-            projection: path.steps().iter().map(convert_projection).collect(),
+            path,
             dataref,
         })
-    }
-
-    pub fn global_payload_gap(&self, ty: TypeId) -> Option<PlaceAccessGapKind> {
-        if self.policy().global_storage_supported(ty) {
-            return None;
-        }
-        Some(
-            if matches!(
-                self.program.type_arena.data(ty),
-                TypeData::Void | TypeData::Any
-            ) {
-                PlaceAccessGapKind::GlobalType
-            } else {
-                PlaceAccessGapKind::GlobalRooting
-            },
-        )
-    }
-
-    pub fn global_supported(&self, global: GlobalId) -> bool {
-        self.program
-            .globals
-            .get(global.index())
-            .is_some_and(|decl| self.global_payload_gap(decl.ty).is_none())
-    }
-
-    pub fn global_root_set_supported(&self, global: GlobalId) -> bool {
-        self.program
-            .globals
-            .get(global.index())
-            .is_some_and(|decl| {
-                decl.mutability == Mutability::Mutable && self.global_payload_gap(decl.ty).is_none()
-            })
     }
 
     pub fn collection_loan_plan(
@@ -359,6 +271,17 @@ impl<'a> PlaceAccessCx<'a> {
         let place = self.plan(function, PlaceAccessIntent::CollectionLoan, &loan.root)?;
         self.check_collection_loan_kind(loan.root.ty, loan.root_kind, loan.mode)?;
         self.check_collection_loan_mutability(function, &loan.root, loan.mode)?;
+        if matches!(
+            loan.mode,
+            air::AirCollectionLoanMode::MutableSequenceElement
+                | air::AirCollectionLoanMode::MutableMapValue
+        ) && place
+            .steps()
+            .iter()
+            .any(|step| matches!(step.kind(), air_place::ProjectionKind::ExternField(_)))
+        {
+            return Err(PlaceAccessGapKind::MutablePlaceProjection);
+        }
         Ok(CollectionLoanPlan {
             place,
             root_kind: loan.root_kind,
@@ -509,9 +432,7 @@ impl<'a> PlaceAccessCx<'a> {
         }
         if matches!(
             intent,
-            PlaceAccessIntent::ReadValue
-                | PlaceAccessIntent::OwnedRead
-                | PlaceAccessIntent::SharedBorrow
+            PlaceAccessIntent::ReadValue | PlaceAccessIntent::OwnedRead
         ) && path.crosses_dataref()
             && dataref.is_none()
         {
@@ -521,7 +442,7 @@ impl<'a> PlaceAccessCx<'a> {
             && matches!(intent, PlaceAccessIntent::MutPlaceArg)
             && !place.projection.is_empty()
         {
-            return self.check_projected_mut_place(path, true);
+            return self.check_projected_mut_place(path, dataref, true);
         }
         match root.storage {
             Some(air_place::PlaceStorage::Local(local))
@@ -542,7 +463,7 @@ impl<'a> PlaceAccessCx<'a> {
                 if ordinary_mut_place_supported(self.program, path, allow_collections) {
                     Ok(())
                 } else {
-                    self.check_projected_mut_place(path, allow_collections)
+                    self.check_projected_mut_place(path, dataref, allow_collections)
                 }
             }
             Some(
@@ -559,6 +480,7 @@ impl<'a> PlaceAccessCx<'a> {
         &self,
         _function: FunctionId,
         path: &air_place::PlacePath,
+        dataref: Option<&DataRefProjectionPlan>,
     ) -> Result<(), PlaceAccessGapKind> {
         let PlaceRoot::Local(_) = path.root().root else {
             return Err(PlaceAccessGapKind::PlaceProjection);
@@ -566,7 +488,7 @@ impl<'a> PlaceAccessCx<'a> {
         if path.crosses_dataref() {
             return Ok(());
         }
-        self.check_projected_mut_place(path, true)
+        self.check_projected_mut_place(path, dataref, true)
             .map_err(|_| PlaceAccessGapKind::PlaceProjection)
     }
 
@@ -581,17 +503,16 @@ impl<'a> PlaceAccessCx<'a> {
         let Some(decl) = self.program.globals.get(global.index()) else {
             return Err(PlaceAccessGapKind::GlobalAccess);
         };
-        let payload_gap = self.global_payload_gap(decl.ty);
         match intent {
             PlaceAccessIntent::Assign if place.projection.is_empty() => {
-                if decl.mutability == Mutability::Mutable && payload_gap.is_none() {
+                if decl.mutability == Mutability::Mutable {
                     Ok(())
                 } else {
                     Err(PlaceAccessGapKind::GlobalRooting)
                 }
             }
             PlaceAccessIntent::StructuralMutation => {
-                if decl.mutability != Mutability::Mutable || payload_gap.is_some() {
+                if decl.mutability != Mutability::Mutable {
                     return Err(PlaceAccessGapKind::GlobalRooting);
                 }
                 if place.projection.is_empty()
@@ -604,9 +525,6 @@ impl<'a> PlaceAccessCx<'a> {
                 }
             }
             PlaceAccessIntent::CollectionLoan => {
-                if payload_gap.is_some() {
-                    return Err(PlaceAccessGapKind::GlobalValueRead);
-                }
                 if place.projection.is_empty()
                     || (collection_loan_projection_supported(self.program, path)
                         && self.value_read_supported(path.ty()))
@@ -622,46 +540,16 @@ impl<'a> PlaceAccessCx<'a> {
                 if !(global_read_projection_supported(path) || dataref.is_some()) {
                     return Err(PlaceAccessGapKind::GlobalProjection);
                 }
-                if payload_gap.is_none() && self.value_read_supported(path.ty()) {
+                if self.value_read_supported(path.ty()) {
                     Ok(())
                 } else {
                     Err(PlaceAccessGapKind::GlobalValueRead)
                 }
             }
-            PlaceAccessIntent::SharedBorrow if !place.projection.is_empty() => {
-                if (global_read_projection_supported(path) || dataref.is_some())
-                    && self.value_read_supported(path.ty())
-                {
-                    Ok(())
-                } else {
-                    Err(PlaceAccessGapKind::GlobalProjection)
-                }
-            }
-            PlaceAccessIntent::MutBorrow if !place.projection.is_empty() => {
-                Err(PlaceAccessGapKind::GlobalProjection)
-            }
-            PlaceAccessIntent::MutBorrow => Err(PlaceAccessGapKind::GlobalBorrow),
-            PlaceAccessIntent::ReadValue
-            | PlaceAccessIntent::OwnedRead
-            | PlaceAccessIntent::SharedBorrow
-                if payload_gap.is_some() =>
-            {
-                Err(PlaceAccessGapKind::GlobalValueRead)
-            }
-            PlaceAccessIntent::Assign
+            PlaceAccessIntent::Assign | PlaceAccessIntent::MutPlaceArg
                 if !place.projection.is_empty()
                     && decl.mutability == Mutability::Mutable
-                    && payload_gap.is_none()
-                    && (dataref.is_some()
-                        || self.check_projected_mut_place(path, true).is_ok()) =>
-            {
-                Ok(())
-            }
-            PlaceAccessIntent::MutPlaceArg
-                if !place.projection.is_empty()
-                    && decl.mutability == Mutability::Mutable
-                    && payload_gap.is_none()
-                    && self.check_projected_mut_place(path, true).is_ok() =>
+                    && self.check_projected_mut_place(path, dataref, true).is_ok() =>
             {
                 Ok(())
             }
@@ -670,11 +558,7 @@ impl<'a> PlaceAccessCx<'a> {
             {
                 Err(PlaceAccessGapKind::GlobalProjection)
             }
-            PlaceAccessIntent::SliceView
-                if place.projection.is_empty() && payload_gap.is_none() =>
-            {
-                Ok(())
-            }
+            PlaceAccessIntent::SliceView if place.projection.is_empty() => Ok(()),
             PlaceAccessIntent::PayloadAlias | PlaceAccessIntent::SliceView => {
                 Err(PlaceAccessGapKind::GlobalProjection)
             }
@@ -683,7 +567,6 @@ impl<'a> PlaceAccessCx<'a> {
             }
             PlaceAccessIntent::ReadValue
             | PlaceAccessIntent::OwnedRead
-            | PlaceAccessIntent::SharedBorrow
             | PlaceAccessIntent::Assign
             | PlaceAccessIntent::MutPlaceArg => Ok(()),
         }
@@ -692,14 +575,15 @@ impl<'a> PlaceAccessCx<'a> {
     fn check_projected_mut_place(
         &self,
         path: &air_place::PlacePath,
+        dataref: Option<&DataRefProjectionPlan>,
         allow_collections: bool,
     ) -> Result<(), PlaceAccessGapKind> {
-        if dataref_mut_place_supported(self.program, self.classes, path)?
-            || ordinary_mut_place_supported(self.program, path, allow_collections)
+        if dataref.is_some() || ordinary_mut_place_supported(self.program, path, allow_collections)
         {
-            return Ok(());
+            Ok(())
+        } else {
+            Err(PlaceAccessGapKind::MutablePlaceProjection)
         }
-        Err(PlaceAccessGapKind::MutablePlaceProjection)
     }
 
     fn value_read_supported(&self, ty: TypeId) -> bool {
@@ -720,16 +604,13 @@ impl<'a> PlaceAccessCx<'a> {
                     .any(|param| param.local_id == local && param.mode == ParamMode::MutBorrow)
         })
     }
-
-    fn policy(&self) -> RustRepresentationPlan<'_> {
-        RustRepresentationPlan::new(self.program, self.classes)
-    }
 }
 
 fn ordinary_projection_supported(kind: air_place::ProjectionKind) -> bool {
     matches!(
         kind,
         air_place::ProjectionKind::Field(_)
+            | air_place::ProjectionKind::ExternField(_)
             | air_place::ProjectionKind::TupleField(_)
             | air_place::ProjectionKind::ArrayIndex(_)
             | air_place::ProjectionKind::ListIndex(_)
@@ -737,21 +618,10 @@ fn ordinary_projection_supported(kind: air_place::ProjectionKind) -> bool {
     )
 }
 
-fn projection_is_dynamic(kind: PlaceProjectionKind) -> bool {
+fn projection_is_dynamic(kind: air_place::ProjectionKind) -> bool {
     matches!(
         kind,
-        PlaceProjectionKind::ArrayIndex(_)
-            | PlaceProjectionKind::ListIndex(_)
-            | PlaceProjectionKind::SliceIndex(_)
-    )
-}
-
-fn dataref_remaining_projection_supported(kind: air_place::ProjectionKind) -> bool {
-    matches!(
-        kind,
-        air_place::ProjectionKind::Field(_)
-            | air_place::ProjectionKind::TupleField(_)
-            | air_place::ProjectionKind::ArrayIndex(_)
+        air_place::ProjectionKind::ArrayIndex(_)
             | air_place::ProjectionKind::ListIndex(_)
             | air_place::ProjectionKind::SliceIndex(_)
     )
@@ -765,29 +635,20 @@ fn global_read_projection_supported(path: &air_place::PlacePath) -> bool {
 
 fn collection_loan_projection_supported(program: &Program, path: &air_place::PlacePath) -> bool {
     path.steps().iter().all(|step| {
-        collection_loan_step_supported(
-            collection_loan_base(program.type_arena.data(step.source_ty())),
-            collection_loan_projection(step.kind()),
+        matches!(
+            (program.type_arena.data(step.source_ty()), step.kind()),
+            (TypeData::Aggregate(_), air_place::ProjectionKind::Field(_))
+                | (
+                    TypeData::Extern(_),
+                    air_place::ProjectionKind::ExternField(_)
+                )
+                | (TypeData::Tuple(_), air_place::ProjectionKind::TupleField(_))
+                | (
+                    TypeData::Array { .. },
+                    air_place::ProjectionKind::ArrayIndex(_)
+                )
         )
     })
-}
-
-fn collection_loan_base(data: &TypeData) -> CollectionLoanBase {
-    match data {
-        TypeData::Aggregate(_) => CollectionLoanBase::Aggregate,
-        TypeData::Tuple(_) => CollectionLoanBase::Tuple,
-        TypeData::Array { .. } => CollectionLoanBase::Array,
-        _ => CollectionLoanBase::Other,
-    }
-}
-
-fn collection_loan_projection(kind: air_place::ProjectionKind) -> CollectionLoanProjection {
-    match kind {
-        air_place::ProjectionKind::Field(_) => CollectionLoanProjection::Field,
-        air_place::ProjectionKind::TupleField(_) => CollectionLoanProjection::TupleField,
-        air_place::ProjectionKind::ArrayIndex(_) => CollectionLoanProjection::Index,
-        _ => CollectionLoanProjection::Other,
-    }
 }
 
 fn global_structural_mutation_projection_supported(
@@ -802,6 +663,9 @@ fn global_structural_mutation_projection_supported(
                 TypeData::Aggregate(_) | TypeData::Tuple(_),
                 air_place::ProjectionKind::Field(_) | air_place::ProjectionKind::TupleField(_),
             ) | (
+                TypeData::Extern(_),
+                air_place::ProjectionKind::ExternField(_),
+            ) | (
                 TypeData::Array { .. },
                 air_place::ProjectionKind::ArrayIndex(_),
             ) | (TypeData::List(_), air_place::ProjectionKind::ListIndex(_))
@@ -812,41 +676,6 @@ fn global_structural_mutation_projection_supported(
         ty = step.ty();
     }
     true
-}
-
-fn dataref_mut_place_supported(
-    program: &Program,
-    classes: &TypePassClasses,
-    path: &air_place::PlacePath,
-) -> Result<bool, PlaceAccessGapKind> {
-    if !path.crosses_dataref() {
-        return Ok(false);
-    }
-    DataRefProjectionPlan::build(program, classes, path, PlaceAccessIntent::MutPlaceArg)
-        .map(|plan| plan.is_some())
-}
-
-fn dataref_mut_place_payload_supported(
-    program: &Program,
-    classes: &TypePassClasses,
-    ty: TypeId,
-) -> bool {
-    match program.type_arena.data(ty) {
-        TypeData::Int
-        | TypeData::Flag(_)
-        | TypeData::Float
-        | TypeData::Bool
-        | TypeData::Char
-        | TypeData::DataRef(_)
-        | TypeData::Dyn(_) => true,
-        TypeData::Void | TypeData::Any | TypeData::Slice(_) => false,
-        _ => RustRepresentationPlan::new(program, classes)
-            .storage_supported(
-                ty,
-                super::rep_policy::LambdaStorageFamily::DataRefProjection,
-            )
-            .is_ok(),
-    }
 }
 
 fn ordinary_mut_place_supported(
@@ -884,199 +713,4 @@ fn ordinary_mut_place_supported(
         slice_dynamic |= slice;
     }
     true
-}
-
-fn convert_projection(step: &air_place::ProjectionStep) -> PlaceProjection {
-    PlaceProjection {
-        source_ty: step.source_ty(),
-        ty: step.ty(),
-        kind: match step.kind() {
-            air_place::ProjectionKind::Field(field) => PlaceProjectionKind::Field(field),
-            air_place::ProjectionKind::DataRefField(field) => {
-                PlaceProjectionKind::DataRefField(field)
-            }
-            air_place::ProjectionKind::ExternField(field) => {
-                PlaceProjectionKind::ExternField(field)
-            }
-            air_place::ProjectionKind::TupleField(index) => PlaceProjectionKind::TupleField(index),
-            air_place::ProjectionKind::ArrayIndex(local) => PlaceProjectionKind::ArrayIndex(local),
-            air_place::ProjectionKind::ListIndex(local) => PlaceProjectionKind::ListIndex(local),
-            air_place::ProjectionKind::SliceIndex(local) => PlaceProjectionKind::SliceIndex(local),
-        },
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use anvyx_frontend::{
-        air::{
-            AirBody, BindingId, CaptureCellDecl, CaptureCellId, CaptureCellLifetime, Function,
-            FunctionKind, GlobalDecl, LambdaCaptureDecl, LambdaDecl, LambdaEscape, LambdaId, Local,
-            LocalKind, Mutability, ReturnMode, ScopedBorrowDecl, ScopedBorrowId,
-            ScopedBorrowSource, Signature, SignatureType, TypeData, TypePassClasses,
-        },
-        ast::{ExprId, Ident},
-    };
-
-    use super::*;
-
-    #[test]
-    fn rejects_dynamic_global_collection_loan() {
-        let (program, place) = dynamic_global_list_place();
-        let cx = cx(&program);
-
-        let gap = cx
-            .collection_loan_plan(
-                FunctionId::from_index(0),
-                &collection_loan(place, air::AirCollectionLoanMode::MutableSequenceElement),
-            )
-            .expect_err("dynamic global loans await live descriptors");
-
-        assert_eq!(gap, PlaceAccessGapKind::GlobalProjection);
-    }
-
-    #[test]
-    fn rejects_dynamic_capture_cell_assignment_projection() {
-        let (program, place) =
-            captured_list_index_program(PlaceRoot::CaptureCell(CaptureCellId::from_index(0)));
-
-        let gap = cx(&program)
-            .plan(FunctionId::from_index(0), PlaceAccessIntent::Assign, &place)
-            .expect_err("dynamic collection projection through cells stays unsupported");
-
-        assert_eq!(gap, PlaceAccessGapKind::MutablePlaceProjection);
-    }
-
-    #[test]
-    fn rejects_dynamic_scoped_borrow_assignment_projection() {
-        let (program, place) =
-            captured_list_index_program(PlaceRoot::ScopedBorrow(ScopedBorrowId::from_index(0)));
-
-        let gap = cx(&program)
-            .plan(FunctionId::from_index(0), PlaceAccessIntent::Assign, &place)
-            .expect_err("dynamic collection projection through scoped cells stays unsupported");
-
-        assert_eq!(gap, PlaceAccessGapKind::MutablePlaceProjection);
-    }
-    fn captured_list_index_program(root: PlaceRoot) -> (Program, Place) {
-        let mut program = Program::default();
-        let int = program.type_arena.alloc(TypeData::Int);
-        let list = program.type_arena.alloc(TypeData::List(int));
-        program.capture_cells.push(CaptureCellDecl {
-            binding: BindingId::from_index(0),
-            owner: FunctionId::from_index(0),
-            source_local: LocalId::from_index(0),
-            ty: list,
-            lifetime: CaptureCellLifetime::Function,
-        });
-        program.scoped_borrows.push(ScopedBorrowDecl {
-            owner: FunctionId::from_index(0),
-            binding: BindingId::from_index(0),
-            source: ScopedBorrowSource::SourceMutParam {
-                local: LocalId::from_index(0),
-            },
-            ty: list,
-            mutability: Mutability::Mutable,
-        });
-        push_lambda_capture_function(
-            &mut program,
-            LambdaCaptureDecl::CaptureCell {
-                binding: BindingId::from_index(0),
-                cell: CaptureCellId::from_index(0),
-                ty: list,
-            },
-        );
-        program.functions[0].locals.push(local(int, false));
-        let place = Place {
-            root,
-            projection: vec![air::Projection::Index(LocalId::from_index(0))],
-            ty: int,
-        };
-        (program, place)
-    }
-
-    fn push_lambda_capture_function(program: &mut Program, capture: LambdaCaptureDecl) {
-        let function_id = FunctionId::from_index(0);
-        let lambda = LambdaId::from_index(0);
-        program.lambdas.push(LambdaDecl {
-            source: ExprId(0),
-            module: air::ModuleId::from_index(0),
-            owner: function_id,
-            body: function_id,
-            signature: SignatureType::new(vec![], ReturnMode::Value(TypeId::from_index(0))),
-            escape: LambdaEscape::NonEscaping,
-            captures: vec![capture],
-        });
-        program.functions.push(Function {
-            kind: FunctionKind::Lambda(lambda),
-            ..function(vec![])
-        });
-    }
-    fn dynamic_global_list_place() -> (Program, Place) {
-        let mut program = Program::default();
-        let int = program.type_arena.alloc(TypeData::Int);
-        let row = program.type_arena.alloc(TypeData::List(int));
-        let rows = program.type_arena.alloc(TypeData::List(row));
-        let global = push_global(&mut program, rows);
-        program.functions.push(function(vec![local(int, false)]));
-        let place = Place {
-            root: PlaceRoot::Global(global),
-            projection: vec![air::Projection::Index(LocalId::from_index(0))],
-            ty: row,
-        };
-        (program, place)
-    }
-
-    fn collection_loan(root: Place, mode: air::AirCollectionLoanMode) -> air::AirCollectionLoan {
-        air::AirCollectionLoan {
-            root,
-            root_kind: air::AirCollectionRootKind::List,
-            mode,
-            body: air::AirBlock::default(),
-        }
-    }
-
-    fn push_global(program: &mut Program, ty: TypeId) -> GlobalId {
-        let global = GlobalId::from_index(program.globals.len());
-        program.globals.push(GlobalDecl {
-            name: Ident::new("state"),
-            module: air::ModuleId::from_index(0),
-            ty,
-            mutability: Mutability::Mutable,
-            init: FunctionId::from_index(0),
-        });
-        global
-    }
-    fn function(locals: Vec<Local>) -> Function {
-        Function {
-            name: Ident::new("main"),
-            module: air::ModuleId::from_index(0),
-            kind: FunctionKind::Normal,
-            owner: None,
-            specialization: None,
-            signature: Signature::new(vec![], TypeId::from_index(0)),
-            locals,
-            body: AirBody {
-                block: air::AirBlock::default(),
-            },
-        }
-    }
-    fn local(ty: TypeId, mutable: bool) -> Local {
-        Local {
-            name: None,
-            binding: None,
-            ty,
-            mutability: if mutable {
-                Mutability::Mutable
-            } else {
-                Mutability::Immutable
-            },
-            kind: LocalKind::User,
-        }
-    }
-
-    fn cx(program: &Program) -> PlaceAccessCx<'_> {
-        let classes = Box::leak(Box::new(TypePassClasses::analyze(program)));
-        PlaceAccessCx::new(program, classes)
-    }
 }

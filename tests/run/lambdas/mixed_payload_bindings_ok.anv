@@ -1,0 +1,37 @@
+// @mode: run
+// @expect: success
+// @match-begin
+// 2
+// 3
+// 5
+// @match-end
+
+fn call_once(f: fn()) {
+    f();
+}
+
+fn main() {
+    var total = 0;
+    var opt: int? = 1;
+    var counts: [string: int] = ["a": 2];
+
+    if ref value? = opt {
+        let update = || {
+            value += 1;
+            total += value;
+        };
+        call_once(update);
+    }
+
+    if ref value? = counts["a"] {
+        let update = || {
+            value += 1;
+            total += value;
+        };
+        call_once(update);
+    }
+
+    println(opt ?? 0);
+    println(counts["a"] ?? 0);
+    println(total);
+}

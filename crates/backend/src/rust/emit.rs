@@ -1,71 +1,53 @@
+use anvyx_frontend::ast::FormatSpec;
+
 use super::{
-    analysis,
-    dataref_place::{DataRefPlaceDescriptor, DataRefPlaceDescriptors},
-    native_call::{NativeArgAction, NativeCallPlan},
-    place::RustPlaces,
+    RirPlan, RustSource, analysis,
+    native_call::NativeArgAction,
+    place::{RustPlaces, dataref_storage_path, field_step_symbol},
     rep_policy::{LambdaTraceAction, LambdaVariantLayout, RirRustRepPolicy, RustTracePlan},
     retained_callbacks::{RetainedCallbackEmitter, RetainedCallbackSigPlan},
     rir::{
         RirCallArg, RirCallTarget, RirCellDecl, RirCellLifetime, RirCellRef, RirCellStorage,
         RirChild, RirCollectionAccess, RirCollectionFor, RirCollectionLoanScope,
-        RirCollectionStorageKind, RirConstValue, RirDataRefId, RirDynCarrier, RirDynCarrierId,
-        RirDynDispatchArm, RirDynReceiver, RirDynStorage, RirDynVariantId, RirEnum, RirEnumId,
-        RirEnumRepr, RirExternKind, RirFlagStaticOp, RirFormatAlign, RirFormatKind, RirFormatSign,
-        RirFormatSpec, RirFunction, RirIf, RirIterCountCheck, RirLambdaCapture,
-        RirLambdaCaptureArg, RirLambdaCaptureKind, RirLambdaEnvFieldKind, RirLambdaEnvId,
-        RirLambdaEnvLayout, RirLambdaId, RirLambdaSig, RirLambdaSigId, RirLambdaStorage,
-        RirLocalId, RirLoop, RirLoopId, RirMapEntryMatch, RirMaterializerId, RirMutPlaceAccess,
-        RirMutPlaceArg, RirMutPlaceHandle, RirOperand, RirOptionMatch, RirOptionPayloadBinding,
-        RirOptionSubject, RirOrdinalAdapter, RirOrdinalPlan, RirParamAbi, RirParamSemantic,
-        RirPatternAlternative, RirPatternBinding, RirPatternBindingMode, RirPatternMatch,
-        RirPatternPath, RirPatternPathStep, RirPatternTest, RirPlace, RirPlaceModel, RirPlaceRoot,
-        RirProgram, RirProjection, RirRValue, RirRangeFor, RirRawEnumValue, RirResolvedCallTarget,
-        RirScopedPlaceCellDecl, RirScopedPlaceCellRef, RirStmt, RirStringLiteralId,
-        RirStructuredBlock, RirTerm, RirType, RirTypeId, RirVariant, RirVariantId, RirVariantKind,
-        VerifiedRirProgram, native_arg_facts, native_dynamic_arg_facts, native_ty_is_resource_ref,
+        RirCollectionStorageKind, RirConstValue, RirDataRefPlace, RirDataRefPlaceId, RirDynCarrier,
+        RirDynCarrierId, RirDynDispatchArm, RirDynReceiver, RirDynStorage, RirDynVariantId,
+        RirEnum, RirEnumId, RirEnumRepr, RirExtern, RirFlagStaticOp, RirFunction, RirIf,
+        RirIterCountCheck, RirLambdaCapture, RirLambdaCaptureArg, RirLambdaCaptureKind,
+        RirLambdaEnvFieldKind, RirLambdaEnvId, RirLambdaEnvLayout, RirLambdaId, RirLambdaSig,
+        RirLambdaSigId, RirLambdaStorage, RirLocalBinding, RirLocalId, RirLoop, RirLoopId,
+        RirMapEntryMatch, RirMaterializerId, RirMutPlaceAccess, RirMutPlaceArg, RirMutPlaceHandle,
+        RirNativeReturn, RirOperand, RirOptionMatch, RirOptionPayloadBinding, RirOptionSubject,
+        RirOrdinalAdapter, RirOrdinalPlan, RirPassMode, RirPatternAlternative, RirPatternBinding,
+        RirPatternBindingMode, RirPatternMatch, RirPatternPath, RirPatternPathStep, RirPatternTest,
+        RirPlace, RirPlaceRoot, RirPlaceStep, RirPlaceStepKind, RirProgram, RirRValue, RirRangeFor,
+        RirRawEnumValue, RirResolvedCallTarget, RirScopedPlaceCellDecl, RirScopedPlaceCellId,
+        RirScopedPlaceCellRef, RirStmt, RirStringLiteralId, RirStructuredBlock, RirTerm, RirType,
+        RirTypeId, RirVariant, RirVariantId, RirVariantKind, native_ty_is_resource_ref,
         stmt_child_blocks_any,
     },
     runtime_owner::RuntimeOwnerEmit,
     syntax::{
-        FormatAlign, FormatKind, FormatSign, FormatSpec, binary_op, block_expr, comma, field_init,
-        format_fragment, match_expr, rust_string, struct_lit, struct_variant,
-        struct_variant_pattern, tuple_variant, tuple_variant_pattern, unary_op,
-        unit_variant_pattern, variant_path,
+        binary_op, block_expr, comma, field_init, format_fragment, match_expr, rust_string,
+        struct_lit, struct_variant, struct_variant_pattern, tuple_variant, tuple_variant_pattern,
+        unary_op, unit_variant_pattern, variant_path,
     },
     target,
-    value::RustValues,
+    value::{MaterializerDir, RustValues},
     write::RustWriter,
 };
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RustSource {
-    text: String,
-}
-
-impl RustSource {
-    pub fn new(text: String) -> Self {
-        Self { text }
-    }
-
-    pub fn as_str(&self) -> &str {
-        &self.text
-    }
-
-    pub fn into_string(self) -> String {
-        self.text
-    }
-}
-
-pub fn emit(program: &VerifiedRirProgram<'_>) -> RustSource {
-    let program = program.program();
+pub(super) fn emit(plan: &RirPlan) -> RustSource {
+    let program = &plan.program;
+    let (retained_callback_sigs, provider_callback_sigs, heap_callback_sigs) =
+        program.callback_sigs();
+    let trace_plan = RustTracePlan::build(program, &retained_callback_sigs);
     let mut cx = EmitCx {
         program,
-        dataref_places: DataRefPlaceDescriptors::build(program),
-        trace_plan: RustTracePlan::build(program),
+        trace_plan,
         fallible_functions: analysis::fallible_functions(program),
-        retained_callback_sigs: program.retained_callback_sigs(),
-        provider_callback_sigs: program.provider_callback_sigs(),
-        heap_callback_sigs: program.heap_callback_sigs(),
+        retained_callback_sigs,
+        provider_callback_sigs,
+        heap_callback_sigs,
         w: RustWriter::default(),
         collection_loans: vec![],
     };
@@ -76,14 +58,12 @@ pub fn emit(program: &VerifiedRirProgram<'_>) -> RustSource {
 struct ResolvedReceiver {
     expr: String,
     ty: RirTypeId,
-    semantic: RirParamSemantic,
 }
 
 type PreparedNativeArgs = (Vec<String>, Vec<String>, Vec<(String, String, bool)>);
 
 struct EmitCx<'a> {
     program: &'a RirProgram,
-    dataref_places: DataRefPlaceDescriptors,
     trace_plan: RustTracePlan,
     fallible_functions: Vec<bool>,
     retained_callback_sigs: Vec<RirLambdaSigId>,
@@ -128,7 +108,8 @@ impl EmitCx<'_> {
             .collection_storage_for(value_ty)
             .expect("verified collection storage declaration");
         format!(
-            "statics.{}",
+            "{}.{}",
+            target::statics_param_name(),
             storage
                 .heap_symbol()
                 .expect("heap-backed collection storage")
@@ -185,7 +166,11 @@ impl EmitCx<'_> {
             }
             let ty = policy.rust_ty(materializer.ty);
             let symbol = target::materializer_symbol(materializer.id);
-            let body = RustValues::materializer_body(self.program, materializer.id);
+            let body = RustValues::transfer_body(
+                self.program,
+                materializer.id,
+                MaterializerDir::RefToOwned,
+            );
             self.w.line(format!(
                 "fn {symbol}<'cx>(value: &{ty}) -> {ty} {{ {body} }}"
             ));
@@ -195,7 +180,11 @@ impl EmitCx<'_> {
                 )
             {
                 let symbol = target::staged_commit_symbol(materializer.id);
-                let body = RustValues::staged_commit_body(self.program, materializer.id);
+                let body = RustValues::transfer_body(
+                    self.program,
+                    materializer.id,
+                    MaterializerDir::StagedToStored,
+                );
                 self.w.line(format!(
                     "fn {symbol}<'cx>(value: {ty}) -> {ty} {{ {body} }}"
                 ));
@@ -204,8 +193,8 @@ impl EmitCx<'_> {
     }
 
     fn emit_ctx(&mut self) {
-        let statics = target::generated_statics_symbol(&self.program.ctx);
-        let globals = target::generated_globals_symbol(&self.program.ctx);
+        let statics = target::generated_statics_symbol();
+        let globals = target::generated_globals_symbol();
         let owned_literals = self
             .program
             .string_literals
@@ -403,8 +392,11 @@ impl EmitCx<'_> {
                         |w| {
                             for global in &traced_globals {
                                 w.line(format_args!(
-                                    "self.{}.validate_trace()?;",
-                                    global.slot_symbol.as_str()
+                                    "{};",
+                                    target::global_validate_trace(&format!(
+                                        "self.{}",
+                                        global.slot_symbol.as_str()
+                                    ))
                                 ));
                             }
                             w.line("Ok(())");
@@ -713,28 +705,28 @@ impl EmitCx<'_> {
     }
 
     fn emit_dataref_place_descriptors(&mut self) {
-        for descriptor in self.dataref_places.all() {
-            Self::emit_dataref_place_descriptor(self.program, &mut self.w, descriptor);
+        for (index, descriptor) in self.program.dataref_places.iter().enumerate() {
+            Self::emit_dataref_place_descriptor(self.program, &mut self.w, index, descriptor);
         }
     }
 
     fn emit_dataref_place_descriptor(
         program: &RirProgram,
         w: &mut RustWriter,
-        descriptor: &DataRefPlaceDescriptor,
+        index: usize,
+        descriptor: &RirDataRefPlace,
     ) {
         let policy = RirRustRepPolicy::new(program);
+        let symbol = target::dataref_place_symbol(index);
         let dataref = &program.datarefs[descriptor.dataref.index()];
         let storage = policy.dataref_storage_ty(dataref);
-        let payload = policy.rust_ty(descriptor.ty);
-        let path = descriptor.storage_path(program);
-        let materializer = program
-            .dataref_projection_materializer(descriptor.ty)
-            .expect("verified dataref projection materializer");
+        let payload = policy.rust_ty(program.materializers[descriptor.materializer.index()].ty);
+        let path = dataref_storage_path(program, &descriptor.storage);
+        let materializer = descriptor.materializer;
         let values = RustValues::new(program, &program.functions[0]);
         let materialized = values.materialize_ref(materializer, &format!("&{path}"));
         let writeback = values.staged_commit(materializer, "value");
-        w.block(format_args!("struct {}<'cx>", descriptor.symbol), |w| {
+        w.block(format_args!("struct {symbol}<'cx>"), |w| {
             w.line(format_args!(
                 "{}: {},",
                 target::dataref_place_heap_type_field(),
@@ -746,7 +738,7 @@ impl EmitCx<'_> {
             format_args!(
                 "unsafe impl<'cx> {} for {}<'cx>",
                 target::dataref_place_ops_ty(&payload),
-                descriptor.symbol
+                symbol
             ),
             |w| {
                 Self::emit_dataref_place_op(
@@ -787,7 +779,8 @@ impl EmitCx<'_> {
         w.indented(|w| {
             w.line("&self,");
             w.line(format_args!(
-                "rt: &mut {},",
+                "{}: &mut {},",
+                target::runtime_param_name(),
                 target::runtime_ctx_ty_with("'_")
             ));
             w.line(format_args!("object: &{},", target::erased_handle_ty()));
@@ -802,7 +795,7 @@ impl EmitCx<'_> {
                 w.line(format_args!(
                     "let value = {}?;",
                     target::rt_heap_try_with_erased(
-                        "rt",
+                        target::runtime_param_name(),
                         "object",
                         &target::dataref_place_heap_type_access("self"),
                         "storage",
@@ -816,7 +809,7 @@ impl EmitCx<'_> {
                 w.line(format_args!(
                     "let mut value = {}?;",
                     target::rt_heap_try_with_erased(
-                        "rt",
+                        target::runtime_param_name(),
                         "object",
                         &target::dataref_place_heap_type_access("self"),
                         "storage",
@@ -828,7 +821,7 @@ impl EmitCx<'_> {
                 w.line(format_args!(
                     "let writeback = {};",
                     target::rt_heap_try_with_erased_mut(
-                        "rt",
+                        target::runtime_param_name(),
                         "object",
                         &target::dataref_place_heap_type_access("self"),
                         "storage",
@@ -876,18 +869,14 @@ impl EmitCx<'_> {
     }
 
     fn emit_struct(&mut self, strukt: &super::rir::RirStruct) {
-        if let Some(path) = &strukt.native_path {
+        if let Some(native) = &strukt.native {
+            let path = target::rust_path(&native.path);
             if strukt.native_ref {
-                self.w.line(target::anv_ref_alias(
-                    strukt.symbol.as_str(),
-                    &path.join("::"),
-                ));
+                self.w
+                    .line(target::anv_ref_alias(strukt.symbol.as_str(), &path));
             } else {
-                self.w.line(format_args!(
-                    "type {} = {};",
-                    strukt.symbol.as_str(),
-                    path.join("::")
-                ));
+                self.w
+                    .line(format_args!("type {} = {};", strukt.symbol.as_str(), path));
             }
             self.w.blank();
             return;
@@ -898,7 +887,7 @@ impl EmitCx<'_> {
             &strukt.fields,
             self.trace_plan.needs_struct_trace(strukt.id),
             policy.struct_cx_dependent(strukt),
-            &policy.record_derives(&strukt.fields, strukt.copyable),
+            &policy.record_derives(policy.struct_ty(strukt.id)),
         );
     }
 
@@ -909,7 +898,7 @@ impl EmitCx<'_> {
             &tuple.fields,
             self.trace_plan.needs_tuple_trace(tuple.id),
             policy.tuple_cx_dependent(tuple),
-            &policy.record_derives(&tuple.fields, tuple.copyable),
+            &policy.record_derives(policy.tuple_ty(tuple.id)),
         );
     }
 
@@ -946,7 +935,7 @@ impl EmitCx<'_> {
     }
 
     fn emit_flag(&mut self, flag: &crate::rust::rir::RirFlag) {
-        let derives = RirRustRepPolicy::new(self.program).flag_derives();
+        let derives = RirRustRepPolicy::flag_derives();
         self.w.line(target::trace_derive(&derives));
         self.w.line(target::trace_crate_attr(false));
         self.w.line(target::flag_type_decl(flag.symbol.as_str()));
@@ -966,11 +955,11 @@ impl EmitCx<'_> {
     }
 
     fn emit_enum(&mut self, enm: &RirEnum) {
-        if let Some(path) = &enm.native_path {
+        if let Some(native) = &enm.native {
             self.w.line(format_args!(
                 "type {} = {};",
                 enm.symbol.as_str(),
-                path.join("::")
+                target::rust_path(&native.path)
             ));
             self.w.blank();
             return;
@@ -1049,7 +1038,7 @@ impl EmitCx<'_> {
                 } else {
                     "payload"
                 };
-                let payload = values.dyn_payload_from_ref(variant.payload, source);
+                let payload = values.materialize_ref(variant.payload, source);
                 let payload = if variant.storage == RirDynStorage::Boxed {
                     format!("Box::new({payload})")
                 } else {
@@ -1074,10 +1063,15 @@ impl EmitCx<'_> {
 
     fn dyn_borrow_carrier_used(&self, carrier: &RirDynCarrier) -> bool {
         self.program.functions.iter().any(|function| {
-            function
-                .params
-                .iter()
-                .any(|param| param.abi == RirParamAbi::DynBorrow && param.ty == carrier.storage_ty)
+            function.params.iter().any(|param| {
+                matches!(
+                    function.locals[param.index()].binding,
+                    RirLocalBinding::Parameter {
+                        mode: RirPassMode::DynBorrow,
+                        ..
+                    }
+                ) && function.locals[param.index()].ty == carrier.storage_ty
+            })
         })
     }
 
@@ -1200,11 +1194,7 @@ impl EmitCx<'_> {
             .map(|variant| {
                 let name = enm.variants[variant.id.index()].symbol.as_str();
                 let path = variant_path(enm.symbol.as_str(), name);
-                let payload_materializer = variants
-                    .iter()
-                    .find(|candidate| candidate.witness == variant.air_witness)
-                    .expect("verified dynamic materializer variant")
-                    .payload;
+                let payload_materializer = variants[variant.id.index()];
                 let payload = values.materialize_ref(payload_materializer, "value");
                 let payload = if variant.storage == RirDynStorage::Boxed {
                     format!("Box::new({payload})")
@@ -1233,30 +1223,30 @@ impl EmitCx<'_> {
                 unreachable!("verified source dynamic storage")
             };
             let source_enum = &self.program.enums[source_enum.index()];
-            let weaken_arms = weakening.arms.iter().map(|arm| {
-                let source_variant = &source_enum.variants[arm.source.index()];
-                let target_variant = &carrier.variants[arm.target.index()];
-                let target_enum_variant = &enm.variants[arm.target.index()];
-                let payload_materializer = variants
-                    .iter()
-                    .find(|candidate| candidate.witness == target_variant.air_witness)
-                    .expect("verified dynamic materializer variant")
-                    .payload;
-                let payload = values.materialize_ref(payload_materializer, "payload");
-                let payload = if target_variant.storage == RirDynStorage::Boxed {
-                    format!("Box::new({payload})")
-                } else {
-                    payload
-                };
-                let source_path =
-                    variant_path(source_enum.symbol.as_str(), source_variant.symbol.as_str());
-                let target_path =
-                    variant_path(enm.symbol.as_str(), target_enum_variant.symbol.as_str());
-                format!(
-                    "{source_path}(payload) => {}",
-                    tuple_variant(&target_path, [payload])
-                )
-            });
+            let weaken_arms = weakening
+                .arms
+                .iter()
+                .enumerate()
+                .map(|(source_index, arm)| {
+                    let source_variant = &source_enum.variants[source_index];
+                    let target_variant = &carrier.variants[arm.target.index()];
+                    let target_enum_variant = &enm.variants[arm.target.index()];
+                    let payload_materializer = variants[target_variant.id.index()];
+                    let payload = values.materialize_ref(payload_materializer, "payload");
+                    let payload = if target_variant.storage == RirDynStorage::Boxed {
+                        format!("Box::new({payload})")
+                    } else {
+                        payload
+                    };
+                    let source_path =
+                        variant_path(source_enum.symbol.as_str(), source_variant.symbol.as_str());
+                    let target_path =
+                        variant_path(enm.symbol.as_str(), target_enum_variant.symbol.as_str());
+                    format!(
+                        "{source_path}(payload) => {}",
+                        tuple_variant(&target_path, [payload])
+                    )
+                });
             let value = match_expr("value", weaken_arms);
             let access = target::mut_place_access(
                 "place",
@@ -1289,8 +1279,9 @@ impl EmitCx<'_> {
         let mut arms = weakening
             .arms
             .iter()
-            .map(|arm| {
-                let source_name = source_enum.variants[arm.source.index()].symbol.as_str();
+            .enumerate()
+            .map(|(source_index, arm)| {
+                let source_name = source_enum.variants[source_index].symbol.as_str();
                 let target_name = target_enum.variants[arm.target.index()].symbol.as_str();
                 format!(
                     "{source_symbol}::{source_name}(place) => {target_symbol}::{target_name}(place.reborrow())"
@@ -1335,11 +1326,7 @@ impl EmitCx<'_> {
         }
     }
 
-    fn stringify_helper_header(
-        &self,
-        helper: &super::rir::RirStringifyHelper,
-    ) -> (String, analysis::ContextUse, bool) {
-        let ctx_use = analysis::stringify_helper_context_use(self.program, helper);
+    fn stringify_helper_header(&self, helper: &super::rir::RirStringifyHelper) -> (String, bool) {
         let fallible =
             analysis::stringify_helper_fallible(self.program, &self.fallible_functions, helper);
         let return_ty = if fallible {
@@ -1350,15 +1337,15 @@ impl EmitCx<'_> {
         let header = format!(
             "fn {}<'cx, 'rt>({}: {}, {}: {}, {}: {}, value: &{}) -> {return_ty}",
             helper.symbol.as_str(),
-            target::runtime_param(ctx_use.rt),
+            target::runtime_param_name(),
             target::runtime_ctx_ref_ty(),
-            target::statics_param(ctx_use.statics),
-            target::statics_ref_ty(target::generated_statics_symbol(&self.program.ctx)),
-            target::globals_param(ctx_use.globals),
-            target::globals_ref_ty(target::generated_globals_symbol(&self.program.ctx)),
+            target::statics_param_name(),
+            target::statics_ref_ty(),
+            target::globals_param_name(),
+            target::globals_ref_ty(),
             self.ty(helper.ty),
         );
-        (header, ctx_use, fallible)
+        (header, fallible)
     }
 
     fn emit_enum_stringify_helper(
@@ -1368,7 +1355,7 @@ impl EmitCx<'_> {
         plans: &[super::rir::RirEnumStringifyVariant],
     ) {
         let enm = &self.program.enums[enum_id.index()];
-        let (header, ctx_use, fallible) = self.stringify_helper_header(helper);
+        let (header, fallible) = self.stringify_helper_header(helper);
         let mut arms = vec![];
         for (variant, plan) in enm.variants.iter().zip(plans) {
             let names = (0..variant.fields.len())
@@ -1425,7 +1412,7 @@ impl EmitCx<'_> {
                         )
                     ));
                 }
-                lines.push(self.stringify_push(field.ty, name, ctx_use, true));
+                lines.push(self.stringify_push(field.ty, name, true));
             }
             lines.push(match variant.kind {
                 RirVariantKind::Tuple => "out.push(')');".to_string(),
@@ -1461,7 +1448,7 @@ impl EmitCx<'_> {
         names: &[RirStringLiteralId],
     ) {
         let flag = &self.program.flags[flag_id.index()];
-        let (header, _, _) = self.stringify_helper_header(helper);
+        let (header, _) = self.stringify_helper_header(helper);
         let exact = flag
             .members
             .iter()
@@ -1524,14 +1511,14 @@ impl EmitCx<'_> {
             unreachable!("verified struct stringify helper")
         };
         let strukt = &self.program.structs[struct_id.index()];
-        let (header, ctx_use, fallible) = self.stringify_helper_header(helper);
+        let (header, fallible) = self.stringify_helper_header(helper);
         let display = rust_string(strukt.display.as_str());
         let fields = strukt
             .fields
             .iter()
             .map(|field| {
                 let name = field.symbol.as_str().to_string();
-                let push = self.stringify_push(field.ty, &format!("value.{name}"), ctx_use, false);
+                let push = self.stringify_push(field.ty, &format!("value.{name}"), false);
                 (name, push)
             })
             .collect::<Vec<_>>();
@@ -1567,7 +1554,6 @@ impl EmitCx<'_> {
         &self,
         kind: super::rir::RirStringifyReqKind,
         value: &str,
-        ctx_use: analysis::ContextUse,
         borrowed: bool,
     ) -> String {
         match kind {
@@ -1581,9 +1567,9 @@ impl EmitCx<'_> {
                 let call = format!(
                     "{}({}, {}, {}, {arg})",
                     helper.symbol.as_str(),
-                    target::runtime_param(ctx_use.rt),
-                    target::statics_param(ctx_use.statics),
-                    target::globals_param(ctx_use.globals),
+                    target::runtime_param_name(),
+                    target::statics_param_name(),
+                    target::globals_param_name(),
                 );
                 if analysis::stringify_helper_fallible(
                     self.program,
@@ -1598,11 +1584,11 @@ impl EmitCx<'_> {
             super::rir::RirStringifyReqKind::Override { function, mode } => {
                 let symbol = self.program.functions[function.index()].symbol.as_str();
                 let arg = match (mode, borrowed) {
-                    (RirParamSemantic::Value, true) => format!("*{value}"),
-                    (RirParamSemantic::Value, false) | (RirParamSemantic::SharedBorrow, true) => {
+                    (RirPassMode::Value, true) => format!("*{value}"),
+                    (RirPassMode::Value, false) | (RirPassMode::SharedBorrow, true) => {
                         value.to_string()
                     }
-                    (RirParamSemantic::SharedBorrow, false) => format!("&{value}"),
+                    (RirPassMode::SharedBorrow, false) => format!("&{value}"),
                     _ => unreachable!("verified stringify override mode"),
                 };
                 let call = if self.has_retained_callbacks() {
@@ -1619,13 +1605,7 @@ impl EmitCx<'_> {
         }
     }
 
-    fn stringify_push(
-        &self,
-        ty: RirTypeId,
-        value: &str,
-        ctx_use: analysis::ContextUse,
-        borrowed: bool,
-    ) -> String {
+    fn stringify_push(&self, ty: RirTypeId, value: &str, borrowed: bool) -> String {
         match self.program.types[ty.index()] {
             RirType::Float => {
                 let value = if borrowed {
@@ -1644,7 +1624,7 @@ impl EmitCx<'_> {
                     .program
                     .stringify_req(ty)
                     .expect("verified stringify field requirement");
-                let call = self.stringify_nested_call(req.kind, value, ctx_use, borrowed);
+                let call = self.stringify_nested_call(req.kind, value, borrowed);
                 format!("out.push_str(({call}).as_str());")
             }
             RirType::Void
@@ -1662,17 +1642,23 @@ impl EmitCx<'_> {
     fn emit_lambda_sig(&mut self, sig: &RirLambdaSig) {
         let policy = RirRustRepPolicy::new(self.program);
         let layout = policy.lambda_sig_layout(sig.id);
-        let symbol = policy.lambda_sig_symbol(sig.id);
+        let symbol = RirRustRepPolicy::lambda_sig_symbol(sig.id);
         let retained_callbacks = self.has_retained_callbacks();
         let mut params = vec![
-            format!("rt: {}", target::runtime_ctx_ref_ty()),
             format!(
-                "statics: {}",
-                target::statics_ref_ty(target::generated_statics_symbol(&self.program.ctx))
+                "{}: {}",
+                target::runtime_param_name(),
+                target::runtime_ctx_ref_ty()
             ),
             format!(
-                "globals: {}",
-                target::globals_ref_ty(target::generated_globals_symbol(&self.program.ctx))
+                "{}: {}",
+                target::statics_param_name(),
+                target::statics_ref_ty()
+            ),
+            format!(
+                "{}: {}",
+                target::globals_param_name(),
+                target::globals_ref_ty()
             ),
         ];
         if retained_callbacks {
@@ -1695,7 +1681,7 @@ impl EmitCx<'_> {
         params.extend(sig.params.iter().enumerate().map(|(index, param)| {
             format!(
                 "arg_{index}: {}",
-                policy.callable_param_ty(param.ty, param.abi, param.escape)
+                policy.callable_param_ty(param.ty, param.mode, param.escape)
             )
         }));
         let fallible = layout
@@ -1722,10 +1708,10 @@ impl EmitCx<'_> {
         let lifetime = policy.lambda_sig_impl_generics(sig.id);
 
         let trace = self.trace_plan.needs_lambda_sig_trace(sig.id);
-        if policy.lambda_sig_copyable(sig.id) {
-            self.w.line("#[derive(Clone, Copy)]");
-        } else if policy.lambda_sig_cloneable(sig.id) {
-            self.w.line("#[derive(Clone)]");
+        let derives = policy.lambda_sig_derives(sig.id);
+        if !derives.is_empty() {
+            self.w
+                .line(format_args!("#[derive({})]", derives.join(", ")));
         }
         self.w.block(format_args!("enum {symbol}{lifetime}"), |w| {
             for variant in &layout.variants {
@@ -1746,7 +1732,7 @@ impl EmitCx<'_> {
                         .map(|(index, capture)| {
                             format!(
                                 "c{index}: {}",
-                                policy.capture_field_ty(capture.ty, capture.abi)
+                                policy.capture_field_ty(capture.ty, capture.mode)
                             )
                         })
                         .collect::<Vec<_>>();
@@ -1806,7 +1792,12 @@ impl EmitCx<'_> {
                                             };
                                             w.line(format_args!(
                                                 "let c{index} = {};",
-                                                target::rt_heap_with("rt", "env", "env", &value)
+                                                target::rt_heap_with(
+                                                    target::runtime_param_name(),
+                                                    "env",
+                                                    "env",
+                                                    &value
+                                                )
                                             ));
                                         }
                                         let capture_args = (0..variant_layout.captures.len())
@@ -1866,7 +1857,7 @@ impl EmitCx<'_> {
         variants: &[LambdaVariantLayout<'_>],
     ) {
         let policy = RirRustRepPolicy::new(self.program);
-        let symbol = policy.lambda_sig_symbol(sig);
+        let symbol = RirRustRepPolicy::lambda_sig_symbol(sig);
         let lifetime = policy.lambda_sig_impl_generics(sig);
         let ty = format!("{symbol}{lifetime}");
         self.w.block(
@@ -1926,7 +1917,7 @@ impl EmitCx<'_> {
 
     fn emit_scoped_lambda_thunk(&mut self, sig: &RirLambdaSig, fallible: bool) {
         let policy = RirRustRepPolicy::new(self.program);
-        let symbol = policy.lambda_sig_symbol(sig.id);
+        let symbol = RirRustRepPolicy::lambda_sig_symbol(sig.id);
         let lifetime = policy.lambda_sig_impl_generics(sig.id);
         let (args_ty, ret_ty) = policy.scoped_lambda_sig_args_ret(sig.id);
         let result_ty = target::result_ty(&ret_ty);
@@ -1945,14 +1936,8 @@ impl EmitCx<'_> {
             "'scoped_cx"
         };
         let rt_ty = target::runtime_ctx_ty_with_lifetimes(ctx_lifetime, "'_");
-        let statics_ty = format!(
-            "{}<{ctx_lifetime}>",
-            target::generated_statics_symbol(&self.program.ctx)
-        );
-        let globals_ty = format!(
-            "{}<{ctx_lifetime}>",
-            target::generated_globals_symbol(&self.program.ctx)
-        );
+        let statics_ty = format!("{}<{ctx_lifetime}>", target::generated_statics_symbol());
+        let globals_ty = format!("{}<{ctx_lifetime}>", target::generated_globals_symbol());
         let thunk_generics = if needs_ctx_lifetime {
             ""
         } else {
@@ -1975,15 +1960,18 @@ impl EmitCx<'_> {
                     |w| {
                         w.line(format_args!("let state = unsafe {{ &mut *state.as_ptr().cast::<{state_tuple}>() }};"));
                         w.line(format_args!(
-                            "let rt = unsafe {{ state.1.cast::<{rt_ty}>().as_mut() }};"
+                            "let {} = unsafe {{ state.1.cast::<{rt_ty}>().as_mut() }};",
+                            target::runtime_param_name()
                         ));
                         w.line(format_args!(
-                            "let statics = unsafe {{ state.2.cast::<{statics_ty}>().as_ref() }};"
+                            "let {} = unsafe {{ state.2.cast::<{statics_ty}>().as_ref() }};",
+                            target::statics_param_name()
                         ));
                         w.line(format_args!(
-                            "let globals = unsafe {{ state.3.cast::<{globals_ty}>().as_ref() }};"
+                            "let {} = unsafe {{ state.3.cast::<{globals_ty}>().as_ref() }};",
+                            target::globals_param_name()
                         ));
-                        w.line(format_args!("{};", target::runtime_validate_reentry("rt")));
+                        w.line(format_args!("{};", target::runtime_validate_reentry(target::runtime_param_name())));
                         if retained_callbacks {
                             let owner_ty = target::runtime_owner_handle_ty();
                             let callbacks_ty = format!(
@@ -2053,24 +2041,23 @@ impl EmitCx<'_> {
     }
 
     fn emit_function(&mut self, function: &RirFunction) {
-        let ctx_use = analysis::function_context_use(self.program, function);
         let policy = RirRustRepPolicy::new(self.program);
         let retained_callbacks = self.has_retained_callbacks();
         let mut params = vec![
             format!(
                 "{}: {}",
-                target::runtime_param(ctx_use.rt),
+                target::runtime_param_name(),
                 target::runtime_ctx_ref_ty()
             ),
             format!(
                 "{}: {}",
-                target::statics_param(ctx_use.statics),
-                target::statics_ref_ty(target::generated_statics_symbol(&self.program.ctx))
+                target::statics_param_name(),
+                target::statics_ref_ty()
             ),
             format!(
                 "{}: {}",
-                target::globals_param(ctx_use.globals),
-                target::globals_ref_ty(target::generated_globals_symbol(&self.program.ctx))
+                target::globals_param_name(),
+                target::globals_ref_ty()
             ),
         ];
         if retained_callbacks {
@@ -2091,8 +2078,11 @@ impl EmitCx<'_> {
             ]);
         }
         params.extend(function.params.iter().map(|param| {
-            let local = &function.locals[param.local.index()];
-            let mutability = if matches!(param.abi, RirParamAbi::MutPlace | RirParamAbi::DynBorrow)
+            let local = &function.locals[param.index()];
+            let RirLocalBinding::Parameter { mode, escape } = local.binding else {
+                unreachable!("verified parameter local binding")
+            };
+            let mutability = if matches!(mode, RirPassMode::MutPlace | RirPassMode::DynBorrow)
                 || self.local_needs_mut_binding(local.ty)
             {
                 "mut "
@@ -2102,7 +2092,7 @@ impl EmitCx<'_> {
             format!(
                 "{mutability}{}: {}",
                 local.symbol.as_str(),
-                policy.callable_param_ty(param.ty, param.abi, param.escape)
+                policy.callable_param_ty(local.ty, mode, escape)
             )
         }));
         let ret = self.function_ret_ty(function);
@@ -2173,7 +2163,7 @@ impl EmitCx<'_> {
             lambda
                 .captures
                 .iter()
-                .any(|capture| capture.semantic == RirParamSemantic::MutBorrow)
+                .any(|capture| capture.mode == RirPassMode::MutBorrow)
         })
     }
 
@@ -2194,8 +2184,7 @@ impl EmitCx<'_> {
                 .line(format_args!("let {}: {ty};", cell.symbol.as_str()));
         }
         for local in &function.locals {
-            if local.payload_ref
-                || function.params.iter().any(|param| param.local == local.id)
+            if !matches!(local.binding, RirLocalBinding::Value)
                 || self
                     .program
                     .cells
@@ -2213,18 +2202,11 @@ impl EmitCx<'_> {
     }
 
     fn emit_scoped_place_cells(&mut self, function: &RirFunction) {
-        let cells = self
-            .program
-            .scoped_place_cells
-            .iter()
-            .filter(|cell| {
-                cell.owner == function.id && !Self::scoped_place_cell_needs_slot_init(cell)
-            })
-            .map(|cell| cell.id)
-            .collect::<Vec<_>>();
-        for cell in cells {
-            let cell = self.program.scoped_place_cells[cell.index()].clone();
-            self.emit_scoped_place_cell_init(function, &cell);
+        for index in 0..self.program.scoped_place_cells.len() {
+            let cell = &self.program.scoped_place_cells[index];
+            if cell.owner == function.id && !Self::scoped_place_cell_needs_slot_init(cell) {
+                self.emit_scoped_place_cell_init(function, cell.id);
+            }
         }
     }
 
@@ -2238,7 +2220,7 @@ impl EmitCx<'_> {
         match stmt {
             RirStmt::Init { local, value } => {
                 let local_data = &function.locals[local.index()];
-                let value = self.rvalue_at(function, index, value);
+                let value = self.rvalue(function, index, value);
                 if predeclared {
                     self.w
                         .line(format_args!("{} = {value};", local_data.symbol.as_str()));
@@ -2267,7 +2249,7 @@ impl EmitCx<'_> {
             }
             RirStmt::GlobalSetRoot { global, value }
             | RirStmt::GlobalUpdateRoot { global, value } => {
-                let value = self.rvalue_at(function, index, value);
+                let value = self.rvalue(function, index, value);
                 let slot = RustValues::global_slot_expr(self.program, *global);
                 let set = if self
                     .program
@@ -2284,7 +2266,7 @@ impl EmitCx<'_> {
                 let (root_ty, root) = values
                     .mut_place_access_arg(&place.access)
                     .expect("verified mutable-place set root");
-                let slot_ty = place.ty;
+                let slot_ty = self.program.verified_mut_place_ty(function, place);
                 let (mut prelude, place) = if place.projections.is_empty() {
                     (vec![], root)
                 } else {
@@ -2294,7 +2276,7 @@ impl EmitCx<'_> {
                     self.w.line(format_args!("{line}"));
                 }
                 let value_tmp = format!("__anv_value_{index}");
-                let value = self.rvalue_at(function, index, value);
+                let value = self.rvalue(function, index, value);
                 self.w.line(format_args!("let {value_tmp} = {value};"));
                 let set = if self.program.collection_replace_ty(slot_ty) {
                     target::mut_place_replace_collection(
@@ -2308,7 +2290,7 @@ impl EmitCx<'_> {
                 self.w.line(format_args!("{set};"));
             }
             RirStmt::Assign { dst, value } => {
-                let value = self.rvalue_at(function, index, value);
+                let value = self.rvalue(function, index, value);
                 let values = RustValues::new(self.program, function);
                 self.w.line(format_args!("{};", values.assign(dst, &value)));
             }
@@ -2326,11 +2308,10 @@ impl EmitCx<'_> {
                 }
             }
             RirStmt::ScopedPlaceCellInit { cell } => {
-                let cell = &self.program.scoped_place_cells[cell.index()];
-                self.emit_scoped_place_cell_init(function, cell);
+                self.emit_scoped_place_cell_init(function, *cell);
             }
             RirStmt::CellSet { cell, value } => {
-                let value = self.rvalue_at(function, index, value);
+                let value = self.rvalue(function, index, value);
                 let set = self.cell_set(function, *cell, &value);
                 self.w.line(format_args!("{set};"));
             }
@@ -2341,7 +2322,7 @@ impl EmitCx<'_> {
                         self.program.scoped_place_cells[cell.index()].payload_ty
                     }
                 };
-                let value = self.rvalue_at(function, index, value);
+                let value = self.rvalue(function, index, value);
                 self.w.line(format_args!(
                     "{};",
                     self.mut_place_set(ty, &self.scoped_place_cell_ref(function, *cell), &value)
@@ -2349,24 +2330,23 @@ impl EmitCx<'_> {
             }
             RirStmt::DataRefSet {
                 object,
-                dataref,
-                projections,
+                place,
+                suffix,
                 value,
-                ty,
             } => {
-                let value = self.rvalue_at(function, index, value);
+                let value = self.rvalue(function, index, value);
                 self.w.line(format_args!(
                     "{};",
-                    self.dataref_set(function, object, *dataref, projections, *ty, &value)
+                    self.dataref_set(function, index, object, *place, suffix, &value)
                 ));
             }
             RirStmt::SequenceSlotSet {
                 collection,
-                index,
+                step,
                 value,
             } => {
                 let value = RustValues::new(self.program, function).value_operand(value);
-                let set = self.sequence_slot_set(function, collection, *index, &value);
+                let set = self.sequence_slot_set(function, collection, *step, &value);
                 self.w.line(format_args!("{set};"));
             }
             RirStmt::MapValueSet { map, index, value } => self.w.line(format_args!(
@@ -2374,7 +2354,7 @@ impl EmitCx<'_> {
                 self.map_value_set(function, map, *index, value)
             )),
             RirStmt::Eval(value) => {
-                let value = self.rvalue_at(function, index, value);
+                let value = self.rvalue(function, index, value);
                 self.w.line(format_args!("{value};"));
             }
             RirStmt::If(branch) => self.emit_if(function, branch, predeclared),
@@ -2797,7 +2777,7 @@ impl EmitCx<'_> {
             RirPatternTest::Literal { path, value } => {
                 let values = RustValues::new(self.program, function);
                 let const_ty = self.program.consts[value.index()].ty;
-                let lhs = if let Some(place) = self.subject_pattern_place_operand(match_, path) {
+                let lhs = if let Some(place) = Self::subject_pattern_place_operand(match_, path) {
                     values.value_operand(&RirOperand::Place(place))
                 } else {
                     let Some(source) = self.pattern_path_ref_source(
@@ -2831,7 +2811,7 @@ impl EmitCx<'_> {
                     .position(|ty| ty == &RirType::Flag(*flag))
                     .map(RirTypeId::from_index)
                     .expect("verified flag pattern type");
-                let lhs = if let Some(place) = self.subject_pattern_place_operand(match_, path) {
+                let lhs = if let Some(place) = Self::subject_pattern_place_operand(match_, path) {
                     values.value_operand(&RirOperand::Place(place))
                 } else {
                     let Some(source) = self.pattern_path_ref_source(
@@ -2852,7 +2832,10 @@ impl EmitCx<'_> {
                 enum_id,
                 variant,
             } if path.steps.is_empty() => {
-                let RirType::Enum(subject_enum) = self.program.types[match_.subject.ty.index()]
+                let RirType::Enum(subject_enum) = self.program.types[self
+                    .program
+                    .verified_place_ty(function, &match_.subject)
+                    .index()]
                 else {
                     return "false".into();
                 };
@@ -2920,7 +2903,7 @@ impl EmitCx<'_> {
         path: &RirPatternPath,
         mutable: bool,
     ) -> Option<String> {
-        if !mutable && let Some(place) = self.subject_pattern_place_operand(match_, path) {
+        if !mutable && let Some(place) = Self::subject_pattern_place_operand(match_, path) {
             return Some(
                 RustValues::new(self.program, function).operand_ref(&RirOperand::Place(place)),
             );
@@ -2930,7 +2913,12 @@ impl EmitCx<'_> {
             "{borrow} {}",
             RustPlaces::new(self.program, function).local_place(&match_.subject)
         );
-        self.pattern_path_ref_steps_source(match_.subject.ty, source, &path.steps, mutable)
+        self.pattern_path_ref_steps_source(
+            self.program.verified_place_ty(function, &match_.subject),
+            source,
+            &path.steps,
+            mutable,
+        )
     }
 
     fn pattern_path_ref_steps_source(
@@ -2941,47 +2929,52 @@ impl EmitCx<'_> {
         mutable: bool,
     ) -> Option<String> {
         for step in steps {
-            match *step {
-                RirPatternPathStep::TupleField(field) => {
-                    let RirType::Tuple(tuple) = self.program.types[current_ty.index()] else {
+            match step {
+                RirPatternPathStep::Place(step) => {
+                    if step.source_ty != current_ty {
                         return None;
-                    };
-                    let field = &self.program.tuples[tuple.index()].fields[field as usize];
+                    }
+                    if matches!(
+                        step.kind,
+                        RirPlaceStepKind::ArrayIndex { .. }
+                            | RirPlaceStepKind::ListIndex { .. }
+                            | RirPlaceStepKind::SliceIndex { .. }
+                    ) {
+                        return None;
+                    }
+                    let symbol = field_step_symbol(self.program, step);
                     let borrow = if mutable { "&mut" } else { "&" };
-                    source = format!("{borrow} ({source}).{}", field.symbol.as_str());
-                    current_ty = field.ty;
+                    source = format!("{borrow} ({source}).{symbol}");
+                    current_ty = step.target_ty;
                 }
-                RirPatternPathStep::Field(field) => {
-                    let RirType::Struct(strukt) = self.program.types[current_ty.index()] else {
+                RirPatternPathStep::OptionalSome {
+                    source_ty,
+                    target_ty,
+                } => {
+                    if *source_ty != current_ty {
                         return None;
-                    };
-                    let field = &self.program.structs[strukt.index()].fields[field.index()];
-                    let borrow = if mutable { "&mut" } else { "&" };
-                    source = format!("{borrow} ({source}).{}", field.symbol.as_str());
-                    current_ty = field.ty;
-                }
-                RirPatternPathStep::OptionalSome => {
-                    let RirType::Option(inner) = self.program.types[current_ty.index()] else {
-                        return None;
-                    };
+                    }
                     let method = if mutable { "as_mut" } else { "as_ref" };
                     source = format!("({source}).{method}().unwrap()");
-                    current_ty = inner;
+                    current_ty = *target_ty;
                 }
                 RirPatternPathStep::EnumTupleField {
+                    source_ty,
+                    target_ty,
                     enum_id,
                     variant,
                     field,
                 }
                 | RirPatternPathStep::EnumStructField {
+                    source_ty,
+                    target_ty,
                     enum_id,
                     variant,
                     field,
                 } => {
-                    if !matches!(
-                        self.program.types[current_ty.index()],
-                        RirType::Enum(found) if found == enum_id
-                    ) {
+                    if *source_ty != current_ty
+                        || !matches!(self.program.types[current_ty.index()], RirType::Enum(found) if found == *enum_id)
+                    {
                         return None;
                     }
                     let enm = &self.program.enums[enum_id.index()];
@@ -2993,7 +2986,7 @@ impl EmitCx<'_> {
                         RirVariantKind::Tuple => {
                             let fields = (0..variant.fields.len())
                                 .map(|index| {
-                                    if index == field as usize {
+                                    if index == *field as usize {
                                         selected.into()
                                     } else {
                                         "_".into()
@@ -3003,14 +2996,14 @@ impl EmitCx<'_> {
                             format!("{path}({})", comma(fields))
                         }
                         RirVariantKind::Struct => {
-                            let field = &variant.fields[field as usize];
+                            let field = &variant.fields[*field as usize];
                             format!("{path} {{ {}: {selected}, .. }}", field.symbol.as_str())
                         }
                     };
                     source = format!(
                         "match ({source}) {{ {pattern} => {selected}, _ => unreachable!() }}"
                     );
-                    current_ty = variant.fields[field as usize].ty;
+                    current_ty = *target_ty;
                 }
             }
         }
@@ -3018,39 +3011,20 @@ impl EmitCx<'_> {
     }
 
     fn subject_pattern_place_operand(
-        &self,
         match_: &RirPatternMatch,
         path: &RirPatternPath,
     ) -> Option<RirPlace> {
-        let mut projections = match_.subject.projections.clone();
-        let mut ty = match_.subject.ty;
-        for step in &path.steps {
-            match *step {
-                RirPatternPathStep::TupleField(field) => {
-                    let RirType::Tuple(tuple) = self.program.types[ty.index()] else {
-                        return None;
-                    };
-                    let field = &self.program.tuples[tuple.index()].fields[field as usize];
-                    projections.push(RirProjection::TupleField(field.id));
-                    ty = field.ty;
-                }
-                RirPatternPathStep::Field(field) => {
-                    let RirType::Struct(strukt) = self.program.types[ty.index()] else {
-                        return None;
-                    };
-                    projections.push(RirProjection::Field(field));
-                    ty = self.program.structs[strukt.index()].fields[field.index()].ty;
-                }
-                RirPatternPathStep::OptionalSome
-                | RirPatternPathStep::EnumTupleField { .. }
-                | RirPatternPathStep::EnumStructField { .. } => return None,
-            }
-        }
-        Some(RirPlace {
-            root: match_.subject.root,
-            projections,
-            ty,
-        })
+        let mut place = match_.subject.clone();
+        place.projections.extend(
+            path.steps
+                .iter()
+                .map(|step| match step {
+                    RirPatternPathStep::Place(step) => Some(*step),
+                    _ => None,
+                })
+                .collect::<Option<Vec<_>>>()?,
+        );
+        Some(place)
     }
 
     fn emit_pattern_bindings(
@@ -3090,6 +3064,7 @@ impl EmitCx<'_> {
                 RirPatternBindingMode::Alias => {
                     self.w
                         .line(format_args!("let {} = {source};", local.symbol.as_str()));
+                    self.emit_scoped_place_cell_inits_for_local(function, binding.local);
                 }
             }
             return;
@@ -3109,11 +3084,13 @@ impl EmitCx<'_> {
                 enum_id,
                 variant,
                 field,
+                ..
             }
             | RirPatternPathStep::EnumStructField {
                 enum_id,
                 variant,
                 field,
+                ..
             } => (*enum_id, *variant, *field as usize),
             _ => return None,
         };
@@ -3161,7 +3138,7 @@ impl EmitCx<'_> {
                 function,
                 index,
                 match_,
-                match_.map.ty,
+                self.program.verified_mut_place_ty(function, &match_.map),
                 &map,
                 &key_tmp,
                 &guard_tmp,
@@ -3175,7 +3152,7 @@ impl EmitCx<'_> {
                 function,
                 index,
                 match_,
-                match_.map.ty,
+                self.program.verified_mut_place_ty(function, &match_.map),
                 &map,
                 &key_tmp,
                 &guard_tmp,
@@ -3229,9 +3206,10 @@ impl EmitCx<'_> {
             payload.symbol.as_str(),
             target::scoped_mut_place_cell_new(
                 &target::mut_place_projected(map, &format!("&{ops}")),
-                &target::runtime_safepoint_state("rt"),
+                &target::runtime_safepoint_state(target::runtime_param_name()),
             )
         ));
+        self.emit_scoped_place_cell_inits_for_local(function, payload.id);
     }
 
     fn emit_map_entry_alias_drop(
@@ -3281,8 +3259,10 @@ impl EmitCx<'_> {
             unreachable!("verified dynamic match carrier")
         };
         let enm = &self.program.enums[id.index()];
-        for (arm_index, arm) in match_.arms.iter().enumerate() {
-            let patterns = arm.variants.iter().map(|variant| {
+        let mapping = &match_.mappings[0];
+        for (arm_index, (arm, variants)) in match_.arms.iter().zip(&mapping.variants).enumerate() {
+            let variants = &self.program.dyn_variant_sets[variants.index()];
+            let patterns = variants.variants.iter().map(|variant| {
                 let variant = &enm.variants[variant.index()];
                 format!(
                     "{}(..)",
@@ -3305,8 +3285,8 @@ impl EmitCx<'_> {
                         .dyn_payload_projection_descriptor(
                             &ops,
                             match_.carrier,
-                            &arm.variants,
-                            arm.target,
+                            &variants.variants,
+                            variants.target,
                         );
                     this.w.line(descriptor.struct_decl);
                     this.w.line(descriptor.impl_decl);
@@ -3316,9 +3296,10 @@ impl EmitCx<'_> {
                         binding.symbol.as_str(),
                         target::scoped_mut_place_cell_new(
                             &target::mut_place_projected(&source, &format!("&{}", descriptor.ctor)),
-                            &target::runtime_safepoint_state("rt"),
+                            &target::runtime_safepoint_state(target::runtime_param_name()),
                         )
                     ));
+                    this.emit_scoped_place_cell_inits_for_local(function, binding.id);
                 }
                 this.emit_structured_block(function, &arm.block, predeclared);
             });
@@ -3327,15 +3308,17 @@ impl EmitCx<'_> {
         let emit_fallback = |this: &mut Self| {
             if let super::rir::RirDynMatchFallbackBinding::Alias(binding) = match_.fallback_binding
             {
+                let binding_id = binding;
                 let binding = &function.locals[binding.index()];
                 this.w.line(format!(
                     "let {} = {};",
                     binding.symbol.as_str(),
                     target::scoped_mut_place_cell_new(
                         &format!("{source_local}.reborrow()"),
-                        &target::runtime_safepoint_state("rt"),
+                        &target::runtime_safepoint_state(target::runtime_param_name()),
                     )
                 ));
+                this.emit_scoped_place_cell_inits_for_local(function, binding_id);
             }
             this.emit_structured_block(function, &match_.fallback, predeclared);
         };
@@ -3367,80 +3350,71 @@ impl EmitCx<'_> {
         let symbol = self.program.dyn_borrow_symbol(carrier.id);
         let local = function.locals[local.index()].symbol.as_str();
         self.w.line(format!("match &mut {local} {{"));
-        for variant in &carrier.variants {
+        let mapping = &match_.mappings[0];
+        for (variant, target_arm) in carrier.variants.iter().zip(&mapping.targets) {
             let name = enm.variants[variant.id.index()].symbol.as_str();
             self.indented(|this| {
                 this.w.line(format!("{symbol}::{name}(place) => {{"));
                 this.indented(|this| {
-                    if let Some(arm) = match_
-                        .arms
-                        .iter()
-                        .find(|arm| arm.variants.contains(&variant.id))
-                    {
-                        match arm.binding {
-                            super::rir::RirDynMatchBinding::Alias(binding) => {
-                                let binding = &function.locals[binding.index()];
-                                this.w.line(format!(
-                                    "let {} = {};",
-                                    binding.symbol.as_str(),
-                                    target::scoped_mut_place_cell_new(
-                                        &target::mut_place_reborrow("place"),
-                                        &target::runtime_safepoint_state("rt"),
-                                    )
-                                ));
-                            }
-                            super::rir::RirDynMatchBinding::Materialize {
-                                local: binding,
-                                materializer,
-                            } => {
-                                let binding = &function.locals[binding.index()];
-                                let payload = RustValues::new(this.program, function)
-                                    .materialize_ref(materializer, "value");
-                                let value = target::mut_place_access(
-                                    &target::mut_place_reborrow("place"),
-                                    target::runtime_param_name(),
-                                    &format!("Ok({payload})"),
-                                );
-                                this.w
-                                    .line(format!("{} = {value};", binding.symbol.as_str()));
-                            }
-                            super::rir::RirDynMatchBinding::Discard => {}
-                            super::rir::RirDynMatchBinding::Take(_) => {
-                                unreachable!("verified borrowed dynamic match binding")
-                            }
-                        }
-                        this.emit_structured_block(function, &arm.block, predeclared);
-                    } else {
+                    let Some(arm) = target_arm.map(|index| &match_.arms[index]) else {
                         this.emit_borrowed_dyn_fallback(
                             function,
                             match_,
                             &format!("{symbol}::{name}(place.reborrow())"),
                             predeclared,
                         );
+                        return;
+                    };
+                    match arm.binding {
+                        super::rir::RirDynMatchBinding::Alias(binding) => {
+                            let binding = &function.locals[binding.index()];
+                            this.w.line(format!(
+                                "let {} = {};",
+                                binding.symbol.as_str(),
+                                target::scoped_mut_place_cell_new(
+                                    &target::mut_place_reborrow("place"),
+                                    &target::runtime_safepoint_state(target::runtime_param_name()),
+                                )
+                            ));
+                        }
+                        super::rir::RirDynMatchBinding::Materialize {
+                            local: binding,
+                            materializer,
+                        } => {
+                            let binding = &function.locals[binding.index()];
+                            let payload = RustValues::new(this.program, function)
+                                .materialize_ref(materializer, "value");
+                            let value = target::mut_place_access(
+                                &target::mut_place_reborrow("place"),
+                                target::runtime_param_name(),
+                                &format!("Ok({payload})"),
+                            );
+                            this.w
+                                .line(format!("{} = {value};", binding.symbol.as_str()));
+                        }
+                        super::rir::RirDynMatchBinding::Discard => {}
+                        super::rir::RirDynMatchBinding::Take(_) => {
+                            unreachable!("verified borrowed dynamic match binding")
+                        }
                     }
+                    this.emit_structured_block(function, &arm.block, predeclared);
                 });
                 this.w.line("}");
             });
         }
-        self.emit_borrowed_owned_match_arm(
-            function,
-            match_,
-            carrier,
-            &format!("{symbol}::Owned"),
-            predeclared,
-        );
-        for weakening in self
-            .program
-            .dyn_weakenings
-            .iter()
-            .filter(|w| w.target == carrier.id)
-        {
-            let source = &self.program.dyn_carriers[weakening.source.index()];
+        for mapping in &match_.mappings {
+            let source = &self.program.dyn_carriers[mapping.carrier.index()];
+            let pattern = if mapping.carrier == carrier.id {
+                format!("{symbol}::Owned")
+            } else {
+                format!("{symbol}::OwnedFrom{}", source.id.index())
+            };
             self.emit_borrowed_owned_match_arm(
                 function,
                 match_,
                 source,
-                &format!("{symbol}::OwnedFrom{}", source.id.index()),
+                mapping,
+                &pattern,
                 predeclared,
             );
         }
@@ -3452,6 +3426,7 @@ impl EmitCx<'_> {
         function: &RirFunction,
         match_: &super::rir::RirDynMatch,
         source: &RirDynCarrier,
+        mapping: &super::rir::RirDynMatchMapping,
         pattern: &str,
         predeclared: bool,
     ) {
@@ -3465,21 +3440,17 @@ impl EmitCx<'_> {
                     unreachable!("verified dynamic match source carrier")
                 };
                 let enm = &this.program.enums[id.index()];
-                let supported = match_
-                    .arms
-                    .iter()
-                    .filter_map(|arm| {
-                        let variants = source
-                            .variants
-                            .iter()
-                            .filter(|variant| variant.concrete_ty == arm.target)
-                            .map(|variant| variant.id)
-                            .collect::<Vec<_>>();
-                        (!variants.is_empty()).then_some((arm, variants))
-                    })
-                    .collect::<Vec<_>>();
-                for (index, (arm, variants)) in supported.iter().enumerate() {
+                let mut emitted = 0;
+                for (arm, variants) in match_.arms.iter().zip(&mapping.variants) {
+                    let variants = &this.program.dyn_variant_sets[variants.index()];
+                    if variants.variants.is_empty() {
+                        continue;
+                    }
+                    let index = emitted;
+                    emitted += 1;
+
                     let patterns = variants
+                        .variants
                         .iter()
                         .map(|variant| {
                             let variant = &enm.variants[variant.index()];
@@ -3505,7 +3476,10 @@ impl EmitCx<'_> {
                             );
                             let values = RustValues::new(this.program, function);
                             let descriptor = values.dyn_payload_projection_descriptor(
-                                &ops, source.id, variants, arm.target,
+                                &ops,
+                                source.id,
+                                &variants.variants,
+                                variants.target,
                             );
                             this.w.line(descriptor.struct_decl);
                             this.w.line(descriptor.impl_decl);
@@ -3521,7 +3495,9 @@ impl EmitCx<'_> {
                                         binding.symbol.as_str(),
                                         target::scoped_mut_place_cell_new(
                                             &projected,
-                                            &target::runtime_safepoint_state("rt"),
+                                            &target::runtime_safepoint_state(
+                                                target::runtime_param_name()
+                                            ),
                                         )
                                     ));
                                 }
@@ -3559,7 +3535,7 @@ impl EmitCx<'_> {
                     };
                     this.emit_borrowed_dyn_fallback(function, match_, &constructor, predeclared);
                 };
-                if supported.is_empty() {
+                if emitted == 0 {
                     emit_fallback(this);
                 } else {
                     this.w.line("else {");
@@ -3605,46 +3581,55 @@ impl EmitCx<'_> {
         let enm = &self.program.enums[id.index()];
         let source = self.owned_value_at(function, index, value);
         self.w.line(format!("match {source} {{"));
-        for variant in &carrier.variants {
-            let rir_variant = &enm.variants[variant.id.index()];
-            let path = variant_path(enm.symbol.as_str(), rir_variant.symbol.as_str());
-            let arm = match_
-                .arms
+        let mapping = &match_.mappings[0];
+        for (arm, variants) in match_.arms.iter().zip(&mapping.variants) {
+            let variants = &self.program.dyn_variant_sets[variants.index()];
+            if variants.variants.is_empty() {
+                continue;
+            }
+            let patterns = variants
+                .variants
                 .iter()
-                .find(|arm| arm.variants.contains(&variant.id));
+                .map(|variant| {
+                    let rir_variant = &enm.variants[variant.index()];
+                    let path = variant_path(enm.symbol.as_str(), rir_variant.symbol.as_str());
+                    format!("{path}(payload)")
+                })
+                .collect::<Vec<_>>()
+                .join(" | ");
+            let variant = &carrier.variants[variants.variants[0].index()];
             self.indented(|this| {
-                this.w.line(format!("{path}(payload) => {{"));
+                this.w.line(format!("{patterns} => {{"));
                 this.indented(|this| {
-                    if let Some(arm) = arm {
-                        if let super::rir::RirDynMatchBinding::Take(binding) = arm.binding {
-                            let binding = &function.locals[binding.index()];
-                            let payload = if variant.storage == RirDynStorage::Boxed {
-                                "*payload"
-                            } else {
-                                "payload"
-                            };
-                            this.w
-                                .line(format!("let {} = {payload};", binding.symbol.as_str()));
-                        }
-                        this.emit_structured_block(function, &arm.block, predeclared);
-                    } else {
-                        if let super::rir::RirDynMatchFallbackBinding::Take(binding) =
-                            match_.fallback_binding
-                        {
-                            let binding = &function.locals[binding.index()];
-                            let payload = "payload";
-                            this.w.line(format!(
-                                "let {} = {};",
-                                binding.symbol.as_str(),
-                                tuple_variant(&path, [payload.to_string()])
-                            ));
-                        }
-                        this.emit_structured_block(function, &match_.fallback, predeclared);
+                    if let super::rir::RirDynMatchBinding::Take(binding) = arm.binding {
+                        let binding = &function.locals[binding.index()];
+                        let payload = if variant.storage == RirDynStorage::Boxed {
+                            "*payload"
+                        } else {
+                            "payload"
+                        };
+                        this.w
+                            .line(format!("let {} = {payload};", binding.symbol.as_str()));
                     }
+                    this.emit_structured_block(function, &arm.block, predeclared);
                 });
                 this.w.line("}");
             });
         }
+        self.indented(|this| {
+            this.w.line("payload => {");
+            this.indented(|this| {
+                if let super::rir::RirDynMatchFallbackBinding::Take(binding) =
+                    match_.fallback_binding
+                {
+                    let binding = &function.locals[binding.index()];
+                    this.w
+                        .line(format!("let {} = payload;", binding.symbol.as_str()));
+                }
+                this.emit_structured_block(function, &match_.fallback, predeclared);
+            });
+            this.w.line("}");
+        });
         self.w.line("}");
     }
 
@@ -3659,13 +3644,17 @@ impl EmitCx<'_> {
             self.emit_mut_place_option_match(function, index, match_, predeclared);
             return;
         };
-        let RirType::Option(_) = self.program.types[subject.ty.index()] else {
+        let RirType::Option(_) =
+            self.program.types[self.program.verified_place_ty(function, subject).index()]
+        else {
             unreachable!("verified option match")
         };
         let places = RustPlaces::new(self.program, function);
         let subject = if let RirPlaceRoot::Local(local) = subject.root
-            && places.payload_ref_cell_local(local)
-        {
+            && matches!(
+                function.locals[local.index()].binding,
+                RirLocalBinding::ScopedPlacePayload
+            ) {
             let tmp = format!("__anv_option_subject_{index}");
             let value = RustValues::new(self.program, function)
                 .value_operand(&RirOperand::Place(subject.clone()));
@@ -3674,9 +3663,9 @@ impl EmitCx<'_> {
         } else {
             places.local_place(subject)
         };
-        let payload_ref = match_.payload.is_some_and(RirOptionPayloadBinding::is_ref);
+        let borrows_payload = match_.payload.is_some_and(RirOptionPayloadBinding::is_ref);
         let payload_escapes = match_.payload.is_some_and(RirOptionPayloadBinding::escapes);
-        let borrow = if payload_ref { "&mut " } else { "&" };
+        let borrow = if borrows_payload { "&mut " } else { "&" };
         if payload_escapes {
             let RirOptionPayloadBinding::Ref { local: payload, .. } =
                 match_.payload.expect("escaping option payload local")
@@ -3692,21 +3681,25 @@ impl EmitCx<'_> {
                 this.emit_structured_block(function, &match_.none_block, predeclared);
             });
             self.w.line("};");
+            self.emit_scoped_place_cell_inits_for_local(function, payload);
             self.emit_structured_block(function, &match_.some_block, predeclared);
             return;
         }
         self.w.line(format_args!("match {borrow}{subject} {{"));
-        let payload_ref = match match_.payload {
+        let payload_expr = match match_.payload {
             Some(RirOptionPayloadBinding::Ref { local, .. }) => {
                 function.locals[local.index()].symbol.as_str().to_string()
             }
             Some(RirOptionPayloadBinding::Owned { .. }) | None => {
-                Self::fresh_option_payload_ref(function)
+                Self::fresh_option_payload(function)
             }
         };
         self.indented(|this| {
-            this.w.line(format_args!("Some({payload_ref}) => {{"));
+            this.w.line(format_args!("Some({payload_expr}) => {{"));
             this.indented(|this| {
+                if let Some(RirOptionPayloadBinding::Ref { local, .. }) = match_.payload {
+                    this.emit_scoped_place_cell_inits_for_local(function, local);
+                }
                 if let Some(RirOptionPayloadBinding::Owned {
                     local: payload,
                     materializer,
@@ -3717,7 +3710,7 @@ impl EmitCx<'_> {
                         "{} = {};",
                         local.symbol.as_str(),
                         RustValues::new(this.program, function)
-                            .materialize_ref(materializer, &payload_ref)
+                            .materialize_ref(materializer, &payload_expr)
                     ));
                 }
                 this.emit_structured_block(function, &match_.some_block, predeclared);
@@ -3796,6 +3789,7 @@ impl EmitCx<'_> {
         payload: RirLocalId,
         subject: &str,
     ) {
+        let payload_id = payload;
         let payload = &function.locals[payload.index()];
         let payload_ty = self.ty(payload.ty);
         let ops = format!("__anv_optional_payload_ops_{index}");
@@ -3809,12 +3803,13 @@ impl EmitCx<'_> {
             payload.symbol.as_str(),
             target::scoped_mut_place_cell_new(
                 &target::mut_place_projected(subject, &format!("&{ops}")),
-                &target::runtime_safepoint_state("rt"),
+                &target::runtime_safepoint_state(target::runtime_param_name()),
             )
         ));
+        self.emit_scoped_place_cell_inits_for_local(function, payload_id);
     }
 
-    fn fresh_option_payload_ref(function: &RirFunction) -> String {
+    fn fresh_option_payload(function: &RirFunction) -> String {
         let base = "__anv_option_payload";
         let mut candidate = base.to_string();
         let mut index = 0;
@@ -3837,7 +3832,7 @@ impl EmitCx<'_> {
     ) {
         for (index, stmt) in block.stmts.iter().enumerate() {
             self.emit_stmt_mode(function, index, stmt, predeclared);
-            for local in self.slice_call_arg_drops(&block.stmts, index) {
+            for local in self.slice_call_arg_drops(function, &block.stmts, index) {
                 self.w.line(format_args!(
                     "drop({});",
                     function.locals[local.index()].symbol.as_str()
@@ -3860,19 +3855,25 @@ impl EmitCx<'_> {
         self.emit_term(function, &block.term);
     }
 
-    fn slice_call_arg_drops(&self, stmts: &[RirStmt], index: usize) -> Vec<RirLocalId> {
+    fn slice_call_arg_drops(
+        &self,
+        function: &RirFunction,
+        stmts: &[RirStmt],
+        index: usize,
+    ) -> Vec<RirLocalId> {
         let Some(args) = stmt_call_args(&stmts[index]) else {
             return vec![];
         };
         let mut drops = vec![];
         for local in args.iter().filter_map(call_arg_root_local) {
-            self.collect_slice_arg_drops(stmts, index, local, &mut drops);
+            self.collect_slice_arg_drops(function, stmts, index, local, &mut drops);
         }
         drops
     }
 
     fn collect_slice_arg_drops(
         &self,
+        function: &RirFunction,
         stmts: &[RirStmt],
         index: usize,
         local: RirLocalId,
@@ -3894,13 +3895,16 @@ impl EmitCx<'_> {
                 value: RirRValue::Use(RirOperand::Place(source)),
                 ..
             } if source.projections.is_empty()
-                && matches!(self.program.types[source.ty.index()], RirType::Slice(_)) =>
+                && matches!(
+                    self.program.types[self.program.verified_place_ty(function, source).index()],
+                    RirType::Slice(_)
+                ) =>
             {
                 let RirPlaceRoot::Local(source_local) = source.root else {
                     unreachable!("expected a local RIR place")
                 };
                 drops.push(local);
-                self.collect_slice_arg_drops(stmts, index, source_local, drops);
+                self.collect_slice_arg_drops(function, stmts, index, source_local, drops);
             }
             _ => {}
         }
@@ -3977,32 +3981,39 @@ impl EmitCx<'_> {
         };
         let arms = arms
             .iter()
-            .filter(|arm| exact_variant.is_none_or(|variant| arm.variant == variant))
-            .map(|arm| {
-                let variant = &carrier.variants[arm.variant.index()];
-                let rir_variant = &enm.variants[arm.variant.index()];
+            .enumerate()
+            .filter(|(index, _)| {
+                exact_variant
+                    .is_none_or(|variant| variant == RirDynVariantId::new(carrier.id, *index))
+            })
+            .map(|(index, arm)| {
+                let variant = &carrier.variants[index];
+                let rir_variant = &enm.variants[index];
                 let path = variant_path(enm.symbol.as_str(), rir_variant.symbol.as_str());
                 let payload = if variant.storage == RirDynStorage::Boxed {
                     "(*payload)".to_string()
                 } else {
                     "payload".to_string()
                 };
-                let (target, receiver, receiver_ty) =
-                    self.dyn_projected_target(&arm.target, payload, variant.concrete_ty, false);
+                let (target, receiver, receiver_ty) = self.dyn_projected_target(
+                    function,
+                    &arm.target,
+                    payload,
+                    variant.concrete_ty,
+                    false,
+                );
                 let receiver = match arm.receiver {
-                    RirParamAbi::Value => receiver,
-                    RirParamAbi::SharedBorrow => format!("&{receiver}"),
+                    RirPassMode::Value => receiver,
+                    RirPassMode::SharedBorrow => format!("&{receiver}"),
                     _ => unreachable!("verified readonly dynamic receiver ABI"),
                 };
-                let call_args = self.dyn_call_args(target, args);
                 let call = self.resolved_call_expr(
                     function,
                     target,
-                    &call_args,
+                    args,
                     Some(ResolvedReceiver {
                         expr: receiver,
                         ty: receiver_ty,
-                        semantic: Self::param_abi_semantic(arm.receiver),
                     }),
                 );
                 (path, call)
@@ -4022,36 +4033,6 @@ impl EmitCx<'_> {
             arms.into_iter()
                 .map(|(path, call)| format!("{path}(payload) => {call}")),
         )
-    }
-
-    fn dyn_call_args(
-        &self,
-        target: &RirResolvedCallTarget,
-        args: &[RirCallArg],
-    ) -> Vec<RirCallArg> {
-        let semantics = match target.base() {
-            RirResolvedCallTarget::Function(id) => self.program.functions[id.index()]
-                .params
-                .iter()
-                .skip(1)
-                .map(|param| param.semantic)
-                .collect::<Vec<_>>(),
-            RirResolvedCallTarget::Extern(id) => self.program.externs[id.index()]
-                .params
-                .iter()
-                .skip(1)
-                .map(|param| param.semantic)
-                .collect::<Vec<_>>(),
-            RirResolvedCallTarget::Promoted { .. } => unreachable!(),
-        };
-        semantics
-            .into_iter()
-            .zip(args)
-            .map(|(semantic, arg)| {
-                arg.adapted_to(semantic, self.program)
-                    .expect("verified dynamic call argument adaptation")
-            })
-            .collect()
     }
 
     fn dyn_borrowed_call(
@@ -4098,9 +4079,10 @@ impl EmitCx<'_> {
         let symbol = self.program.dyn_borrow_symbol(carrier_id);
         let mut dispatch = arms
             .iter()
-            .map(|arm| {
-                let variant = &carrier.variants[arm.variant.index()];
-                let name = enm.variants[arm.variant.index()].symbol.as_str();
+            .enumerate()
+            .map(|(index, arm)| {
+                let variant = &carrier.variants[index];
+                let name = enm.variants[index].symbol.as_str();
                 let receiver = target::mut_place_reborrow("place");
                 let call = if readonly {
                     self.dyn_readonly_concrete_call(function, variant, arm, args, &receiver)
@@ -4120,29 +4102,11 @@ impl EmitCx<'_> {
             .iter()
             .filter(|weakening| weakening.target == carrier_id)
         {
-            let source_arms = weakening
-                .arms
-                .iter()
-                .map(|map| {
-                    let mut arm = arms
-                        .iter()
-                        .find(|arm| arm.variant == map.target)
-                        .expect("verified weakened dispatch arm")
-                        .clone();
-                    arm.variant = map.source;
-                    arm
-                })
-                .collect::<Vec<_>>();
             dispatch.push(format!(
                 "{symbol}::OwnedFrom{}(place) => {}",
                 weakening.source.index(),
-                self.dyn_borrowed_carrier_call(
-                    function,
-                    weakening.source,
-                    &source_arms,
-                    args,
-                    "place",
-                    readonly,
+                self.dyn_borrowed_weakened_carrier_call(
+                    function, weakening, arms, args, "place", readonly,
                 )
             ));
         }
@@ -4161,15 +4125,15 @@ impl EmitCx<'_> {
     ) -> String {
         let carrier_decl = &self.program.dyn_carriers[carrier.index()];
         let values = RustValues::new(self.program, function);
-        self.dyn_carrier_descriptor_dispatch(carrier, arms, place, |arm| {
+        self.dyn_carrier_descriptor_dispatch(carrier, arms, place, |index, arm| {
             if !readonly {
-                return self.dyn_mut_descriptor_call(function, carrier, arm, args);
+                return self.dyn_mut_descriptor_call(function, carrier, index, arm, args);
             }
-            let variant = &carrier_decl.variants[arm.variant.index()];
+            let variant = &carrier_decl.variants[index];
             let payload = values.dyn_payload_projection_descriptor(
                 "__AnvDynPayloadOps",
                 carrier,
-                &[arm.variant],
+                &[RirDynVariantId::new(carrier, index)],
                 variant.concrete_ty,
             );
             let root = target::mut_place_reborrow("__anv_carrier_place");
@@ -4186,12 +4150,90 @@ impl EmitCx<'_> {
         })
     }
 
+    fn dyn_borrowed_weakened_carrier_call(
+        &self,
+        function: &RirFunction,
+        weakening: &super::rir::RirDynWeakening,
+        arms: &[RirDynDispatchArm],
+        args: &[RirCallArg],
+        place: &str,
+        readonly: bool,
+    ) -> String {
+        let source = &self.program.dyn_carriers[weakening.source.index()];
+        let RirType::Enum(enum_id) = self.program.types[source.storage_ty.index()] else {
+            unreachable!("verified weakened dynamic carrier")
+        };
+        let enm = &self.program.enums[enum_id.index()];
+        let tag = match_expr(
+            "value",
+            weakening.arms.iter().enumerate().map(|(source_index, _)| {
+                let variant = &enm.variants[source_index];
+                let path = variant_path(enm.symbol.as_str(), variant.symbol.as_str());
+                format!("{path}(..) => {source_index}")
+            }),
+        );
+        let probe = target::mut_place_reborrow("__anv_carrier_place");
+        let dispatch = weakening
+            .arms
+            .iter()
+            .enumerate()
+            .map(|(source_index, map)| {
+                let arm = &arms[map.target.index()];
+                let call = if readonly {
+                    let variant = &source.variants[source_index];
+                    let payload = RustValues::new(self.program, function)
+                        .dyn_payload_projection_descriptor(
+                            "__AnvDynPayloadOps",
+                            source.id,
+                            &[RirDynVariantId::new(source.id, source_index)],
+                            variant.concrete_ty,
+                        );
+                    let root = target::mut_place_reborrow("__anv_carrier_place");
+                    let receiver = target::mut_place_projected(&root, "&__anv_payload_ops");
+                    let call =
+                        self.dyn_readonly_concrete_call(function, variant, arm, args, &receiver);
+                    block_expr(
+                        [
+                            payload.struct_decl,
+                            payload.impl_decl,
+                            format!("let __anv_payload_ops = {};", payload.ctor),
+                        ],
+                        Some(call),
+                    )
+                } else {
+                    self.dyn_mut_descriptor_call(function, source.id, source_index, arm, args)
+                };
+                format!("{source_index} => {call}")
+            })
+            .chain(std::iter::once(
+                "_ => unreachable!(\"verified dynamic dispatch tag\")".to_string(),
+            ));
+        block_expr(
+            [
+                format!("let mut __anv_carrier_root = {place};"),
+                format!(
+                    "let mut __anv_carrier_place = {};",
+                    target::mut_place_reborrow("__anv_carrier_root")
+                ),
+                format!(
+                    "let __anv_variant = {};",
+                    target::mut_place_access_ctx(
+                        &probe,
+                        target::runtime_param_name(),
+                        &format!("{{ let _ = {}; Ok({tag}) }}", target::runtime_param_name())
+                    )
+                ),
+            ],
+            Some(match_expr("__anv_variant", dispatch)),
+        )
+    }
+
     fn dyn_carrier_descriptor_dispatch(
         &self,
         carrier: RirDynCarrierId,
         arms: &[RirDynDispatchArm],
         place: &str,
-        mut render: impl FnMut(&RirDynDispatchArm) -> String,
+        mut render: impl FnMut(usize, &RirDynDispatchArm) -> String,
     ) -> String {
         let carrier_decl = &self.program.dyn_carriers[carrier.index()];
         let RirType::Enum(id) = self.program.types[carrier_decl.storage_ty.index()] else {
@@ -4200,8 +4242,8 @@ impl EmitCx<'_> {
         let enm = &self.program.enums[id.index()];
         let tag = match_expr(
             "value",
-            arms.iter().enumerate().map(|(index, arm)| {
-                let variant = &enm.variants[arm.variant.index()];
+            arms.iter().enumerate().map(|(index, _)| {
+                let variant = &enm.variants[index];
                 let path = variant_path(enm.symbol.as_str(), variant.symbol.as_str());
                 format!("{path}(..) => {index}")
             }),
@@ -4218,14 +4260,14 @@ impl EmitCx<'_> {
                 target::mut_place_access_ctx(
                     &probe,
                     target::runtime_param_name(),
-                    &format!("{{ let _ = rt; Ok({tag}) }}"),
+                    &format!("{{ let _ = {}; Ok({tag}) }}", target::runtime_param_name()),
                 )
             ),
         ];
         let dispatch = arms
             .iter()
             .enumerate()
-            .map(|(index, arm)| format!("{index} => {}", render(arm)))
+            .map(|(index, arm)| format!("{index} => {}", render(index, arm)))
             .chain(std::iter::once(
                 "_ => unreachable!(\"verified dynamic dispatch tag\")".to_string(),
             ));
@@ -4239,15 +4281,12 @@ impl EmitCx<'_> {
         concrete_ty: RirTypeId,
         receiver: &str,
     ) -> (&'a RirResolvedCallTarget, RirTypeId, Vec<String>) {
-        let (target, fields, receiver_ty) = self.dyn_mut_projected_target(target, concrete_ty);
+        let (target, fields, receiver_ty) = Self::dyn_mut_projected_target(target, concrete_ty);
         let mut stmts = vec![format!("let mut __anv_receiver = {receiver};")];
         if fields.is_empty() {
             return (target, receiver_ty, stmts);
         }
-        let projections = fields
-            .into_iter()
-            .map(RirProjection::Field)
-            .collect::<Vec<_>>();
+        let projections = fields;
         let descriptor = RustValues::new(self.program, function)
             .mut_place_projection_descriptor_for(
                 "__AnvPromotedReceiverOps",
@@ -4287,20 +4326,18 @@ impl EmitCx<'_> {
                 &format!("{{ Ok({materialized}) }}"),
             )
         ));
-        let args = self.dyn_call_args(target, args);
         let receiver = match arm.receiver {
-            RirParamAbi::Value => "__anv_receiver_value".to_string(),
-            RirParamAbi::SharedBorrow => "&__anv_receiver_value".to_string(),
+            RirPassMode::Value => "__anv_receiver_value".to_string(),
+            RirPassMode::SharedBorrow => "&__anv_receiver_value".to_string(),
             _ => unreachable!("verified readonly dynamic receiver ABI"),
         };
         let call = self.resolved_call_expr(
             function,
             target,
-            &args,
+            args,
             Some(ResolvedReceiver {
                 expr: receiver,
                 ty: receiver_ty,
-                semantic: Self::param_abi_semantic(arm.receiver),
             }),
         );
         block_expr(stmts, Some(call))
@@ -4316,19 +4353,17 @@ impl EmitCx<'_> {
     ) -> String {
         let (target, receiver_ty, mut stmts) =
             self.dyn_concrete_receiver(function, &arm.target, variant.concrete_ty, receiver);
-        let args = self.dyn_call_args(target, args);
         let call = match arm.receiver {
-            RirParamAbi::MutPlace => self.resolved_call_expr(
+            RirPassMode::MutPlace => self.resolved_call_expr(
                 function,
                 target,
-                &args,
+                args,
                 Some(ResolvedReceiver {
                     expr: "__anv_receiver".to_string(),
                     ty: receiver_ty,
-                    semantic: RirParamSemantic::MutPlace,
                 }),
             ),
-            RirParamAbi::MutBorrow => {
+            RirPassMode::MutBorrow => {
                 debug_assert!(matches!(target, RirResolvedCallTarget::Extern(_)));
                 debug_assert!(native_ty_is_resource_ref(self.program, receiver_ty));
                 let snapshot =
@@ -4345,11 +4380,10 @@ impl EmitCx<'_> {
                 self.resolved_call_expr(
                     function,
                     target,
-                    &args,
+                    args,
                     Some(ResolvedReceiver {
                         expr: "&mut __anv_native_receiver".to_string(),
                         ty: receiver_ty,
-                        semantic: RirParamSemantic::MutBorrow,
                     }),
                 )
             }
@@ -4367,8 +4401,8 @@ impl EmitCx<'_> {
         arms: &[RirDynDispatchArm],
     ) -> String {
         let (prelude, place) = self.prepared_escaping_payload_place_arg(function, 0, place);
-        let call = self.dyn_carrier_descriptor_dispatch(carrier, arms, &place, |arm| {
-            self.dyn_mut_descriptor_call(function, carrier, arm, args)
+        let call = self.dyn_carrier_descriptor_dispatch(carrier, arms, &place, |index, arm| {
+            self.dyn_mut_descriptor_call(function, carrier, index, arm, args)
         });
         block_expr(prelude, Some(call))
     }
@@ -4377,14 +4411,15 @@ impl EmitCx<'_> {
         &self,
         function: &RirFunction,
         carrier: RirDynCarrierId,
+        variant_index: usize,
         arm: &RirDynDispatchArm,
         args: &[RirCallArg],
     ) -> String {
-        let variant = &self.program.dyn_carriers[carrier.index()].variants[arm.variant.index()];
+        let variant = &self.program.dyn_carriers[carrier.index()].variants[variant_index];
         let payload = RustValues::new(self.program, function).dyn_payload_projection_descriptor(
             "__AnvDynPayloadOps",
             carrier,
-            &[arm.variant],
+            &[RirDynVariantId::new(carrier, variant_index)],
             variant.concrete_ty,
         );
         let stmts = [
@@ -4398,37 +4433,27 @@ impl EmitCx<'_> {
         block_expr(stmts, Some(call))
     }
 
-    fn dyn_mut_projected_target<'a>(
-        &self,
-        target: &'a RirResolvedCallTarget,
+    fn dyn_mut_projected_target(
+        target: &RirResolvedCallTarget,
         mut ty: RirTypeId,
-    ) -> (
-        &'a RirResolvedCallTarget,
-        Vec<super::rir::RirFieldId>,
-        RirTypeId,
-    ) {
+    ) -> (&RirResolvedCallTarget, Vec<RirPlaceStep>, RirTypeId) {
         let mut target = target;
-        let mut fields = vec![];
+        let mut projections = vec![];
         while let RirResolvedCallTarget::Promoted {
-            fields: promoted,
+            projections: promoted,
             target: next,
         } = target
         {
-            for field in promoted {
-                let RirType::Struct(id) = self.program.types[ty.index()] else {
-                    unreachable!("verified promoted mutable dynamic receiver")
-                };
-                let field_decl = &self.program.structs[id.index()].fields[field.index()];
-                fields.push(*field);
-                ty = field_decl.ty;
-            }
+            ty = promoted.last().map_or(ty, |step| step.target_ty);
+            projections.extend(promoted);
             target = next;
         }
-        (target, fields, ty)
+        (target, projections, ty)
     }
 
     fn dyn_projected_target<'a>(
         &self,
+        function: &RirFunction,
         target: &'a RirResolvedCallTarget,
         mut receiver: String,
         mut ty: RirTypeId,
@@ -4436,22 +4461,24 @@ impl EmitCx<'_> {
     ) -> (&'a RirResolvedCallTarget, String, RirTypeId) {
         let mut target = target;
         while let RirResolvedCallTarget::Promoted {
-            fields,
+            projections,
             target: next,
         } = target
         {
-            for field in fields {
-                let RirType::Struct(id) = self.program.types[ty.index()] else {
-                    unreachable!("verified promoted dynamic receiver")
-                };
-                let field = &self.program.structs[id.index()].fields[field.index()];
-                receiver = if borrowed {
-                    format!("&({receiver}).{}", field.symbol.as_str())
-                } else {
-                    format!("({receiver}).{}", field.symbol.as_str())
-                };
-                ty = field.ty;
-            }
+            let projected = RustPlaces::new(self.program, function)
+                .projected_expr(
+                    ty,
+                    &receiver,
+                    projections.last().map_or(ty, |step| step.target_ty),
+                    projections,
+                )
+                .expect("verified promoted dynamic receiver");
+            receiver = if borrowed {
+                format!("&({projected})")
+            } else {
+                projected
+            };
+            ty = projections.last().map_or(ty, |step| step.target_ty);
             target = next;
         }
         (target, receiver, ty)
@@ -4471,7 +4498,7 @@ impl EmitCx<'_> {
             unreachable!("verified access-aware transfer")
         };
         let (prelude, place) = self.prepared_mut_place_arg(function, index, access);
-        let value = values.render_materializer_ref(materializer, "value");
+        let value = values.materialize_ref(materializer, "value");
         let access = target::mut_place_access(
             &place,
             target::runtime_param_name(),
@@ -4480,9 +4507,114 @@ impl EmitCx<'_> {
         block_expr(prelude, Some(access))
     }
 
-    fn rvalue_at(&mut self, function: &RirFunction, index: usize, value: &RirRValue) -> String {
+    fn rvalue(&mut self, function: &RirFunction, index: usize, value: &RirRValue) -> String {
+        let values = RustValues::new(self.program, function);
+        let places = RustPlaces::new(self.program, function);
         match value {
-            RirRValue::Materialize(owned) => self.owned_value_at(function, index, owned),
+            RirRValue::DynPack { variant, value, .. } => {
+                let carrier = &self.program.dyn_carriers[variant.carrier().index()];
+                let RirType::Enum(enum_id) = self.program.types[carrier.storage_ty.index()] else {
+                    unreachable!("verified dynamic carrier storage")
+                };
+                let enm = &self.program.enums[enum_id.index()];
+                let rir_variant = &enm.variants[variant.index()];
+                let mut payload = self.owned_value_at(function, index, value);
+                if carrier.variants[variant.index()].storage == RirDynStorage::Boxed {
+                    payload = format!("Box::new({payload})");
+                }
+                tuple_variant(
+                    &variant_path(enm.symbol.as_str(), rir_variant.symbol.as_str()),
+                    [payload],
+                )
+            }
+            RirRValue::DynDowncast {
+                value, variants, ..
+            } => {
+                let variants = &self.program.dyn_variant_sets[variants.index()];
+                let carrier = &self.program.dyn_carriers[variants.carrier.index()];
+                let RirType::Enum(id) = self.program.types[carrier.storage_ty.index()] else {
+                    unreachable!("verified dynamic carrier storage")
+                };
+                let enm = &self.program.enums[id.index()];
+                let arms = carrier.variants.iter().map(|variant| {
+                    let rir_variant = &enm.variants[variant.id.index()];
+                    let path = variant_path(enm.symbol.as_str(), rir_variant.symbol.as_str());
+                    if !variants.variants.contains(&variant.id) {
+                        return format!("{path}(..) => None");
+                    }
+                    let payload = if variant.storage == RirDynStorage::Boxed {
+                        "*payload"
+                    } else {
+                        "payload"
+                    };
+                    format!("{path}(payload) => Some({payload})")
+                });
+                let source = self.owned_value_at(function, index, value);
+                match_expr(&source, arms)
+            }
+            RirRValue::DynCall {
+                dispatch,
+                exact_variant,
+                receiver,
+                args,
+                ..
+            } => {
+                let dispatch = &self.program.dyn_dispatches[dispatch.index()];
+                self.dyn_call(
+                    function,
+                    index,
+                    dispatch.carrier,
+                    receiver,
+                    *exact_variant,
+                    args,
+                    &dispatch.arms,
+                )
+            }
+            RirRValue::DynWeaken {
+                weakening, value, ..
+            } => {
+                let weakening = &self.program.dyn_weakenings[weakening.index()];
+                let source = &self.program.dyn_carriers[weakening.source.index()];
+                let target = &self.program.dyn_carriers[weakening.target.index()];
+                let RirType::Enum(source_enum) = self.program.types[source.storage_ty.index()]
+                else {
+                    unreachable!("verified source dynamic storage")
+                };
+                let RirType::Enum(target_enum) = self.program.types[target.storage_ty.index()]
+                else {
+                    unreachable!("verified target dynamic storage")
+                };
+                let source_enum = &self.program.enums[source_enum.index()];
+                let target_enum = &self.program.enums[target_enum.index()];
+                let arms = weakening
+                    .arms
+                    .iter()
+                    .enumerate()
+                    .map(|(source_index, arm)| {
+                        let source_variant = &source_enum.variants[source_index];
+                        let target_variant = &target_enum.variants[arm.target.index()];
+                        let source_path = variant_path(
+                            source_enum.symbol.as_str(),
+                            source_variant.symbol.as_str(),
+                        );
+                        let target_path = variant_path(
+                            target_enum.symbol.as_str(),
+                            target_variant.symbol.as_str(),
+                        );
+                        let payload = "payload";
+                        format!(
+                            "{source_path}(payload) => {}",
+                            tuple_variant(&target_path, [payload.to_string()])
+                        )
+                    });
+                let source = self.owned_value_at(function, index, value);
+                match_expr(&source, arms)
+            }
+            RirRValue::Use(operand) => values.value_operand(operand),
+            RirRValue::TakeStaged(operand) => values.operand(operand),
+            RirRValue::Materialize(owned) | RirRValue::FunctionValue { value: owned, .. } => {
+                self.owned_value_at(function, index, owned)
+            }
             RirRValue::Struct { ty, fields } => self.struct_literal(function, index, *ty, fields),
             RirRValue::Tuple { ty, fields } => self.tuple_literal(function, index, *ty, fields),
             RirRValue::DataRefAlloc { ty, fields } => {
@@ -4521,181 +4653,6 @@ impl EmitCx<'_> {
                 variant,
                 fields,
             } => self.enum_literal(function, index, *ty, *variant, fields),
-            RirRValue::OptionalSome { value, .. } => {
-                format!("Some({})", self.owned_value_at(function, index, value))
-            }
-            RirRValue::ListPush { list, value } => {
-                let elem = self.owned_value_at(function, index, value);
-                let materializer = self.sequence_elem_materializer(list.ty());
-                let materialize = self.materializer_closure(function, materializer);
-                self.collection_mutation(
-                    function,
-                    list,
-                    [("__anv_elem", elem)],
-                    &target::list_push_ctx_region("__anv_elem", &materialize),
-                )
-            }
-            RirRValue::MapInsert {
-                map, key, value, ..
-            } => {
-                let key = self.owned_value_at(function, index, key);
-                let value = self.owned_value_at(function, index, value);
-                let (materialize_key, materialize_value) =
-                    self.map_materializer_closures(function, map.ty());
-                self.collection_mutation(
-                    function,
-                    map,
-                    [("__anv_key", key), ("__anv_insert", value)],
-                    &target::map_insert_region(
-                        "__anv_key",
-                        "__anv_insert",
-                        &materialize_key,
-                        &materialize_value,
-                    ),
-                )
-            }
-            _ => self.rvalue(function, index, value),
-        }
-    }
-
-    fn rvalue(&mut self, function: &RirFunction, index: usize, value: &RirRValue) -> String {
-        let values = RustValues::new(self.program, function);
-        let places = RustPlaces::new(self.program, function);
-        match value {
-            RirRValue::DynPack {
-                carrier,
-                variant,
-                value,
-                ..
-            } => {
-                let carrier = &self.program.dyn_carriers[carrier.index()];
-                let RirType::Enum(enum_id) = self.program.types[carrier.storage_ty.index()] else {
-                    unreachable!("verified dynamic carrier storage")
-                };
-                let enm = &self.program.enums[enum_id.index()];
-                let rir_variant = &enm.variants[variant.index()];
-                let mut payload = self.owned_value_at(function, index, value);
-                if carrier.variants[variant.index()].storage == RirDynStorage::Boxed {
-                    payload = format!("Box::new({payload})");
-                }
-                tuple_variant(
-                    &variant_path(enm.symbol.as_str(), rir_variant.symbol.as_str()),
-                    [payload],
-                )
-            }
-            RirRValue::DynDowncast {
-                carrier,
-                value,
-                variants,
-                ..
-            } => {
-                let carrier = &self.program.dyn_carriers[carrier.index()];
-                let RirType::Enum(id) = self.program.types[carrier.storage_ty.index()] else {
-                    unreachable!("verified dynamic carrier storage")
-                };
-                let enm = &self.program.enums[id.index()];
-                let arms = carrier.variants.iter().map(|variant| {
-                    let rir_variant = &enm.variants[variant.id.index()];
-                    let path = variant_path(enm.symbol.as_str(), rir_variant.symbol.as_str());
-                    if !variants.contains(&variant.id) {
-                        return format!("{path}(..) => None");
-                    }
-                    let payload = if variant.storage == RirDynStorage::Boxed {
-                        "*payload"
-                    } else {
-                        "payload"
-                    };
-                    format!("{path}(payload) => Some({payload})")
-                });
-                let source = self.owned_value_at(function, index, value);
-                match_expr(&source, arms)
-            }
-            RirRValue::DynCall {
-                carrier,
-                exact_variant,
-                receiver,
-                args,
-                arms,
-                ..
-            } => self.dyn_call(
-                function,
-                index,
-                *carrier,
-                receiver,
-                *exact_variant,
-                args,
-                arms,
-            ),
-            RirRValue::DynWeaken {
-                source,
-                target,
-                value,
-                arms,
-                ..
-            } => {
-                let source = &self.program.dyn_carriers[source.index()];
-                let target = &self.program.dyn_carriers[target.index()];
-                let RirType::Enum(source_enum) = self.program.types[source.storage_ty.index()]
-                else {
-                    unreachable!("verified source dynamic storage")
-                };
-                let RirType::Enum(target_enum) = self.program.types[target.storage_ty.index()]
-                else {
-                    unreachable!("verified target dynamic storage")
-                };
-                let source_enum = &self.program.enums[source_enum.index()];
-                let target_enum = &self.program.enums[target_enum.index()];
-                let arms = arms.iter().map(|arm| {
-                    let source_variant = &source_enum.variants[arm.source.index()];
-                    let target_variant = &target_enum.variants[arm.target.index()];
-                    let source_path =
-                        variant_path(source_enum.symbol.as_str(), source_variant.symbol.as_str());
-                    let target_path =
-                        variant_path(target_enum.symbol.as_str(), target_variant.symbol.as_str());
-                    let payload = "payload";
-                    format!(
-                        "{source_path}(payload) => {}",
-                        tuple_variant(&target_path, [payload.to_string()])
-                    )
-                });
-                let source = self.owned_value_at(function, index, value);
-                match_expr(&source, arms)
-            }
-            RirRValue::Use(operand) => values.value_operand(operand),
-            RirRValue::TakeStaged(operand) => values.operand(operand),
-            RirRValue::Materialize(owned) | RirRValue::FunctionValue { value: owned, .. } => {
-                self.owned_value_at(function, index, owned)
-            }
-            RirRValue::Struct { ty, fields } => self.struct_literal(function, 0, *ty, fields),
-            RirRValue::Tuple { ty, fields } => self.tuple_literal(function, 0, *ty, fields),
-            RirRValue::DataRefAlloc { ty, fields } => self.dataref_alloc(function, 0, *ty, fields),
-            RirRValue::Array { elems, .. } => {
-                format!(
-                    "[{}]",
-                    comma(elems.iter().map(|elem| values.owned_value(elem)))
-                )
-            }
-            RirRValue::List { ty, elems } => {
-                let elems = comma(elems.iter().map(|elem| values.owned_value(elem)));
-                let storage_ty = self.collection_storage_heap_type(*ty);
-                target::anv_list_from_elems(target::runtime_param_name(), &storage_ty, &elems)
-            }
-            RirRValue::Map { ty, entries } => {
-                let entries = comma(entries.iter().map(|(key, value)| {
-                    format!(
-                        "({}, {})",
-                        values.owned_value(key),
-                        values.owned_value(value)
-                    )
-                }));
-                let storage_ty = self.collection_storage_heap_type(*ty);
-                target::anv_map_from_entries(target::runtime_param_name(), &storage_ty, &entries)
-            }
-            RirRValue::EnumVariant {
-                ty,
-                variant,
-                fields,
-            } => self.enum_literal(function, 0, *ty, *variant, fields),
             RirRValue::Unary { value, ty, .. }
                 if matches!(self.program.types[ty.index()], RirType::Flag(_)) =>
             {
@@ -4736,7 +4693,7 @@ impl EmitCx<'_> {
                 RirFlagStaticOp::All => target::flag_all(self.flag_symbol(*ty)),
             },
             RirRValue::OptionalSome { value, .. } => {
-                format!("Some({})", values.owned_value(value))
+                format!("Some({})", self.owned_value_at(function, index, value))
             }
             RirRValue::Call { callee, args, .. } => match callee {
                 RirCallTarget::Function(id) => self.resolved_call_expr(
@@ -4790,7 +4747,7 @@ impl EmitCx<'_> {
                 value,
                 source_ty,
                 spec,
-            } if *spec == RirFormatSpec::default()
+            } if *spec == FormatSpec::default()
                 && matches!(self.program.types[source_ty.index()], RirType::Float) =>
             {
                 target::anv_string_from_float(&values.operand(value))
@@ -4800,19 +4757,19 @@ impl EmitCx<'_> {
                 source_ty,
                 spec,
             } => target::anv_string_format(
-                &rust_string(&format_fragment(rust_format_spec(*spec))),
+                &rust_string(&format_fragment(*spec)),
                 &values.format_arg(value, *source_ty),
             ),
             RirRValue::Len { source } => format!("{}.len() as i64", places.local_place(source)),
             RirRValue::CollectionLen { source } => self.collection_len(function, source),
-            RirRValue::SequenceSlotAt {
-                collection,
-                index,
-                ty,
-            } => self.sequence_slot_at(function, collection, *index, *ty),
+            RirRValue::SequenceSlotAt { collection, step } => {
+                self.sequence_slot_at(function, collection, *step)
+            }
             RirRValue::ListPush { list, value } => {
-                let elem = values.owned_value(value);
-                let materializer = self.sequence_elem_materializer(list.ty());
+                let elem = self.owned_value_at(function, index, value);
+                let materializer = self.sequence_elem_materializer(
+                    self.program.verified_collection_ty(function, list),
+                );
                 let materialize = self.materializer_closure(function, materializer);
                 self.collection_mutation(
                     function,
@@ -4840,10 +4797,12 @@ impl EmitCx<'_> {
             RirRValue::MapInsert {
                 map, key, value, ..
             } => {
-                let key = values.owned_value(key);
-                let value = values.owned_value(value);
-                let (materialize_key, materialize_value) =
-                    self.map_materializer_closures(function, map.ty());
+                let key = self.owned_value_at(function, index, key);
+                let value = self.owned_value_at(function, index, value);
+                let (materialize_key, materialize_value) = self.map_materializer_closures(
+                    function,
+                    self.program.verified_collection_ty(function, map),
+                );
                 self.collection_mutation(
                     function,
                     map,
@@ -4858,8 +4817,10 @@ impl EmitCx<'_> {
             }
             RirRValue::MapRemove { map, key, .. } => {
                 let key = values.operand(key);
-                let (materialize_key, materialize_value) =
-                    self.map_materializer_closures(function, map.ty());
+                let (materialize_key, materialize_value) = self.map_materializer_closures(
+                    function,
+                    self.program.verified_collection_ty(function, map),
+                );
                 self.collection_mutation(
                     function,
                     map,
@@ -4886,7 +4847,7 @@ impl EmitCx<'_> {
                 lambda, captures, ..
             } => {
                 let lambda_decl = &self.program.lambdas[lambda.index()];
-                let sig = RirRustRepPolicy::new(self.program).lambda_sig_symbol(lambda_decl.sig);
+                let sig = RirRustRepPolicy::lambda_sig_symbol(lambda_decl.sig);
                 let variant = lambda_variant(*lambda);
                 match lambda_decl.storage {
                     RirLambdaStorage::ZeroEnv => format!("{sig}::{variant}"),
@@ -4905,9 +4866,17 @@ impl EmitCx<'_> {
                                 )
                             })
                             .collect::<Vec<_>>();
-                        let heap_type = format!("statics.{}", lambda_env_heap_type_symbol(env.id));
+                        let heap_type = format!(
+                            "{}.{}",
+                            target::statics_param_name(),
+                            lambda_env_heap_type_symbol(env.id)
+                        );
                         let storage = format!("{} {{ {} }}", env.symbol.as_str(), comma(fields));
-                        let alloc = target::rt_heap_alloc("rt", "heap_type", &storage);
+                        let alloc = target::rt_heap_alloc(
+                            target::runtime_param_name(),
+                            "heap_type",
+                            &storage,
+                        );
                         format!(
                             "{{ let heap_type = {heap_type}; {sig}::{variant} {{ env: {alloc} }} }}"
                         )
@@ -4964,29 +4933,52 @@ impl EmitCx<'_> {
         &self,
         function: &RirFunction,
         collection: &RirCollectionAccess,
-        index: RirLocalId,
-        ty: RirTypeId,
+        step: RirPlaceStep,
     ) -> String {
-        match collection {
-            RirCollectionAccess::Direct(collection) => match self.program.types
-                [collection.ty.index()]
-            {
-                RirType::List(_) => self.list_slot_at(function, collection, index, ty),
-                RirType::Array { .. } => self.direct_array_slot_at(function, collection, index),
-                RirType::Slice(_) => {
-                    let place = Self::sequence_slot_place(collection, index, ty);
-                    RustValues::new(self.program, function).value_operand(&RirOperand::Place(place))
-                }
-                _ => unreachable!("verified sequence slot collection"),
-            },
-            RirCollectionAccess::MutPlace(collection) => match self.program.types
-                [collection.ty.index()]
-            {
-                RirType::Array { .. } => self.mut_place_array_slot_at(function, collection, index),
-                RirType::List(_) => self.mut_place_list_slot_at(function, collection, index, ty),
-                RirType::Slice(_) => self.mut_place_slice_slot_at(function, collection, index, ty),
-                _ => unreachable!("RIR verifier rejects unsupported mut-place sequence slots"),
-            },
+        match (collection, step.kind) {
+            (
+                RirCollectionAccess::Direct(collection),
+                RirPlaceStepKind::ArrayIndex {
+                    index,
+                    elem_materializer,
+                    ..
+                },
+            ) => self.direct_array_slot_at(function, collection, index, elem_materializer),
+            (
+                RirCollectionAccess::Direct(collection),
+                RirPlaceStepKind::ListIndex {
+                    index,
+                    elem_materializer,
+                },
+            ) => self.list_slot_at(function, collection, index, elem_materializer),
+            (RirCollectionAccess::Direct(collection), RirPlaceStepKind::SliceIndex { .. }) => {
+                let mut place = collection.clone();
+                place.projections.push(step);
+                RustValues::new(self.program, function).value_operand(&RirOperand::Place(place))
+            }
+            (
+                RirCollectionAccess::MutPlace(collection),
+                RirPlaceStepKind::ArrayIndex {
+                    index,
+                    elem_materializer,
+                    ..
+                },
+            ) => self.mut_place_array_slot_at(function, collection, index, elem_materializer),
+            (
+                RirCollectionAccess::MutPlace(collection),
+                RirPlaceStepKind::ListIndex {
+                    index,
+                    elem_materializer,
+                },
+            ) => self.mut_place_list_slot_at(function, collection, index, elem_materializer),
+            (
+                RirCollectionAccess::MutPlace(collection),
+                RirPlaceStepKind::SliceIndex {
+                    index,
+                    elem_materializer,
+                },
+            ) => self.mut_place_slice_slot_at(function, collection, index, elem_materializer),
+            _ => unreachable!("verified sequence slot step"),
         }
     }
 
@@ -4994,39 +4986,60 @@ impl EmitCx<'_> {
         &self,
         function: &RirFunction,
         collection: &RirCollectionAccess,
-        index: RirLocalId,
+        step: RirPlaceStep,
         value: &str,
     ) -> String {
-        match collection {
-            RirCollectionAccess::Direct(collection) => {
-                match self.program.types[collection.ty.index()] {
-                    RirType::List(_) => self.list_slot_set(function, collection, index, value),
-                    RirType::Array { .. } | RirType::Slice(_)
-                        if matches!(collection.root, RirPlaceRoot::Global(_)) =>
-                    {
-                        self.direct_sequence_slot_set(function, collection, index, value)
-                    }
-                    RirType::Array { elem, .. } | RirType::Slice(elem) => {
-                        let place = Self::sequence_slot_place(collection, index, elem);
-                        RustValues::new(self.program, function).assign(&place, value)
-                    }
-                    _ => unreachable!("verified sequence slot collection"),
-                }
+        match (collection, step.kind) {
+            (
+                RirCollectionAccess::Direct(collection),
+                RirPlaceStepKind::ArrayIndex { index, .. },
+            ) if matches!(collection.root, RirPlaceRoot::Global(_)) => self
+                .direct_sequence_slot_set(
+                    function,
+                    collection,
+                    index,
+                    step.target_ty,
+                    false,
+                    value,
+                ),
+            (
+                RirCollectionAccess::Direct(collection),
+                RirPlaceStepKind::SliceIndex { index, .. },
+            ) if matches!(collection.root, RirPlaceRoot::Global(_)) => self
+                .direct_sequence_slot_set(function, collection, index, step.target_ty, true, value),
+            (
+                RirCollectionAccess::Direct(collection),
+                RirPlaceStepKind::ArrayIndex { .. } | RirPlaceStepKind::SliceIndex { .. },
+            ) => {
+                let mut place = collection.clone();
+                place.projections.push(step);
+                RustValues::new(self.program, function).assign(&place, value)
             }
-            RirCollectionAccess::MutPlace(collection) => {
-                match self.program.types[collection.ty.index()] {
-                    RirType::Array { elem, .. } => {
-                        self.mut_place_array_slot_set(function, collection, index, value, elem)
-                    }
-                    RirType::List(_) => {
-                        self.mut_place_list_slot_set(function, collection, index, value)
-                    }
-                    RirType::Slice(_) => {
-                        self.mut_place_slice_slot_set(function, collection, index, value)
-                    }
-                    _ => unreachable!("RIR verifier rejects unsupported mut-place sequence slots"),
-                }
+            (
+                RirCollectionAccess::Direct(collection),
+                RirPlaceStepKind::ListIndex {
+                    index,
+                    elem_materializer,
+                },
+            ) => self.list_slot_set(function, collection, index, elem_materializer, value),
+            (
+                RirCollectionAccess::MutPlace(collection),
+                RirPlaceStepKind::ArrayIndex { index, .. },
+            ) => self.mut_place_array_slot_set(function, collection, index, value, step.target_ty),
+            (
+                RirCollectionAccess::MutPlace(collection),
+                RirPlaceStepKind::ListIndex {
+                    index,
+                    elem_materializer,
+                },
+            ) => {
+                self.mut_place_list_slot_set(function, collection, index, elem_materializer, value)
             }
+            (
+                RirCollectionAccess::MutPlace(collection),
+                RirPlaceStepKind::SliceIndex { index, .. },
+            ) => self.mut_place_slice_slot_set(function, collection, index, value),
+            _ => unreachable!("verified sequence slot step"),
         }
     }
 
@@ -5035,6 +5048,8 @@ impl EmitCx<'_> {
         function: &RirFunction,
         collection: &RirPlace,
         index: RirLocalId,
+        elem: RirTypeId,
+        slice: bool,
         value: &str,
     ) -> String {
         let (mut prelude, collection_expr) =
@@ -5048,18 +5063,8 @@ impl EmitCx<'_> {
             ),
             format!("let __anv_sequence_value = {value};"),
         ]);
-        let update = match self.program.types[collection.ty.index()] {
-            RirType::Array { elem, .. } if self.program.collection_replace_ty(elem) => {
-                format!(
-                    "{}?",
-                    target::replace_collection_result(
-                        "__anv_sequence[index]",
-                        "__anv_sequence_value"
-                    )
-                )
-            }
-            RirType::Array { .. } => "__anv_sequence[index] = __anv_sequence_value".to_string(),
-            RirType::Slice(_) => format!(
+        let update = if slice {
+            format!(
                 "{}?",
                 target::slice_with_elem_mut_leaf(
                     "__anv_sequence",
@@ -5067,8 +5072,14 @@ impl EmitCx<'_> {
                     "index",
                     "*value = __anv_sequence_value; Ok(())",
                 )
-            ),
-            _ => unreachable!("verified sequence slot collection"),
+            )
+        } else if self.program.collection_replace_ty(elem) {
+            format!(
+                "{}?",
+                target::replace_collection_result("__anv_sequence[index]", "__anv_sequence_value")
+            )
+        } else {
+            "__anv_sequence[index] = __anv_sequence_value".to_string()
         };
         block_expr(prelude, Some(update))
     }
@@ -5078,7 +5089,7 @@ impl EmitCx<'_> {
         function: &RirFunction,
         collection: &RirPlace,
         index: RirLocalId,
-        _ty: RirTypeId,
+        materializer: RirMaterializerId,
     ) -> String {
         let (mut prelude, collection_expr) =
             self.direct_collection(function, collection, "__anv_collection_guard", false);
@@ -5087,7 +5098,6 @@ impl EmitCx<'_> {
             &RirCollectionAccess::Direct(collection.clone()),
             target::collection_structural_version("__anv_list"),
         );
-        let materializer = self.sequence_elem_materializer(collection.ty);
         let value = RustValues::new(self.program, function).materialize_ref(materializer, "value");
         prelude.extend([
             format!("let __anv_list = &({collection_expr});"),
@@ -5116,9 +5126,9 @@ impl EmitCx<'_> {
         function: &RirFunction,
         collection: &RirPlace,
         index: RirLocalId,
+        materializer: RirMaterializerId,
         value: &str,
     ) -> String {
-        let materializer = self.sequence_elem_materializer(collection.ty);
         let materialize = self.materializer_closure(function, materializer);
         let (mut prelude, collection_expr) =
             self.direct_collection(function, collection, "__anv_collection_guard", true);
@@ -5220,9 +5230,9 @@ impl EmitCx<'_> {
         function: &RirFunction,
         collection: &RirPlace,
         index: RirLocalId,
+        materializer: RirMaterializerId,
     ) -> String {
         let index = function.locals[index.index()].symbol.as_str();
-        let materializer = self.sequence_elem_materializer(collection.ty);
         let elem = RustValues::new(self.program, function).materialize_ref(materializer, "elem");
         let (mut prelude, array) =
             self.direct_collection(function, collection, "__anv_array", false);
@@ -5239,9 +5249,9 @@ impl EmitCx<'_> {
         function: &RirFunction,
         collection: &RirMutPlaceArg,
         index: RirLocalId,
+        materializer: RirMaterializerId,
     ) -> String {
         let index = function.locals[index.index()].symbol.as_str();
-        let materializer = self.sequence_elem_materializer(collection.ty);
         let elem = RustValues::new(self.program, function).materialize_ref(materializer, "elem");
         let body = block_expr(
             [format!(
@@ -5288,14 +5298,13 @@ impl EmitCx<'_> {
         function: &RirFunction,
         collection: &RirMutPlaceArg,
         index: RirLocalId,
-        _ty: RirTypeId,
+        materializer: RirMaterializerId,
     ) -> String {
         let index = function.locals[index.index()].symbol.as_str();
         let version = self.collection_version(
             &RirCollectionAccess::MutPlace(collection.clone()),
             target::collection_structural_version("value"),
         );
-        let materializer = self.sequence_elem_materializer(collection.ty);
         let value = RustValues::new(self.program, function).materialize_ref(materializer, "value");
         let body = block_expr(
             [format!(
@@ -5321,9 +5330,9 @@ impl EmitCx<'_> {
         function: &RirFunction,
         collection: &RirMutPlaceArg,
         index: RirLocalId,
+        materializer: RirMaterializerId,
         new_value: &str,
     ) -> String {
-        let materializer = self.sequence_elem_materializer(collection.ty);
         let materialize = self.materializer_closure(function, materializer);
         let index = function.locals[index.index()].symbol.as_str();
         let version = self.collection_version(
@@ -5358,9 +5367,8 @@ impl EmitCx<'_> {
         function: &RirFunction,
         collection: &RirMutPlaceArg,
         index: RirLocalId,
-        _ty: RirTypeId,
+        materializer: RirMaterializerId,
     ) -> String {
-        let materializer = self.sequence_elem_materializer(collection.ty);
         let materialize = self.materializer_closure(function, materializer);
         let index = function.locals[index.index()].symbol.as_str();
         let body = block_expr(
@@ -5404,13 +5412,6 @@ impl EmitCx<'_> {
         self.mut_place_mutate_block(function, collection, &body)
     }
 
-    fn sequence_slot_place(collection: &RirPlace, index: RirLocalId, ty: RirTypeId) -> RirPlace {
-        let mut place = collection.clone();
-        place.projections.push(RirProjection::Index(index));
-        place.ty = ty;
-        place
-    }
-
     fn direct_collection(
         &self,
         function: &RirFunction,
@@ -5434,7 +5435,12 @@ impl EmitCx<'_> {
                     root
                 } else {
                     RustPlaces::new(self.program, function)
-                        .projected_expr(root_ty, &root, collection.ty, &collection.projections)
+                        .projected_expr(
+                            root_ty,
+                            &root,
+                            self.program.verified_place_ty(function, collection),
+                            &collection.projections,
+                        )
                         .expect("verified global collection projection")
                 };
                 let slot = RustValues::global_slot_expr(self.program, global);
@@ -5464,7 +5470,10 @@ impl EmitCx<'_> {
             unreachable!("verified map get result")
         };
         let key = RustValues::new(self.program, function).operand(key);
-        let (_, materialize_value) = self.map_materializer_closures(function, map.ty());
+        let (_, materialize_value) = self.map_materializer_closures(
+            function,
+            self.program.verified_collection_ty(function, map),
+        );
         self.map_read(function, map, |map| {
             target::map_get_with(map, target::runtime_param_name(), &key, &materialize_value)
         })
@@ -5478,8 +5487,10 @@ impl EmitCx<'_> {
         value: &RirOperand,
     ) -> String {
         let value = RustValues::new(self.program, function).value_operand(value);
-        let (materialize_key, materialize_value) =
-            self.map_materializer_closures(function, map.ty());
+        let (materialize_key, materialize_value) = self.map_materializer_closures(
+            function,
+            self.program.verified_collection_ty(function, map),
+        );
         let set = self.map_index_update(function, map, index, |map, version| {
             target::map_with_value_mut_short(
                 map,
@@ -5501,7 +5512,10 @@ impl EmitCx<'_> {
         index: RirLocalId,
         _ty: RirTypeId,
     ) -> String {
-        let (materialize_key, _) = self.map_materializer_closures(function, map.ty());
+        let (materialize_key, _) = self.map_materializer_closures(
+            function,
+            self.program.verified_collection_ty(function, map),
+        );
         self.map_index_read(function, map, index, |map, version| {
             target::map_key_at_shared(
                 map,
@@ -5520,7 +5534,10 @@ impl EmitCx<'_> {
         index: RirLocalId,
         _ty: RirTypeId,
     ) -> String {
-        let (_, materialize_value) = self.map_materializer_closures(function, map.ty());
+        let (_, materialize_value) = self.map_materializer_closures(
+            function,
+            self.program.verified_collection_ty(function, map),
+        );
         self.map_index_read(function, map, index, |map, version| {
             target::map_value_at_shared(
                 map,
@@ -5543,8 +5560,10 @@ impl EmitCx<'_> {
             RirType::Tuple(id) => &self.program.tuples[id.index()],
             _ => unreachable!("verified map entry tuple"),
         };
-        let (materialize_key, materialize_value) =
-            self.map_materializer_closures(function, map.ty());
+        let (materialize_key, materialize_value) = self.map_materializer_closures(
+            function,
+            self.program.verified_collection_ty(function, map),
+        );
         self.map_index_read(function, map, index, |map, version| {
             let entry = target::map_entry_at_shared(
                 map,
@@ -5765,7 +5784,8 @@ impl EmitCx<'_> {
                 let (prelude, place) = self.prepared_mut_place_arg(function, index, root);
                 let staged = matches!(root.access, RirMutPlaceAccess::DataRef { .. })
                     && matches!(
-                        self.program.types[root.ty.index()],
+                        self.program.types
+                            [self.program.verified_mut_place_ty(function, root).index()],
                         RirType::List(_) | RirType::Map { .. }
                     );
                 let loan = if staged {
@@ -5796,7 +5816,7 @@ impl EmitCx<'_> {
             RustPlaces::new(self.program, function).projected_expr(
                 root_ty,
                 &root_expr,
-                root.ty,
+                self.program.verified_place_ty(function, root),
                 &root.projections,
             )?
         };
@@ -5956,28 +5976,28 @@ impl EmitCx<'_> {
         value: &RirRValue,
     ) -> String {
         let payload = self.cell_payload_ty(cell);
-        let value = self.rvalue_at(function, index, value);
+        let value = self.rvalue(function, index, value);
         match self.cell_decl(cell).storage {
-            RirCellStorage::StackScoped => {
-                format!(
-                    "{}::new_with_safepoint({value}, {})",
-                    target::stack_lambda_cell_ctor(&payload),
-                    target::runtime_safepoint_state("rt")
-                )
-            }
+            RirCellStorage::StackScoped => target::lambda_cell_new_with_safepoint(
+                &target::stack_lambda_cell_ctor(&payload),
+                &value,
+                &target::runtime_safepoint_state(target::runtime_param_name()),
+            ),
             RirCellStorage::Heap => {
                 let heap_type = format!(
-                    "statics.{}",
+                    "{}.{}",
+                    target::statics_param_name(),
                     lambda_cell_heap_type_symbol(self.cell_decl(cell).id)
                 );
-                let storage = format!(
-                    "{}::new_with_safepoint(value, safepoint)",
-                    target::lambda_cell_ctor(&payload)
+                let storage = target::lambda_cell_new_with_safepoint(
+                    &target::lambda_cell_ctor(&payload),
+                    "value",
+                    "safepoint",
                 );
                 format!(
                     "{{ let value = {value}; let heap_type = {heap_type}; let safepoint = {}; {} }}",
-                    target::runtime_safepoint_state("rt"),
-                    target::rt_heap_alloc("rt", "heap_type", &storage)
+                    target::runtime_safepoint_state(target::runtime_param_name()),
+                    target::rt_heap_alloc(target::runtime_param_name(), "heap_type", &storage)
                 )
             }
         }
@@ -5993,28 +6013,12 @@ impl EmitCx<'_> {
             }
             RirCellStorage::Heap => {
                 target::rt_heap_with(
-                    "rt",
+                    target::runtime_param_name(),
                     &format!("&{}", self.cell_ref(function, cell)),
                     "cell",
                     &format!("cell.{set}"),
                 ) + "?"
             }
-        }
-    }
-
-    fn param_abi_semantic(abi: RirParamAbi) -> RirParamSemantic {
-        match abi {
-            RirParamAbi::Value => RirParamSemantic::Value,
-            RirParamAbi::SharedBorrow => RirParamSemantic::SharedBorrow,
-            RirParamAbi::MutBorrow => RirParamSemantic::MutBorrow,
-            RirParamAbi::MutPlace => RirParamSemantic::MutPlace,
-            RirParamAbi::DynBorrow => RirParamSemantic::DynBorrow,
-            RirParamAbi::ScopedLambda => RirParamSemantic::ScopedLambda,
-            RirParamAbi::EscapingLambda => RirParamSemantic::EscapingLambda,
-            RirParamAbi::AnvCallback => RirParamSemantic::AnvCallback,
-            RirParamAbi::StackCell => RirParamSemantic::StackCell,
-            RirParamAbi::HeapCell => RirParamSemantic::HeapCell,
-            RirParamAbi::ScopedPlaceCell => RirParamSemantic::ScopedPlaceCell,
         }
     }
 
@@ -6094,27 +6098,23 @@ impl EmitCx<'_> {
         &self,
         function: &RirFunction,
         args: &[RirCallArg],
-        native_plan: &NativeCallPlan,
-        abis: &[anvyx_runtime::RustParamAbi],
-        tys: &[RirTypeId],
+        ext: &RirExtern,
         receiver: Option<ResolvedReceiver>,
         mut rendered: Vec<String>,
         render: impl FnOnce(String) -> String,
     ) -> String {
         let mut resource_borrows = vec![];
         let offset = if let Some(receiver) = receiver {
-            let abi = &abis[0];
-            let ty = tys[0];
-            debug_assert_eq!(receiver.ty, ty);
-            let facts = native_dynamic_arg_facts(self.program, ty, receiver.semantic);
-            let action = native_plan.arg_action(0, facts);
+            let param = &ext.params[0];
+            debug_assert_eq!(receiver.ty, param.ty);
+            let action = param.action;
             let mut expr = receiver.expr;
             if let Some(mutable) = action.native_ref_borrow_mutability() {
                 let arg = "__anv_ref_arg_0".to_string();
                 resource_borrows.push((expr, arg.clone(), mutable));
                 expr = arg;
             } else {
-                expr = self.native_arg_expr(abi, ty, expr);
+                expr = self.native_arg_expr(&param.abi, param.ty, expr);
             }
             rendered.push(expr);
             1
@@ -6122,7 +6122,7 @@ impl EmitCx<'_> {
             0
         };
         let (prelude, rendered, mut args_borrows) =
-            self.prepared_native_args(function, args, native_plan, abis, tys, offset, rendered);
+            self.prepared_native_args(function, args, ext, offset, rendered);
         resource_borrows.append(&mut args_borrows);
         let mut call = render(comma(rendered));
         for (resource, arg, mutable) in resource_borrows.into_iter().rev() {
@@ -6139,9 +6139,7 @@ impl EmitCx<'_> {
         &self,
         function: &RirFunction,
         args: &[RirCallArg],
-        native_plan: &NativeCallPlan,
-        abis: &[anvyx_runtime::RustParamAbi],
-        tys: &[RirTypeId],
+        ext: &RirExtern,
         offset: usize,
         mut rendered: Vec<String>,
     ) -> PreparedNativeArgs {
@@ -6150,13 +6148,9 @@ impl EmitCx<'_> {
         let values = RustValues::new(self.program, function);
         for (arg_index, arg) in args.iter().enumerate() {
             let index = arg_index + offset;
+            let param = &ext.params[index];
             let (stmts, mut expr) = self.prepared_call_arg(function, index, arg);
-            let (Some(abi), Some(ty)) = (abis.get(index), tys.get(index)) else {
-                prelude.extend(stmts);
-                rendered.push(expr);
-                continue;
-            };
-            let action = native_plan.arg_action(index, native_arg_facts(self.program, *ty, arg));
+            let action = ext.arg_action(index, arg);
             if action == NativeArgAction::SnapshotString {
                 let tmp = format!("__anv_native_arg_{index}");
                 let snapshot = format!("{}::from({expr})", target::anv_string_ty());
@@ -6166,14 +6160,14 @@ impl EmitCx<'_> {
                     format!("{{ {} {snapshot} }}", stmts.join(" "))
                 };
                 prelude.push(format!("let {tmp} = {init};"));
-                expr = values.borrow_temp_arg(*ty, &tmp);
+                expr = values.borrow_temp_arg(param.ty, &tmp);
             } else {
                 prelude.extend(stmts);
             }
-            if let anvyx_runtime::RustParamAbi::InitField(inner) = abi {
+            if let anvyx_runtime::RustParamAbi::InitField(inner) = &param.abi {
                 expr = match arg {
                     RirCallArg::InitFieldProvided(_) => {
-                        let value = self.native_arg_expr(inner, *ty, expr);
+                        let value = self.native_arg_expr(inner, param.ty, expr);
                         target::init_field_provided(&value)
                     }
                     RirCallArg::InitFieldOmitted => target::init_field_omitted(),
@@ -6184,7 +6178,7 @@ impl EmitCx<'_> {
                 resource_borrows.push((expr, arg.clone(), mutable));
                 expr = arg;
             } else {
-                expr = self.native_arg_expr(abi, *ty, expr);
+                expr = self.native_arg_expr(&param.abi, param.ty, expr);
             }
             rendered.push(expr);
         }
@@ -6380,7 +6374,7 @@ impl EmitCx<'_> {
             let tmp = format!("__anv_global_borrow_{index}");
             return (
                 vec![values.global_value_binding(global, &tmp)],
-                values.borrow_temp_arg(place.ty, &tmp),
+                values.borrow_temp_arg(self.program.verified_place_ty(function, place), &tmp),
             );
         }
         let RirCallArg::MutPlace(mut_place) = arg else {
@@ -6396,33 +6390,13 @@ impl EmitCx<'_> {
         borrow: &super::rir::RirDynBorrow,
     ) -> (Vec<String>, String) {
         let symbol = self.program.dyn_borrow_symbol(borrow.target);
-        let weakening = borrow.air_weakening.map(|id| {
-            self.program
-                .dyn_weakenings
-                .iter()
-                .find(|weakening| weakening.air_id == id)
-                .expect("verified dynamic borrow weakening")
-        });
+        let weakening = borrow
+            .weakening
+            .map(|id| &self.program.dyn_weakenings[id.index()]);
         match &borrow.source {
-            super::rir::RirDynBorrowSource::Concrete {
-                place,
-                carrier,
-                air_witness,
-            } => {
-                let source = &self.program.dyn_carriers[carrier.index()];
-                let source_variant = source
-                    .variants
-                    .iter()
-                    .find(|variant| variant.air_witness == *air_witness)
-                    .expect("verified dynamic borrow witness");
-                let target_variant = weakening.map_or(source_variant.id, |weakening| {
-                    weakening
-                        .arms
-                        .iter()
-                        .find(|arm| arm.source == source_variant.id)
-                        .expect("verified dynamic borrow weakening arm")
-                        .target
-                });
+            super::rir::RirDynBorrowSource::Concrete { place, variant } => {
+                let target_variant =
+                    weakening.map_or(*variant, |weakening| weakening.arms[variant.index()].target);
                 let target = &self.program.dyn_carriers[borrow.target.index()];
                 let RirType::Enum(id) = self.program.types[target.storage_ty.index()] else {
                     unreachable!("verified dynamic carrier storage")
@@ -6457,6 +6431,19 @@ impl EmitCx<'_> {
         }
     }
 
+    fn emit_scoped_place_cell_inits_for_local(
+        &mut self,
+        function: &RirFunction,
+        local: RirLocalId,
+    ) {
+        for index in 0..self.program.scoped_place_cells.len() {
+            let cell = &self.program.scoped_place_cells[index];
+            if cell.owner == function.id && cell.source.root_local() == Some(local) {
+                self.emit_scoped_place_cell_init(function, cell.id);
+            }
+        }
+    }
+
     fn scoped_place_cell_needs_slot_init(cell: &RirScopedPlaceCellDecl) -> bool {
         matches!(
             cell.source.place().access,
@@ -6464,20 +6451,20 @@ impl EmitCx<'_> {
         )
     }
 
-    fn emit_scoped_place_cell_init(
-        &mut self,
-        function: &RirFunction,
-        cell: &RirScopedPlaceCellDecl,
-    ) {
+    fn emit_scoped_place_cell_init(&mut self, function: &RirFunction, id: RirScopedPlaceCellId) {
+        let cell = &self.program.scoped_place_cells[id.index()];
         let (prelude, source) =
-            self.prepared_scoped_place_cell_source(function, cell.id.index(), cell.source.place());
+            self.prepared_scoped_place_cell_source(function, id.index(), cell.source.place());
         for line in prelude {
             self.w.line(format_args!("{line}"));
         }
         self.w.line(format_args!(
             "let {} = {};",
             cell.symbol.as_str(),
-            target::scoped_mut_place_cell_new(&source, &target::runtime_safepoint_state("rt"))
+            target::scoped_mut_place_cell_new(
+                &source,
+                &target::runtime_safepoint_state(target::runtime_param_name())
+            )
         ));
     }
 
@@ -6487,18 +6474,27 @@ impl EmitCx<'_> {
         index: usize,
         mut_place: &RirMutPlaceArg,
     ) -> (Vec<String>, String) {
-        let RirMutPlaceAccess::Handle(RirMutPlaceHandle::Local { local, ty }) = mut_place.access
-        else {
+        let RirMutPlaceAccess::Handle(RirMutPlaceHandle::Local { local }) = mut_place.access else {
             return self.prepared_mut_place_arg(function, index, mut_place);
         };
-        if function.locals[local.index()].payload_ref {
+        if !matches!(
+            function.locals[local.index()].binding,
+            RirLocalBinding::Value
+        ) {
             return self.prepared_mut_place_arg(function, index, mut_place);
         }
         let root = target::mut_place_local_raw(function.locals[local.index()].symbol.as_str());
         if mut_place.projections.is_empty() {
             return (vec![], root);
         }
-        self.prepared_projected_mut_place(function, index, mut_place, ty, &root)
+        self.prepared_projected_mut_place(
+            function,
+            index,
+            mut_place,
+            self.program
+                .verified_mut_place_root_ty(function, &mut_place.access),
+            &root,
+        )
     }
 
     fn prepared_mut_place_arg(
@@ -6513,7 +6509,7 @@ impl EmitCx<'_> {
         {
             return self.prepared_projected_mut_place(function, index, mut_place, root_ty, &root);
         }
-        let RirMutPlaceAccess::DataRef { object, dataref } = &mut_place.access else {
+        let RirMutPlaceAccess::DataRef { object, place } = &mut_place.access else {
             return (
                 vec![],
                 values
@@ -6526,9 +6522,8 @@ impl EmitCx<'_> {
             function,
             index,
             object,
-            *dataref,
+            *place,
             &mut_place.projections,
-            mut_place.ty,
             &format!("__anv_dataref_place_object_{index}"),
             &format!("__anv_dataref_place_ops_{index}"),
         )
@@ -6539,52 +6534,37 @@ impl EmitCx<'_> {
         function: &RirFunction,
         index: usize,
         object: &RirOperand,
-        dataref: RirDataRefId,
-        projections: &[RirProjection],
-        ty: RirTypeId,
+        place: RirDataRefPlaceId,
+        suffix: &[RirPlaceStep],
         object_tmp: &str,
         ops_tmp: &str,
     ) -> (Vec<String>, String) {
         let values = RustValues::new(self.program, function);
-        let (path, consumed) = RirPlaceModel::new(self.program)
-            .dataref_storage_prefix(dataref, projections)
-            .expect("verified dataref place prefix");
-        let descriptor = self
-            .dataref_places
-            .find(dataref, &projections[..consumed], path.ty())
-            .expect("verified dataref place descriptor");
+        let descriptor = &self.program.dataref_places[place.index()];
+        let storage_ty = self.program.materializers[descriptor.materializer.index()].ty;
         let object_ref = values.operand_ref(object);
-        let heap_type = descriptor.heap_type_field(self.program);
+        let heap_type = self.program.datarefs[descriptor.dataref.index()].heap_type_symbol();
         let mut prelude = vec![
             format!(
                 "let {object_tmp} = {};",
-                target::rt_heap_erase("rt", &object_ref)
+                target::rt_heap_erase(target::runtime_param_name(), &object_ref)
             ),
             format!(
                 "let {ops_tmp} = {} {{ {}: {} }};",
-                descriptor.symbol,
+                target::dataref_place_symbol(place.index()),
                 target::dataref_place_heap_type_field(),
-                target::heap_type_access("statics", &heap_type)
+                target::heap_type_access(target::statics_param_name(), &heap_type)
             ),
         ];
         let root = target::mut_place_dataref(object_tmp, &format!("&{ops_tmp}"));
-        let suffix = &projections[consumed..];
         if suffix.is_empty() {
             return (prelude, root);
         }
         let root_tmp = format!("__anv_dataref_place_root_{index}");
         prelude.push(format!("let mut {root_tmp} = {root};"));
         let root = target::mut_place_reborrow(&root_tmp);
-        let suffix_place = RirMutPlaceArg {
-            access: RirMutPlaceAccess::DataRef {
-                object: object.clone(),
-                dataref,
-            },
-            projections: suffix.to_vec(),
-            ty,
-        };
         let (projected, place) =
-            self.prepared_projected_mut_place(function, index, &suffix_place, path.ty(), &root);
+            self.prepared_dataref_suffix(function, index, storage_ty, suffix, &root);
         prelude.extend(projected);
         (prelude, place)
     }
@@ -6595,17 +6575,18 @@ impl EmitCx<'_> {
         index: usize,
         mut_place: &RirMutPlaceArg,
     ) -> (Vec<String>, String) {
-        if let RirMutPlaceAccess::Handle(RirMutPlaceHandle::Global { global, ty }) =
-            mut_place.access
-        {
+        if let RirMutPlaceAccess::Handle(RirMutPlaceHandle::Global { global }) = mut_place.access {
             let init = format!("__anv_global_place_init_{index}");
             let root = format!("__anv_global_place_root_{index}");
             let prelude = vec![
                 format!(
-                    "let {init}: &dyn for<'__anv_rt> Fn(&mut {}) -> Result<{}, {}> = &|rt| {};",
+                    "let {init}: &dyn for<'__anv_rt> Fn(&mut {}) -> Result<{}, {}> = &|{}| {};",
                     target::runtime_ctx_ty_with("'__anv_rt"),
-                    self.ty(ty),
+                    self.ty(self
+                        .program
+                        .verified_mut_place_root_ty(function, &mut_place.access)),
                     target::runtime_error_ty(),
+                    target::runtime_param_name(),
                     RustValues::global_init_call(self.program, global)
                 ),
                 format!(
@@ -6619,25 +6600,40 @@ impl EmitCx<'_> {
             if mut_place.projections.is_empty() {
                 return (prelude, root);
             }
-            let (projected_prelude, place) =
-                self.prepared_projected_mut_place(function, index, mut_place, ty, &root);
+            let (projected_prelude, place) = self.prepared_projected_mut_place(
+                function,
+                index,
+                mut_place,
+                self.program
+                    .verified_mut_place_root_ty(function, &mut_place.access),
+                &root,
+            );
             return (
                 prelude.into_iter().chain(projected_prelude).collect(),
                 place,
             );
         }
-        let RirMutPlaceAccess::Handle(RirMutPlaceHandle::Local { local, ty }) = mut_place.access
-        else {
+        let RirMutPlaceAccess::Handle(RirMutPlaceHandle::Local { local }) = mut_place.access else {
             return self.prepared_mut_place_arg(function, index, mut_place);
         };
-        if function.locals[local.index()].payload_ref {
+        if !matches!(
+            function.locals[local.index()].binding,
+            RirLocalBinding::Value
+        ) {
             return self.prepared_mut_place_arg(function, index, mut_place);
         }
         let root = target::mut_place_local_raw(function.locals[local.index()].symbol.as_str());
         if mut_place.projections.is_empty() {
             return (vec![], root);
         }
-        self.prepared_projected_mut_place(function, index, mut_place, ty, &root)
+        self.prepared_projected_mut_place(
+            function,
+            index,
+            mut_place,
+            self.program
+                .verified_mut_place_root_ty(function, &mut_place.access),
+            &root,
+        )
     }
 
     fn prepared_scoped_lambda_call_arg(
@@ -6651,9 +6647,9 @@ impl EmitCx<'_> {
         let (args_ty, ret_ty) = policy.scoped_lambda_sig_args_ret(sig);
         let state = format!("__anv_scoped_lambda_state_{index}");
         let lambda = self.owned_value_at(function, index, callee);
-        let rt_ptr = target::non_null_from_mut("&mut *rt");
-        let statics_ptr = target::non_null_from_mut("statics");
-        let globals_ptr = target::non_null_from_mut("globals");
+        let rt_ptr = target::non_null_from_mut(&format!("&mut *{}", target::runtime_param_name()));
+        let statics_ptr = target::non_null_from_mut(target::statics_param_name());
+        let globals_ptr = target::non_null_from_mut(target::globals_param_name());
         let retained_callbacks = self.has_retained_callbacks();
         let retained_ptrs = retained_callbacks.then(|| {
             format!(
@@ -6695,8 +6691,12 @@ impl EmitCx<'_> {
                 format!(
                     "let {handle} = {};",
                     target::rt_heap_alloc(
-                        "rt",
-                        &format!("statics.{}", plan.heap_type_field()),
+                        target::runtime_param_name(),
+                        &format!(
+                            "{}.{}",
+                            target::statics_param_name(),
+                            plan.heap_type_field()
+                        ),
                         &record_var
                     )
                 ),
@@ -6723,8 +6723,7 @@ impl EmitCx<'_> {
         let index_var = format!("__anv_callback_index_{index}");
         let generation = format!("__anv_callback_generation_{index}");
         let arg = format!("__anv_callback_arg_{index}");
-        let table_id = plan.table_id();
-        let signature_id = plan.signature_id();
+        let callback_id = plan.callback_id();
         prelude.extend([
             format!(
                 "let ({index_var}, {generation}) = unsafe {{ &mut *callbacks.as_ptr() }}.insert_{field}({handle});"
@@ -6732,10 +6731,10 @@ impl EmitCx<'_> {
             format!(
                 "let {key} = {};",
                 target::callback_key_new(
-                    "owner.owner_id()",
-                    "owner.shutdown_generation()",
-                    table_id,
-                    signature_id,
+                    &target::owner_id("owner"),
+                    &target::owner_shutdown_generation("owner"),
+                    callback_id,
+                    callback_id,
                     &index_var,
                     &generation
                 )
@@ -6772,7 +6771,7 @@ impl EmitCx<'_> {
         prelude.extend([
             format!(
                 "let {erased} = {};",
-                target::rt_heap_ref_erase("rt", &format!("&{handle}"))
+                target::rt_heap_ref_erase(target::runtime_param_name(), &format!("&{handle}"))
             ),
             format!(
                 "let {arg} = {};",
@@ -6787,6 +6786,29 @@ impl EmitCx<'_> {
         (prelude, arg)
     }
 
+    fn prepared_dataref_suffix(
+        &self,
+        function: &RirFunction,
+        index: usize,
+        root_ty: RirTypeId,
+        suffix: &[RirPlaceStep],
+        root: &str,
+    ) -> (Vec<String>, String) {
+        let ops = format!("__AnvProjectedPlaceOps{index}");
+        let ops_tmp = format!("__anv_projected_place_ops_{index}");
+        let slot_ty = suffix.last().map_or(root_ty, |step| step.target_ty);
+        let descriptor = RustValues::new(self.program, function)
+            .mut_place_projection_descriptor_for(&ops, root_ty, root, slot_ty, suffix);
+        (
+            vec![
+                descriptor.struct_decl,
+                descriptor.impl_decl,
+                format!("let {ops_tmp} = {};", descriptor.ctor),
+            ],
+            target::mut_place_projected(root, &format!("&{ops_tmp}")),
+        )
+    }
+
     fn prepared_projected_mut_place(
         &self,
         function: &RirFunction,
@@ -6798,25 +6820,31 @@ impl EmitCx<'_> {
         let ops = format!("__AnvProjectedPlaceOps{index}");
         let ops_tmp = format!("__anv_projected_place_ops_{index}");
         let values = RustValues::new(self.program, function);
-        let descriptor =
-            if let RirMutPlaceAccess::Handle(RirMutPlaceHandle::Local { local, .. }) =
-                mut_place.access
-                && !RustPlaces::new(self.program, function).payload_ref_cell_local(local)
-            {
-                let raw_root = function.locals[local.index()].symbol.as_str();
-                let projection = RustPlaces::new(self.program, function)
-                    .projected_place(root_ty_id, raw_root, mut_place.ty, &mut_place.projections)
-                    .expect("verified projected place descriptor");
-                values.mut_place_projection_descriptor(&ops, &projection)
-            } else {
-                values.mut_place_projection_descriptor_for(
-                    &ops,
+        let descriptor = if let RirMutPlaceAccess::Handle(RirMutPlaceHandle::Local { local }) =
+            mut_place.access
+            && matches!(
+                function.locals[local.index()].binding,
+                RirLocalBinding::Value
+            ) {
+            let raw_root = function.locals[local.index()].symbol.as_str();
+            let projection = RustPlaces::new(self.program, function)
+                .projected_place(
                     root_ty_id,
-                    root,
-                    mut_place.ty,
+                    raw_root,
+                    self.program.verified_mut_place_ty(function, mut_place),
                     &mut_place.projections,
                 )
-            };
+                .expect("verified projected place descriptor");
+            values.mut_place_projection_descriptor(&ops, &projection)
+        } else {
+            values.mut_place_projection_descriptor_for(
+                &ops,
+                root_ty_id,
+                root,
+                self.program.verified_mut_place_ty(function, mut_place),
+                &mut_place.projections,
+            )
+        };
         (
             vec![
                 descriptor.struct_decl,
@@ -6835,25 +6863,20 @@ impl EmitCx<'_> {
         capture: &RirLambdaCaptureArg,
     ) -> String {
         let values = RustValues::new(self.program, function);
-        match (decl.kind, decl.semantic, capture) {
+        match (decl.kind, decl.mode, capture) {
             (
                 RirLambdaCaptureKind::Param,
-                RirParamSemantic::Value,
+                RirPassMode::Value,
                 RirLambdaCaptureArg::Owned { value },
             ) => self.owned_value_at(function, index, value),
             (
                 RirLambdaCaptureKind::Param,
-                RirParamSemantic::SharedBorrow,
+                RirPassMode::SharedBorrow,
                 RirLambdaCaptureArg::Shared { place },
             ) => values.borrow_arg(place),
             (
-                RirLambdaCaptureKind::Param,
-                RirParamSemantic::MutBorrow,
-                RirLambdaCaptureArg::Scoped { place },
-            ) => values.mut_borrow_arg(place),
-            (
                 RirLambdaCaptureKind::StackCell { .. },
-                RirParamSemantic::StackCell,
+                RirPassMode::StackCell,
                 RirLambdaCaptureArg::StackCell { cell },
             ) => match cell {
                 RirCellRef::Owner(_) => format!("&{}", self.cell_ref(function, *cell)),
@@ -6861,12 +6884,12 @@ impl EmitCx<'_> {
             },
             (
                 RirLambdaCaptureKind::HeapCell { .. },
-                RirParamSemantic::HeapCell,
+                RirPassMode::HeapCell,
                 RirLambdaCaptureArg::HeapCell { cell },
             ) => format!("{}.clone()", self.cell_ref(function, *cell)),
             (
                 RirLambdaCaptureKind::ScopedPlaceCell { .. },
-                RirParamSemantic::ScopedPlaceCell,
+                RirPassMode::ScopedPlaceCell,
                 RirLambdaCaptureArg::ScopedPlaceCell { cell },
             ) => self.scoped_place_cell_capture_arg(function, *cell),
             _ => unreachable!("verified lambda capture arg mode"),
@@ -7018,7 +7041,9 @@ impl EmitCx<'_> {
                 let range =
                     target::checked_range(start, end, inclusive, &format!("{source_expr}.len()"));
                 let lines = vec![format!("let __anv_range = {range};")];
-                let view = match self.program.types[source.ty.index()] {
+                let view = match self.program.types
+                    [self.program.verified_place_ty(function, source).index()]
+                {
                     RirType::Array { .. } if mutable => target::anv_slice_from_raw_parts_mut(
                         &format!("{source_expr}.as_mut_ptr()"),
                         &format!("{source_expr}.len()"),
@@ -7032,7 +7057,9 @@ impl EmitCx<'_> {
                         "__anv_range.len()",
                     ),
                     RirType::List(_) if mutable => {
-                        let materializer = self.sequence_elem_materializer(source.ty);
+                        let materializer = self.sequence_elem_materializer(
+                            self.program.verified_place_ty(function, source),
+                        );
                         let materialize = self.materializer_closure(function, materializer);
                         target::anv_slice_from_list_mut(
                             target::runtime_param_name(),
@@ -7058,9 +7085,15 @@ impl EmitCx<'_> {
             }
             RirCollectionAccess::MutPlace(source) => {
                 let (prelude, place) = self.prepared_mut_place_arg(function, 0, source);
-                let raw = matches!(self.program.types[source.ty.index()], RirType::Array { .. });
+                let raw = matches!(
+                    self.program.types
+                        [self.program.verified_mut_place_ty(function, source).index()],
+                    RirType::Array { .. }
+                );
                 let view = if mutable && !raw {
-                    let materializer = self.sequence_elem_materializer(source.ty);
+                    let materializer = self.sequence_elem_materializer(
+                        self.program.verified_mut_place_ty(function, source),
+                    );
                     let materialize = self.materializer_closure(function, materializer);
                     target::mut_place_list_slice_view(
                         &place,
@@ -7099,12 +7132,13 @@ impl EmitCx<'_> {
         let start = function.locals[start.index()].symbol.as_str();
         let end = function.locals[end.index()].symbol.as_str();
         let range = target::checked_range(start, end, inclusive, "__anv_source.len()");
-        let source_kind = match self.program.types[source.ty.index()] {
-            RirType::List(_) => RangeCopySource::List,
-            RirType::Array { .. } => RangeCopySource::Array,
-            RirType::Slice(_) => RangeCopySource::Slice,
-            _ => unreachable!("verified range list copy source"),
-        };
+        let source_kind =
+            match self.program.types[self.program.verified_place_ty(function, source).index()] {
+                RirType::List(_) => RangeCopySource::List,
+                RirType::Array { .. } => RangeCopySource::Array,
+                RirType::Slice(_) => RangeCopySource::Slice,
+                _ => unreachable!("verified range list copy source"),
+            };
         let values = RustValues::new(self.program, function);
         let item = "item";
         let materializer = self.sequence_elem_materializer(ty);
@@ -7150,12 +7184,12 @@ impl EmitCx<'_> {
         &self,
         _function: &RirFunction,
         ret: RirTypeId,
-        abi: &anvyx_runtime::RustReturnAbi,
+        plan: &RirNativeReturn,
         call: String,
     ) -> String {
-        match abi {
-            anvyx_runtime::RustReturnAbi::Void => call,
-            _ => self.native_return_expr(ret, abi, &call),
+        match plan {
+            RirNativeReturn::Void => call,
+            _ => self.native_return_expr(ret, plan, &call),
         }
     }
 
@@ -7164,44 +7198,46 @@ impl EmitCx<'_> {
             unreachable!("verified native resource return type")
         };
         let native = self.program.structs[id.index()]
-            .native_path
+            .native
             .as_ref()
-            .expect("verified native resource path")
-            .join("::");
-        target::native_ref_adopt(&native, expr)
+            .expect("verified native resource path");
+        target::native_ref_adopt(&target::rust_path(&native.path), expr)
     }
 
     fn native_owned_named_return_expr(
         &self,
         ret: RirTypeId,
-        abi: &anvyx_runtime::ExternTypeExpr,
+        ty: &anvyx_runtime::ExternTypeExpr,
+        adopt: bool,
         expr: &str,
     ) -> String {
-        if native_ty_is_resource_ref(self.program, ret) {
+        if adopt {
             self.native_ref_adopt_return(ret, expr)
         } else {
-            self.native_value_return_expr(ret, abi, expr)
+            self.native_value_return_expr(ret, ty, expr)
         }
     }
 
-    fn native_return_expr(
-        &self,
-        ret: RirTypeId,
-        abi: &anvyx_runtime::RustReturnAbi,
-        expr: &str,
-    ) -> String {
-        match abi {
-            anvyx_runtime::RustReturnAbi::Value(ty) => self.native_value_return_expr(ret, ty, expr),
-            anvyx_runtime::RustReturnAbi::OwnedNamed(ty) => {
-                self.native_owned_named_return_expr(ret, ty, expr)
+    fn native_return_expr(&self, ret: RirTypeId, plan: &RirNativeReturn, expr: &str) -> String {
+        match plan {
+            RirNativeReturn::Void => expr.to_string(),
+            RirNativeReturn::Value(ty) => self.native_value_return_expr(ret, ty, expr),
+            RirNativeReturn::OwnedNamed { ty, adopt } => {
+                self.native_owned_named_return_expr(ret, ty, *adopt, expr)
             }
-            anvyx_runtime::RustReturnAbi::Option(inner) => {
-                let RirType::Option(inner_ty) = self.program.types[ret.index()] else {
-                    unreachable!("verified native option return type")
-                };
-                target::rust_option_map(expr, &self.native_return_expr(inner_ty, inner, "value"))
-            }
-            anvyx_runtime::RustReturnAbi::Result(ok, err) => {
+            RirNativeReturn::Option {
+                payload_ty,
+                payload,
+            } => target::rust_option_map(
+                expr,
+                &self.native_return_expr(*payload_ty, payload, "value"),
+            ),
+            RirNativeReturn::Result {
+                ok_ty,
+                ok,
+                err_ty,
+                err,
+            } => {
                 let (enm, ok_variant, err_variant) = self.result_enum(ret);
                 let ok_path = variant_path(enm.symbol.as_str(), ok_variant.symbol.as_str());
                 let err_path = variant_path(enm.symbol.as_str(), err_variant.symbol.as_str());
@@ -7209,16 +7245,13 @@ impl EmitCx<'_> {
                     expr,
                     &format!(
                         "Ok(value) => {ok_path}({})",
-                        self.native_return_expr(ok_variant.fields[0].ty, ok, "value")
+                        self.native_return_expr(*ok_ty, ok, "value")
                     ),
                     &format!(
                         "Err(value) => {err_path}({})",
-                        self.native_return_expr(err_variant.fields[0].ty, err, "value")
+                        self.native_return_expr(*err_ty, err, "value")
                     ),
                 )
-            }
-            anvyx_runtime::RustReturnAbi::Void => {
-                unreachable!("verified native result payload ABI")
             }
         }
     }
@@ -7347,26 +7380,15 @@ impl EmitCx<'_> {
         receiver: Option<ResolvedReceiver>,
     ) -> String {
         let ext = &self.program.externs[id.index()];
-        let RirExternKind::Native(native) = &ext.kind;
-        let rendered = match native.abi.ctx {
+        let rendered = match ext.ctx {
             anvyx_runtime::RustWrapperCtx::HiddenRuntime => target::native_call_args([]),
             anvyx_runtime::RustWrapperCtx::None => vec![],
         };
-        let symbol = native.path.join("::");
-        let native_plan = self.program.native_call_plan(id);
-        let suspend_entry = native_plan.provider_entry().suspends_runtime_entry();
-        let param_tys = ext.params.iter().map(|param| param.ty).collect::<Vec<_>>();
-        let call = self.prepared_native_call_expr(
-            function,
-            args,
-            &native_plan,
-            native.abi.params.as_slice(),
-            &param_tys,
-            receiver,
-            rendered,
-            |rendered| {
+        let symbol = target::rust_path(&ext.path);
+        let call =
+            self.prepared_native_call_expr(function, args, ext, receiver, rendered, |rendered| {
                 let call = format!("{symbol}({rendered})");
-                let call = if suspend_entry {
+                let call = if ext.suspends_runtime_entry {
                     RuntimeOwnerEmit::provider_suspended_call(
                         "owner",
                         "__anv_provider_entry",
@@ -7376,14 +7398,13 @@ impl EmitCx<'_> {
                 } else {
                     call
                 };
-                if native.abi.fallible {
+                if ext.fallible {
                     format!("{call}?")
                 } else {
                     call
                 }
-            },
-        );
-        self.native_return_call(function, ext.ret, &native.abi.ret, call)
+            });
+        self.native_return_call(function, ext.ret, &ext.ret_plan, call)
     }
 
     fn dataref_alloc(
@@ -7404,35 +7425,79 @@ impl EmitCx<'_> {
                 self.owned_value_at(function, index, value)
             )
         }));
-        let heap_type = format!("statics.{}", dataref.heap_type_symbol());
+        let heap_type = format!(
+            "{}.{}",
+            target::statics_param_name(),
+            dataref.heap_type_symbol()
+        );
         let storage = format!("{} {{ {} }}", dataref.storage_symbol(), fields);
         format!(
             "{{ let heap_type = {heap_type}; {} }}",
-            target::rt_heap_alloc("rt", "heap_type", &storage)
+            target::rt_heap_alloc(target::runtime_param_name(), "heap_type", &storage)
         )
     }
 
     fn dataref_set(
         &self,
         function: &RirFunction,
+        index: usize,
         object: &RirOperand,
-        dataref: RirDataRefId,
-        projections: &[RirProjection],
-        ty: RirTypeId,
+        place: RirDataRefPlaceId,
+        suffix: &[RirPlaceStep],
         value: &str,
     ) -> String {
-        let object = RustValues::new(self.program, function).operand_ref(object);
-        let path = RustPlaces::new(self.program, function).storage_path(dataref, projections);
-        if self.program.collection_replace_ty(ty) {
-            target::rt_heap_with_mut(
-                "rt",
-                &object,
+        let descriptor = &self.program.dataref_places[place.index()];
+        if suffix.is_empty() {
+            let values = RustValues::new(self.program, function);
+            let object = values.operand_ref(object);
+            let dataref_decl = &self.program.datarefs[descriptor.dataref.index()];
+            let object_tmp = format!("__anv_dataref_set_object_{index}");
+            let path = dataref_storage_path(self.program, &descriptor.storage);
+            let storage_ty = self.program.materializers[descriptor.materializer.index()].ty;
+            let body = if self.program.collection_replace_ty(storage_ty) {
+                target::replace_collection_result(&path, value)
+            } else {
+                format!("{{ {path} = {value}; Ok(()) }}")
+            };
+            let heap_type = target::heap_type_access(
+                target::statics_param_name(),
+                &dataref_decl.heap_type_symbol(),
+            );
+            let write = target::rt_heap_try_with_erased_mut(
+                target::runtime_param_name(),
+                &format!("&{object_tmp}"),
+                &heap_type,
                 "storage",
-                &target::replace_collection_result(&path, value),
-            ) + "?"
-        } else {
-            target::rt_heap_with_mut("rt", &object, "storage", &format!("{path} = {value};"))
+                &dataref_decl.storage_symbol(),
+                &body,
+            );
+            return block_expr(
+                [format!(
+                    "let {object_tmp} = {};",
+                    target::rt_heap_erase(target::runtime_param_name(), &object)
+                )],
+                Some(format!("{write}?")),
+            );
         }
+        let (prelude, place_expr) = self.prepared_dataref_place(
+            function,
+            index,
+            object,
+            place,
+            suffix,
+            &format!("__anv_dataref_place_object_{index}"),
+            &format!("__anv_dataref_place_ops_{index}"),
+        );
+        let ty = suffix.last().map_or(
+            self.program.materializers[descriptor.materializer.index()].ty,
+            |step| step.target_ty,
+        );
+        let set = if self.program.collection_replace_ty(ty) {
+            target::mut_place_replace_collection(&place_expr, target::runtime_param_name(), value)
+        } else {
+            target::mut_place_set(&place_expr, target::runtime_param_name(), value)
+        };
+        block_expr(prelude, Some(set))
     }
 
     fn struct_literal(
@@ -7548,13 +7613,12 @@ impl EmitCx<'_> {
         match req.kind {
             super::rir::RirStringifyReqKind::Helper(helper) => {
                 let helper = &self.program.stringify_helpers[helper.index()];
-                let ctx_use = analysis::function_context_use(self.program, function);
                 let call = format!(
                     "{}({}, {}, {}, &{})",
                     helper.symbol.as_str(),
-                    target::runtime_param(ctx_use.rt),
-                    target::statics_param(ctx_use.statics),
-                    target::globals_param(ctx_use.globals),
+                    target::runtime_param_name(),
+                    target::statics_param_name(),
+                    target::globals_param_name(),
                     RustValues::new(self.program, function).operand(value)
                 );
                 if analysis::stringify_helper_fallible(
@@ -7657,21 +7721,21 @@ fn stmt_directly_uses_local(program: &RirProgram, stmt: &RirStmt, local: RirLoca
         }
         RirStmt::DataRefSet {
             object,
-            projections,
+            suffix,
             value,
             ..
         } => {
             operand_uses_local(program, object, local)
-                || projections_use_local(projections, local)
+                || projections_use_local(suffix, local)
                 || rvalue_uses_local(program, value, local)
         }
         RirStmt::SequenceSlotSet {
             collection,
-            index,
+            step,
             value,
         } => {
             collection.uses_local(local)
-                || *index == local
+                || step.index_local() == Some(local)
                 || operand_uses_local(program, value, local)
         }
         RirStmt::MapValueSet { map, index, value } => {
@@ -7751,7 +7815,7 @@ fn term_uses_local(program: &RirProgram, term: &RirTerm, local: RirLocalId) -> b
 
 fn rvalue_uses_local(program: &RirProgram, value: &RirRValue, local: RirLocalId) -> bool {
     let mut uses = false;
-    value.for_each_child(crate::rust::rir::RirValueUse::Read, &mut |child| {
+    value.for_each_child(&mut |child| {
         uses |= match child {
             RirChild::Operand { operand, .. } => operand_uses_local(program, operand, local),
             RirChild::Place { place, .. } => place_uses_local(place, local),
@@ -7762,9 +7826,7 @@ fn rvalue_uses_local(program: &RirProgram, value: &RirRValue, local: RirLocalId)
                 RirLambdaCaptureArg::Owned { value } => {
                     owned_value_uses_local(program, value, local)
                 }
-                RirLambdaCaptureArg::Shared { place } | RirLambdaCaptureArg::Scoped { place } => {
-                    place_uses_local(place, local)
-                }
+                RirLambdaCaptureArg::Shared { place } => place_uses_local(place, local),
                 RirLambdaCaptureArg::StackCell { cell }
                 | RirLambdaCaptureArg::HeapCell { cell } => cell_uses_local(cell, local),
                 RirLambdaCaptureArg::ScopedPlaceCell { cell } => {
@@ -7772,7 +7834,7 @@ fn rvalue_uses_local(program: &RirProgram, value: &RirRValue, local: RirLocalId)
                 }
             },
             RirChild::LocalRead(read) => read == local,
-            RirChild::Block(_) | RirChild::Tail(_) => false,
+            RirChild::Block(_) => false,
         };
     });
     uses
@@ -7866,14 +7928,13 @@ fn mut_place_handle_uses_local(
     local: RirLocalId,
 ) -> bool {
     match handle {
-        RirMutPlaceHandle::Local { local: root, .. }
-        | RirMutPlaceHandle::Param { local: root, .. } => *root == local,
-        RirMutPlaceHandle::StackCell { cell, .. } | RirMutPlaceHandle::HeapCell { cell, .. } => {
+        RirMutPlaceHandle::Local { local: root } | RirMutPlaceHandle::Param { local: root } => {
+            *root == local
+        }
+        RirMutPlaceHandle::StackCell { cell } | RirMutPlaceHandle::HeapCell { cell } => {
             cell_uses_local(cell, local)
         }
-        RirMutPlaceHandle::ScopedPlaceCell { cell, .. } => {
-            scoped_cell_uses_local(program, cell, local)
-        }
+        RirMutPlaceHandle::ScopedPlaceCell { cell } => scoped_cell_uses_local(program, cell, local),
         RirMutPlaceHandle::Global { .. } => false,
     }
 }
@@ -7920,10 +7981,10 @@ fn place_uses_local(place: &RirPlace, local: RirLocalId) -> bool {
         || projections_use_local(&place.projections, local)
 }
 
-fn projections_use_local(projections: &[RirProjection], local: RirLocalId) -> bool {
+fn projections_use_local(projections: &[RirPlaceStep], local: RirLocalId) -> bool {
     projections
         .iter()
-        .any(|projection| matches!(projection, RirProjection::Index(index) if *index == local))
+        .any(|projection| projection.index_local() == Some(local))
 }
 
 fn block_uses_scoped_lambda_sig(block: &RirStructuredBlock, sig: RirLambdaSigId) -> bool {
@@ -7993,7 +8054,7 @@ fn call_arg_root_local(arg: &RirCallArg) -> Option<RirLocalId> {
             place.projections.is_empty().then_some(local)
         }
         RirCallArg::MutPlace(mut_place) => match &mut_place.access {
-            RirMutPlaceAccess::Handle(RirMutPlaceHandle::Local { local, .. }) => {
+            RirMutPlaceAccess::Handle(RirMutPlaceHandle::Local { local }) => {
                 mut_place.projections.is_empty().then_some(*local)
             }
             _ => None,
@@ -8001,7 +8062,7 @@ fn call_arg_root_local(arg: &RirCallArg) -> Option<RirLocalId> {
         RirCallArg::DynBorrow(borrow) => match &borrow.source {
             super::rir::RirDynBorrowSource::Concrete { place, .. }
             | super::rir::RirDynBorrowSource::Owned { place, .. } => match &place.access {
-                RirMutPlaceAccess::Handle(RirMutPlaceHandle::Local { local, .. }) => {
+                RirMutPlaceAccess::Handle(RirMutPlaceHandle::Local { local }) => {
                     place.projections.is_empty().then_some(*local)
                 }
                 _ => None,
@@ -8028,7 +8089,7 @@ fn owned_value_root_local(owned: &super::rir::RirOwnedValue) -> Option<RirLocalI
             place.projections.is_empty().then_some(local)
         }
         super::rir::RirOwnedOperand::Access(place) => match &place.access {
-            RirMutPlaceAccess::Handle(RirMutPlaceHandle::Local { local, .. }) => {
+            RirMutPlaceAccess::Handle(RirMutPlaceHandle::Local { local }) => {
                 place.projections.is_empty().then_some(*local)
             }
             _ => None,
@@ -8040,32 +8101,6 @@ fn owned_value_root_local(owned: &super::rir::RirOwnedValue) -> Option<RirLocalI
             | super::rir::RirDynBorrowSource::Owned { .. } => None,
         },
         super::rir::RirOwnedOperand::Value(RirOperand::Const(_)) => None,
-    }
-}
-
-fn rust_format_spec(spec: RirFormatSpec) -> FormatSpec {
-    FormatSpec {
-        fill: spec.fill,
-        align: spec.align.map(|align| match align {
-            RirFormatAlign::Left => FormatAlign::Left,
-            RirFormatAlign::Right => FormatAlign::Right,
-            RirFormatAlign::Center => FormatAlign::Center,
-        }),
-        sign: match spec.sign {
-            RirFormatSign::Default => FormatSign::Default,
-            RirFormatSign::Always => FormatSign::Always,
-        },
-        zero_pad: spec.zero_pad,
-        width: spec.width,
-        precision: spec.precision,
-        kind: match spec.kind {
-            RirFormatKind::Default => FormatKind::Default,
-            RirFormatKind::Hex => FormatKind::Hex,
-            RirFormatKind::HexUpper => FormatKind::HexUpper,
-            RirFormatKind::Binary => FormatKind::Binary,
-            RirFormatKind::Exp => FormatKind::Exp,
-            RirFormatKind::ExpUpper => FormatKind::ExpUpper,
-        },
     }
 }
 
@@ -8093,17 +8128,17 @@ fn lambda_cell_heap_type_symbol(id: super::rir::RirCellId) -> String {
 
 fn lambda_capture_call_arg(index: usize, capture: &RirLambdaCapture) -> String {
     match capture.kind {
-        RirLambdaCaptureKind::Param => match capture.semantic {
-            RirParamSemantic::Value | RirParamSemantic::SharedBorrow => format!("*c{index}"),
-            RirParamSemantic::MutBorrow => format!("&mut **c{index}"),
-            RirParamSemantic::MutPlace
-            | RirParamSemantic::DynBorrow
-            | RirParamSemantic::ScopedLambda
-            | RirParamSemantic::EscapingLambda
-            | RirParamSemantic::AnvCallback
-            | RirParamSemantic::StackCell
-            | RirParamSemantic::HeapCell
-            | RirParamSemantic::ScopedPlaceCell => unreachable!("verified non-param capture kind"),
+        RirLambdaCaptureKind::Param => match capture.mode {
+            RirPassMode::Value | RirPassMode::SharedBorrow => format!("*c{index}"),
+            RirPassMode::MutBorrow => format!("&mut **c{index}"),
+            RirPassMode::MutPlace
+            | RirPassMode::DynBorrow
+            | RirPassMode::ScopedLambda
+            | RirPassMode::EscapingLambda
+            | RirPassMode::AnvCallback
+            | RirPassMode::StackCell
+            | RirPassMode::HeapCell
+            | RirPassMode::ScopedPlaceCell => unreachable!("verified non-param capture kind"),
         },
         RirLambdaCaptureKind::StackCell { .. } | RirLambdaCaptureKind::ScopedPlaceCell { .. } => {
             format!("*c{index}")

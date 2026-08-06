@@ -1,51 +1,70 @@
 use anvyx_frontend::air;
 use anvyx_runtime::{
-    CallbackEscape, ExternParam, ExternTypeExpr, ParamFlow, RustExternBinding, RustParamAbi,
-    RustProviderSupport, RustReturnAbi, RustTypeBinding,
+    CallbackEscape, ExternParam, ExternTypeExpr, ParamFlow, RustExternAbi, RustExternBinding,
+    RustParamAbi, RustProviderSupport, RustReturnAbi,
 };
-
-use super::{native_call, rir};
-
-pub(super) struct ResolvedExtern<'a> {
-    pub binding: &'a RustExternBinding,
-    pub params: Vec<native_call::NativeParamAbi>,
-    pub callback_receiver: Option<usize>,
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ResolveExternError {
-    UnsupportedExtern,
-    UnsupportedRustAbi,
+    MissingBinding,
+    MissingConfiguredSupport,
+    MissingExport,
+    UnsupportedAbi,
 }
 
 pub(super) fn resolve_extern<'a>(
     providers: &'a [RustProviderSupport],
+    program: &air::Program,
     decl: &air::ExternDecl,
-) -> Result<ResolvedExtern<'a>, ResolveExternError> {
+) -> Result<(&'a RustExternBinding, Option<usize>), ResolveExternError> {
     let binding = decl
         .binding
         .as_ref()
-        .ok_or(ResolveExternError::UnsupportedExtern)?;
-    let binding =
-        extern_binding(providers, binding).ok_or(ResolveExternError::UnsupportedExtern)?;
+        .ok_or(ResolveExternError::MissingBinding)?;
+    let support = provider(providers, binding.package.as_str(), &binding.provider)
+        .ok_or(ResolveExternError::MissingConfiguredSupport)?;
+    let binding = extern_binding(support, binding).ok_or(ResolveExternError::MissingExport)?;
     let callback_receiver = callback_receiver_index(decl);
-    if !rir::rust_extern_abi_supported_with_receiver(&binding.abi, callback_receiver)
+    if !rust_extern_abi_supported_with_receiver(&binding.abi, callback_receiver)
         || binding.abi.params.len() != decl.call_params().count()
         || !rust_abi_matches_air(&binding.abi.params, &binding.abi.ret, &decl.abi)
+        || !hidden_ctx_borrows_ok(program, decl, binding)
     {
-        return Err(ResolveExternError::UnsupportedRustAbi);
+        return Err(ResolveExternError::UnsupportedAbi);
     }
-    let params = binding
-        .abi
-        .params
-        .iter()
-        .map(native_call::classify_param)
-        .collect();
-    Ok(ResolvedExtern {
-        binding,
-        params,
-        callback_receiver,
-    })
+    Ok((binding, callback_receiver))
+}
+
+pub(super) fn rust_extern_abi_supported_with_receiver(
+    abi: &RustExternAbi,
+    receiver: Option<usize>,
+) -> bool {
+    match abi.support {
+        anvyx_runtime::RustAbiSupport::Direct => abi.backend_supported(),
+        anvyx_runtime::RustAbiSupport::NeedsWrapperConversion => {
+            abi.supported_callback_wrapper_with_receiver(receiver)
+        }
+        anvyx_runtime::RustAbiSupport::Unsupported => false,
+    }
+}
+
+fn hidden_ctx_borrows_ok(
+    program: &air::Program,
+    decl: &air::ExternDecl,
+    binding: &RustExternBinding,
+) -> bool {
+    binding.abi.ctx != anvyx_runtime::RustWrapperCtx::HiddenRuntime
+        || decl
+            .call_params()
+            .zip(&binding.abi.params)
+            .all(|(param, abi)| {
+                !matches!(abi, RustParamAbi::Borrow(_) | RustParamAbi::MutBorrow(_))
+                    || !matches!(
+                        program.type_arena.data(param.ty),
+                        air::TypeData::Extern(id)
+                            if program.extern_type(*id).rep == air::ExternRep::Shared
+                    )
+            })
 }
 
 fn callback_receiver_index(decl: &air::ExternDecl) -> Option<usize> {
@@ -92,29 +111,14 @@ fn air_extern_param(abi: &RustParamAbi, ty: ExternTypeExpr) -> ExternParam {
 }
 
 fn extern_binding<'a>(
-    providers: &'a [RustProviderSupport],
+    support: &'a RustProviderSupport,
     binding: &air::ExternBindingDecl,
 ) -> Option<&'a RustExternBinding> {
-    provider(providers, binding.package.as_str(), &binding.provider).and_then(|provider| {
-        provider
-            .modules
-            .iter()
-            .flat_map(|module| &module.bindings)
-            .find(|native| native.key == binding.key)
-    })
-}
-
-pub(super) fn type_binding<'a>(
-    providers: &'a [RustProviderSupport],
-    binding: &air::ExternTypeBindingDecl,
-) -> Option<&'a RustTypeBinding> {
-    provider(providers, binding.package.as_str(), &binding.provider).and_then(|provider| {
-        provider
-            .modules
-            .iter()
-            .flat_map(|module| &module.types)
-            .find(|native| native.key == binding.key)
-    })
+    support
+        .modules
+        .iter()
+        .flat_map(|module| &module.bindings)
+        .find(|native| native.key == binding.key)
 }
 
 fn provider<'a>(

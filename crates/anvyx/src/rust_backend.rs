@@ -17,16 +17,20 @@ fn render_error(error: Error) -> String {
             check::emit_text_diagnostic_report(&output.report);
             output.summary().to_string()
         }
+        Error::TargetDiagnostics(output) => {
+            check::emit_text_diagnostic_report(&output.report);
+            output.gaps.summary()
+        }
         error => error.to_string(),
     }
 }
 
-fn handle_event(event: Event) {
+fn handle_event(event: &Event<'_>) {
     match event {
         Event::Checking { file } => {
             progress::status("Checking", &format!("{}...", file.display()));
         }
-        Event::Checked { report } => check::emit_text_diagnostic_report(&report),
+        Event::Checked { report } => check::emit_text_diagnostic_report(report),
         Event::GeneratingRust => progress::status("Generating", "Rust..."),
         Event::CompilingRust => progress::status("Compiling", "generated Rust..."),
         Event::Running { file } => {

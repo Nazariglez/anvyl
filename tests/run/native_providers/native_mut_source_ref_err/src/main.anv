@@ -1,0 +1,14 @@
+// @mode: run
+// @expect: error
+// @contains: UnsupportedMutablePlaceNativeBoundary
+
+import pkg:host.host { Counter, make_counter };
+
+fn forward(ref counter: Counter) {
+    counter.bump(1);
+}
+
+fn main() {
+    var counter = make_counter(1);
+    forward(counter);
+}

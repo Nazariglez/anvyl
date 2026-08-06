@@ -1,0 +1,39 @@
+// @mode: run
+// @expect: success
+// @match-begin
+// object
+// suffix
+// 12
+// 1
+// 1
+// @match-end
+
+dataref Node {
+    values: [int; 1],
+}
+
+fn object_index(ref calls: int) -> int {
+    calls += 1;
+    println("object");
+    1
+}
+
+fn suffix_index(ref calls: int) -> int {
+    calls += 1;
+    println("suffix");
+    0
+}
+
+fn bump(ref value: int) {
+    value += 10;
+}
+
+fn main() {
+    var object_calls = 0;
+    var suffix_calls = 0;
+    var nodes = [Node { values: [1] }, Node { values: [2] }];
+    bump(nodes[object_index(object_calls)].values[suffix_index(suffix_calls)]);
+    println(nodes[1].values[0]);
+    println(object_calls);
+    println(suffix_calls);
+}

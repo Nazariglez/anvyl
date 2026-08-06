@@ -2,11 +2,11 @@ use super::{
     place::{MutPlaceProjection, MutPlaceProjectionStep, RustPlaces, projected_ops_ctor},
     rep_policy::{RirRustRepPolicy, RustBorrowView},
     rir::{
-        RirCallArg, RirCellRef, RirConst, RirConstValue, RirDynCarrierId, RirDynStorage,
-        RirDynVariantId, RirEnum, RirField, RirFunction, RirGlobalId, RirMaterializerId,
-        RirMutPlaceAccess, RirMutPlaceArg, RirMutPlaceHandle, RirOperand, RirParamSemantic,
-        RirPlace, RirPlaceRoot, RirProgram, RirProjection, RirScopedPlaceCellRef, RirType,
-        RirTypeId, RirVariant, RirVariantKind,
+        RirCallArg, RirCellRef, RirConst, RirConstValue, RirCopyEvidence, RirDynCarrierId,
+        RirDynStorage, RirDynVariantId, RirField, RirFunction, RirGlobalId, RirMaterializer,
+        RirMaterializerAction, RirMaterializerId, RirMutPlaceAccess, RirMutPlaceArg,
+        RirMutPlaceHandle, RirOperand, RirPassMode, RirPlace, RirPlaceRoot, RirPlaceStep,
+        RirProgram, RirScopedPlaceCellRef, RirType, RirTypeId, RirVariantKind,
     },
     syntax::{
         block_expr, comma, field_init, match_expr, rust_char, rust_string, struct_lit,
@@ -28,6 +28,12 @@ pub(super) struct ProjectedPlaceDescriptor {
     pub(super) impl_decl: String,
 }
 
+#[derive(Clone, Copy)]
+pub(super) enum MaterializerDir {
+    RefToOwned,
+    StagedToStored,
+}
+
 impl<'a> RustValues<'a> {
     pub(super) fn new(program: &'a RirProgram, function: &'a RirFunction) -> Self {
         Self {
@@ -36,6 +42,10 @@ impl<'a> RustValues<'a> {
             policy: RirRustRepPolicy::new(program),
             places: RustPlaces::new(program, function),
         }
+    }
+
+    fn place_ty(&self, place: &RirPlace) -> RirTypeId {
+        self.program.verified_place_ty(self.function, place)
     }
 
     pub(super) fn call_arg(&self, arg: &RirCallArg) -> String {
@@ -68,7 +78,7 @@ impl<'a> RustValues<'a> {
     pub(super) fn borrow_arg(&self, place: &RirPlace) -> String {
         let place_expr = self.places.local_place(place);
         self.borrow_expr(
-            place.ty,
+            self.place_ty(place),
             &place_expr,
             self.places.shared_borrow_root_param(place),
         )
@@ -99,10 +109,8 @@ impl<'a> RustValues<'a> {
 
     fn borrow_expr(&self, ty: RirTypeId, expr: &str, borrowed_root: bool) -> String {
         match self.policy.borrow_view(ty) {
-            RustBorrowView::Ref | RustBorrowView::Slice | RustBorrowView::Str if borrowed_root => {
-                expr.to_string()
-            }
-            RustBorrowView::Ref | RustBorrowView::Slice => format!("&{expr}"),
+            RustBorrowView::Ref | RustBorrowView::Str if borrowed_root => expr.to_string(),
+            RustBorrowView::Ref => format!("&{expr}"),
             RustBorrowView::Str => format!("{expr}.as_str()"),
             RustBorrowView::TargetGap => expr.to_string(),
         }
@@ -130,43 +138,49 @@ impl<'a> RustValues<'a> {
     }
 
     fn mut_place_handle_arg(&self, root: &RirMutPlaceHandle) -> (RirTypeId, String) {
+        let ty = self
+            .program
+            .verified_mut_place_root_ty(self.function, &RirMutPlaceAccess::Handle(root.clone()));
         match root {
-            RirMutPlaceHandle::Local { local, ty }
-                if self.places.payload_ref_cell_local(*local) =>
+            RirMutPlaceHandle::Local { local }
+                if matches!(
+                    self.function.locals[local.index()].binding,
+                    super::rir::RirLocalBinding::ScopedPlacePayload
+                ) =>
             {
                 (
-                    *ty,
+                    ty,
                     target::mut_place_scoped_cell(&format!(
                         "&{}",
                         self.function.locals[local.index()].symbol.as_str()
                     )),
                 )
             }
-            RirMutPlaceHandle::Local { local, ty } => (
-                *ty,
-                target::mut_place_local(&self.place(&RirPlace::local(*local, vec![], *ty))),
+            RirMutPlaceHandle::Local { local } => (
+                ty,
+                target::mut_place_local(&self.place(&RirPlace::local(*local, vec![]))),
             ),
-            RirMutPlaceHandle::Param { local, ty } => (
-                *ty,
+            RirMutPlaceHandle::Param { local } => (
+                ty,
                 target::mut_place_reborrow(self.function.locals[local.index()].symbol.as_str()),
             ),
-            RirMutPlaceHandle::StackCell { cell, ty } => {
-                (*ty, target::mut_place_stack_cell(&self.cell_ref(*cell)))
+            RirMutPlaceHandle::StackCell { cell } => {
+                (ty, target::mut_place_stack_cell(&self.cell_ref(*cell)))
             }
-            RirMutPlaceHandle::HeapCell { cell, ty } => {
-                (*ty, target::mut_place_heap_cell(&self.cell_ref(*cell)))
+            RirMutPlaceHandle::HeapCell { cell } => {
+                (ty, target::mut_place_heap_cell(&self.cell_ref(*cell)))
             }
-            RirMutPlaceHandle::ScopedPlaceCell { cell, ty } => {
+            RirMutPlaceHandle::ScopedPlaceCell { cell } => {
                 let cell = match cell {
                     RirScopedPlaceCellRef::Owner(_) => {
                         format!("&{}", self.scoped_place_cell_ref(*cell))
                     }
                     RirScopedPlaceCellRef::Capture { .. } => self.scoped_place_cell_ref(*cell),
                 };
-                (*ty, target::mut_place_scoped_cell(&cell))
+                (ty, target::mut_place_scoped_cell(&cell))
             }
-            RirMutPlaceHandle::Global { global, ty } => (
-                *ty,
+            RirMutPlaceHandle::Global { global } => (
+                ty,
                 target::mut_place_global(
                     &Self::global_slot_expr(self.program, *global),
                     &Self::global_init_call(self.program, *global),
@@ -212,14 +226,6 @@ impl<'a> RustValues<'a> {
         }
     }
 
-    pub(super) fn dyn_payload_from_ref(
-        &self,
-        materializer: RirMaterializerId,
-        expr: &str,
-    ) -> String {
-        self.render_materializer_ref(materializer, expr)
-    }
-
     pub(super) fn owned_value(&self, owned: &super::rir::RirOwnedValue) -> String {
         if let super::rir::RirOwnedOperand::DynBorrow(borrow) = &owned.value {
             let super::rir::RirOwnedSource::Reuse(materializer) = owned.source else {
@@ -229,7 +235,7 @@ impl<'a> RustValues<'a> {
                 super::rir::RirDynBorrowSource::Borrowed { local, .. }
                 | super::rir::RirDynBorrowSource::Reborrowed { local, .. },
                 None,
-            ) = (&borrow.source, borrow.air_weakening)
+            ) = (&borrow.source, borrow.weakening)
             else {
                 unreachable!("verified owned dynamic reborrow")
             };
@@ -263,7 +269,7 @@ impl<'a> RustValues<'a> {
                 } else {
                     format!("&{value}")
                 };
-                self.render_materializer_ref(materializer, &source)
+                self.materialize_ref(materializer, &source)
             }
             super::rir::RirOwnedSource::Transfer { .. } => value,
         }
@@ -284,7 +290,10 @@ impl<'a> RustValues<'a> {
         }
         let place_expr = self.place(place);
         if self.places.shared_borrow_root_param(place)
-            && matches!(self.program.types[place.ty.index()], RirType::String)
+            && matches!(
+                self.program.types[self.place_ty(place).index()],
+                RirType::String
+            )
         {
             return target::anv_string_from(&place_expr);
         }
@@ -293,12 +302,12 @@ impl<'a> RustValues<'a> {
         } else {
             format!("&{place_expr}")
         };
-        self.render_value_ref(place.ty, &source)
+        self.value_from_ref(self.place_ty(place), &source)
     }
 
     pub(super) fn operand_ty(&self, operand: &RirOperand) -> RirTypeId {
         match operand {
-            RirOperand::Place(place) => place.ty,
+            RirOperand::Place(place) => self.place_ty(place),
             RirOperand::Const(id) => self.program.consts[id.index()].ty,
         }
     }
@@ -315,25 +324,23 @@ impl<'a> RustValues<'a> {
                 if let Some(value) = self.global_value_operand(place) {
                     return value;
                 }
-                match self.program.types[place.ty.index()] {
-                    RirType::Struct(id)
-                        if self.program.structs[id.index()].copyable
-                            && self.program.structs[id.index()].native_path.is_some() =>
-                    {
-                        self.place(place)
-                    }
-                    RirType::Struct(id) if self.program.structs[id.index()].copyable => {
-                        self.copy_struct_place(place)
-                    }
-                    RirType::Enum(id) if self.program.enums[id.index()].copyable => {
-                        self.copy_enum_place(place)
-                    }
-                    RirType::Tuple(id) if self.program.tuples[id.index()].copyable => {
-                        self.copy_tuple_place(place)
-                    }
-                    RirType::Array { .. } => self.copy_array_place(place),
-                    _ => self.place(place),
+                let Some(id) = self.value_materializer(self.place_ty(place)) else {
+                    return self.place(place);
+                };
+                let materializer = &self.program.materializers[id.index()];
+                if !matches!(
+                    materializer.copy,
+                    Some(
+                        RirCopyEvidence::Struct { .. }
+                            | RirCopyEvidence::Tuple { .. }
+                            | RirCopyEvidence::Array { .. }
+                            | RirCopyEvidence::Enum { .. }
+                    )
+                ) {
+                    return self.place(place);
                 }
+                let source = self.operand_ref(operand);
+                self.materialize_ref(materializer.id, &source)
             }
             RirOperand::Const(id) => self.const_value(&self.program.consts[id.index()]),
         }
@@ -344,7 +351,7 @@ impl<'a> RustValues<'a> {
     }
 
     fn mut_place_value_operand(&self, place: &RirPlace) -> String {
-        self.place_value_from_access(place.ty, &self.place(place))
+        self.place_value_from_access(self.place_ty(place), &self.place(place))
     }
 
     fn global_value_operand(&self, place: &RirPlace) -> Option<String> {
@@ -357,10 +364,10 @@ impl<'a> RustValues<'a> {
         let root_ty = self.program.globals[global.index()].ty;
         let guard = "__anv_global";
         let root = format!("(&*{guard})");
-        let expr = self
-            .places
-            .projected_expr(root_ty, &root, place.ty, &place.projections)?;
-        let value = self.value_from_place(place.ty, &expr);
+        let expr =
+            self.places
+                .projected_expr(root_ty, &root, self.place_ty(place), &place.projections)?;
+        let value = self.value_from_ref(self.place_ty(place), &format!("&{expr}"));
         let read = target::global_read(
             &Self::global_slot_expr(self.program, global),
             &Self::global_init_call(self.program, global),
@@ -375,7 +382,7 @@ impl<'a> RustValues<'a> {
         );
         block_expr(
             [format!("let __global = {read};")],
-            Some(self.render_value_ref(self.program.globals[global.index()].ty, "&*__global")),
+            Some(self.value_from_ref(self.program.globals[global.index()].ty, "&*__global")),
         )
     }
 
@@ -386,13 +393,13 @@ impl<'a> RustValues<'a> {
         if let Some(set) = self.dynamic_local_assign(dst, value) {
             return set;
         }
-        if let Some(access) = self.places.dynamic_place_access(dst) {
+        if let Some(access) = self.places.slice_index_access(dst) {
             return self.assign_slice_index(&access, value);
         }
         let dst_expr = self.places.local_place(dst);
         if self.places.mut_place_root_param(dst) {
-            self.mut_place_set(dst.ty, &dst_expr, value)
-        } else if self.program.collection_replace_ty(dst.ty) {
+            self.mut_place_set(self.place_ty(dst), &dst_expr, value)
+        } else if self.program.collection_replace_ty(self.place_ty(dst)) {
             target::replace_collection(&dst_expr, value)
         } else {
             format!("{dst_expr} = {value}")
@@ -471,7 +478,7 @@ impl<'a> RustValues<'a> {
         let projection = self.places.projected_place(
             local.ty,
             local.symbol.as_str(),
-            place.ty,
+            self.place_ty(place),
             &place.projections,
         )?;
         if !Self::needs_dynamic_set_region(&projection) {
@@ -493,7 +500,7 @@ impl<'a> RustValues<'a> {
             &projection,
             &Self::projection_root_place(&projection),
             "",
-            &self.place_value_from_access(place.ty, "__anv_place"),
+            &self.place_value_from_access(self.place_ty(place), "__anv_place"),
         )
     }
 
@@ -551,7 +558,7 @@ impl<'a> RustValues<'a> {
         root_ty: RirTypeId,
         root: &str,
         slot_ty: RirTypeId,
-        projections: &[RirProjection],
+        projections: &[RirPlaceStep],
     ) -> ProjectedPlaceDescriptor {
         let projection = self
             .places
@@ -619,15 +626,10 @@ impl<'a> RustValues<'a> {
         );
         let root_ty = self.policy.rust_ty(carrier.storage_ty);
         let target_ty = self.policy.rust_ty(target);
-        let rt_ty = target::runtime_ctx_ty_with_lifetimes("'cx", "'_");
-        let result = target::result_ty("()");
         ProjectedPlaceDescriptor {
             struct_decl: format!("struct {ops};"),
             ctor: ops.to_string(),
-            impl_decl: format!(
-                "unsafe impl<'cx> {} for {ops} {{ fn access(&self, _rt: &mut {rt_ty}, root: &{root_ty}, f: &mut dyn FnMut(&{target_ty}) -> {result}) -> {result} {{ {access} }} fn mutate(&self, _rt: &mut {rt_ty}, root: &mut {root_ty}, f: &mut dyn FnMut(&mut {target_ty}) -> {result}) -> {result} {{ {mutate} }} }}",
-                target::projection_ops_ty(&root_ty, &target_ty),
-            ),
+            impl_decl: target::projection_ops_impl(ops, &root_ty, &target_ty, &access, &mutate),
         }
     }
 
@@ -667,26 +669,7 @@ impl<'a> RustValues<'a> {
     ) -> String {
         let access = Self::projected_access("root", true, steps);
         let mutate = self.projected_mutate("root", true, steps);
-        let rt_ty = target::runtime_ctx_ty_with_lifetimes("'cx", "'_");
-        let rt = if steps.iter().any(|step| {
-            matches!(
-                step,
-                MutPlaceProjectionStep::ListIndex { .. }
-                    | MutPlaceProjectionStep::SliceIndex { .. }
-            )
-        }) {
-            "rt"
-        } else {
-            "_rt"
-        };
-        format!(
-            "unsafe impl<'cx> {} for {ops} {{ fn access(&self, {rt}: &mut {rt_ty}, root: &{root_ty}, f: &mut dyn FnMut(&{slot_ty}) -> {}) -> {} {{ {access} }} fn mutate(&self, {rt}: &mut {rt_ty}, root: &mut {root_ty}, f: &mut dyn FnMut(&mut {slot_ty}) -> {}) -> {} {{ {mutate} }} }}",
-            target::projection_ops_ty(root_ty, slot_ty),
-            target::result_ty("()"),
-            target::result_ty("()"),
-            target::result_ty("()"),
-            target::result_ty("()"),
-        )
+        target::projection_ops_impl(ops, root_ty, slot_ty, &access, &mutate)
     }
 
     fn projected_access(expr: &str, by_ref: bool, steps: &[MutPlaceProjectionStep]) -> String {
@@ -719,7 +702,7 @@ impl<'a> RustValues<'a> {
                 let body = Self::projected_access("value", true, rest);
                 let access = target::list_with_elem_shared_short(
                     expr,
-                    "rt",
+                    target::runtime_param_name(),
                     "index",
                     &format!("self.{version}"),
                     &body,
@@ -728,7 +711,12 @@ impl<'a> RustValues<'a> {
             }
             MutPlaceProjectionStep::SliceIndex { index, .. } => {
                 let body = Self::projected_access("value", true, rest);
-                target::slice_with_elem_shared_leaf(expr, "rt", &format!("self.{index}"), &body)
+                target::slice_with_elem_shared_leaf(
+                    expr,
+                    target::runtime_param_name(),
+                    &format!("self.{index}"),
+                    &body,
+                )
             }
         }
     }
@@ -828,7 +816,7 @@ impl<'a> RustValues<'a> {
                     let body = self.projected_mutate("value", true, rest);
                     let access = target::list_with_elem_mut_leaf(
                         expr,
-                        "rt",
+                        target::runtime_param_name(),
                         "index",
                         &format!("self.{version}"),
                         &materialize,
@@ -839,14 +827,14 @@ impl<'a> RustValues<'a> {
                 let (read_body, body, write_body) = self.nested_projection_mutation(rest);
                 let read = target::list_with_elem_shared_short(
                     expr,
-                    "rt",
+                    target::runtime_param_name(),
                     "index",
                     &format!("self.{version}"),
                     &read_body,
                 );
                 let write = target::list_with_elem_mut_leaf(
                     expr,
-                    "rt",
+                    target::runtime_param_name(),
                     "index",
                     &format!("self.{version}"),
                     &materialize,
@@ -861,7 +849,7 @@ impl<'a> RustValues<'a> {
                     let body = self.projected_mutate("value", true, rest);
                     return target::slice_with_elem_mut_leaf(
                         expr,
-                        "rt",
+                        target::runtime_param_name(),
                         &format!("self.{index}"),
                         &body,
                     );
@@ -869,13 +857,13 @@ impl<'a> RustValues<'a> {
                 let (read_body, body, write_body) = self.nested_projection_mutation(rest);
                 let read = target::slice_with_elem_shared_leaf(
                     expr,
-                    "rt",
+                    target::runtime_param_name(),
                     &format!("self.{index}"),
                     &read_body,
                 );
                 let write = target::slice_with_elem_mut_leaf(
                     expr,
-                    "rt",
+                    target::runtime_param_name(),
                     &format!("self.{index}"),
                     &write_body,
                 );
@@ -888,26 +876,27 @@ impl<'a> RustValues<'a> {
 
     fn place_value_from_access(&self, ty: RirTypeId, expr: &str) -> String {
         let runtime = target::runtime_param_name();
-        let copy = self.value_materializer(ty).is_some_and(|materializer| {
-            matches!(
-                self.program.materializers[materializer.index()].action,
-                super::rir::RirMaterializerAction::Copy
-            )
-        });
+        let copy = self
+            .value_materializer(ty)
+            .and_then(|id| self.program.materializers.get(id.index()))
+            .is_some_and(RirMaterializer::is_copy);
         if copy {
             target::mut_place_get_copy(expr, runtime)
         } else {
-            let value = self.render_value_ref(ty, "value");
+            let value = self.value_from_ref(ty, "value");
             target::mut_place_access(expr, runtime, &format!("Ok({value})"))
         }
     }
 
     pub(super) fn value_from_ref(&self, ty: RirTypeId, expr: &str) -> String {
-        self.render_value_ref(ty, expr)
+        let materializer = self
+            .value_materializer(ty)
+            .expect("verified value materializer");
+        self.materialize_ref(materializer, expr)
     }
 
     pub(super) fn materialize_ref(&self, materializer: RirMaterializerId, expr: &str) -> String {
-        self.render_materializer_ref(materializer, expr)
+        self.render_transfer(materializer, expr, MaterializerDir::RefToOwned)
     }
 
     fn sequence_materializer_closure(&self, ty: RirTypeId) -> String {
@@ -915,12 +904,8 @@ impl<'a> RustValues<'a> {
             .program
             .sequence_elem_materializer(ty)
             .expect("verified sequence storage declaration");
-        let body = self.render_materializer_ref(materializer, "value");
+        let body = self.materialize_ref(materializer, "value");
         target::materializer_closure("value", &body)
-    }
-
-    pub(super) fn value_from_place(&self, ty: RirTypeId, expr: &str) -> String {
-        self.render_value_ref(ty, &format!("&{expr}"))
     }
 
     fn value_materializer(&self, ty: RirTypeId) -> Option<RirMaterializerId> {
@@ -931,118 +916,236 @@ impl<'a> RustValues<'a> {
             .flatten()
     }
 
-    fn render_value_ref(&self, ty: RirTypeId, expr: &str) -> String {
-        let materializer = self
-            .value_materializer(ty)
-            .expect("verified value materializer");
-        self.render_materializer_ref(materializer, expr)
-    }
-
-    pub(super) fn materializer_body(program: &'a RirProgram, id: RirMaterializerId) -> String {
+    pub(super) fn transfer_body(
+        program: &'a RirProgram,
+        id: RirMaterializerId,
+        dir: MaterializerDir,
+    ) -> String {
         let function = program
             .functions
             .first()
             .expect("materializer helper requires an executable program");
-        Self::new(program, function).render_materializer_body(id, "value")
+        Self::new(program, function).render_transfer_body(id, "value", dir)
     }
 
-    pub(super) fn render_materializer_ref(&self, id: RirMaterializerId, expr: &str) -> String {
+    pub(super) fn staged_commit(&self, id: RirMaterializerId, value: &str) -> String {
+        self.render_transfer(id, value, MaterializerDir::StagedToStored)
+    }
+
+    fn render_transfer(&self, id: RirMaterializerId, expr: &str, dir: MaterializerDir) -> String {
         if self.program.materializers[id.index()]
             .action
             .requires_helper()
         {
-            target::materializer_call(id, expr)
+            match dir {
+                MaterializerDir::RefToOwned => target::materializer_call(id, expr),
+                MaterializerDir::StagedToStored => target::staged_commit_call(id, expr),
+            }
         } else {
-            self.render_materializer_body(id, expr)
+            self.render_transfer_body(id, expr, dir)
         }
     }
 
-    fn render_materializer_body(&self, id: RirMaterializerId, expr: &str) -> String {
+    fn render_transfer_body(
+        &self,
+        id: RirMaterializerId,
+        expr: &str,
+        dir: MaterializerDir,
+    ) -> String {
         let materializer = &self.program.materializers[id.index()];
-        match &materializer.action {
-            super::rir::RirMaterializerAction::Copy => self.copy_from_ref(materializer.ty, expr),
-            super::rir::RirMaterializerAction::ManagedShare
+        match (&materializer.action, dir) {
+            (RirMaterializerAction::Copy, MaterializerDir::RefToOwned) => {
+                self.render_copy(materializer, expr)
+            }
+            (RirMaterializerAction::ManagedShare, MaterializerDir::RefToOwned)
                 if materializer.stages_collection(self.program) =>
             {
                 target::collection_staged_owner(&format!("*({expr})"))
             }
-            super::rir::RirMaterializerAction::ManagedShare => target::managed_share_from_ref(expr),
-            super::rir::RirMaterializerAction::IdentityShare => {
+            (RirMaterializerAction::ManagedShare, MaterializerDir::StagedToStored)
+                if materializer.stages_collection(self.program) =>
+            {
+                target::collection_commit_staged_owner(expr)
+            }
+            (RirMaterializerAction::ManagedShare, MaterializerDir::RefToOwned) => {
+                target::managed_share_from_ref(expr)
+            }
+            (RirMaterializerAction::IdentityShare, MaterializerDir::RefToOwned) => {
                 target::identity_share_from_ref(expr)
             }
-            super::rir::RirMaterializerAction::CallableShare => {
+            (RirMaterializerAction::CallableShare, MaterializerDir::RefToOwned) => {
                 target::callable_share_from_ref(expr)
             }
-            super::rir::RirMaterializerAction::ProviderMaterialize { binding } => {
-                target::provider_materialize(&binding.path, expr)
-            }
-            super::rir::RirMaterializerAction::Struct { fields } => {
-                let RirType::Struct(strukt) = self.program.types[materializer.ty.index()] else {
-                    unreachable!("verified struct materializer")
+            (
+                RirMaterializerAction::ProviderMaterialize { binding },
+                MaterializerDir::RefToOwned,
+            ) => target::provider_materialize(&binding.path, expr),
+            (
+                RirMaterializerAction::Copy
+                | RirMaterializerAction::ManagedShare
+                | RirMaterializerAction::IdentityShare
+                | RirMaterializerAction::CallableShare
+                | RirMaterializerAction::ProviderMaterialize { .. },
+                MaterializerDir::StagedToStored,
+            ) => expr.to_string(),
+            (
+                RirMaterializerAction::Struct { fields } | RirMaterializerAction::Tuple { fields },
+                _,
+            ) => {
+                let (symbol, declarations) = match self.program.types[materializer.ty.index()] {
+                    RirType::Struct(id) => {
+                        let decl = &self.program.structs[id.index()];
+                        (decl.symbol.as_str(), decl.fields.as_slice())
+                    }
+                    RirType::Tuple(id) => {
+                        let decl = &self.program.tuples[id.index()];
+                        (decl.symbol.as_str(), decl.fields.as_slice())
+                    }
+                    _ => unreachable!("verified record materializer"),
                 };
-                let strukt = &self.program.structs[strukt.index()];
-                self.render_record_materializer(
-                    strukt.symbol.as_str(),
-                    &strukt.fields,
-                    fields,
-                    expr,
+                self.render_transfer_record(symbol, declarations, fields, expr, dir)
+            }
+            (RirMaterializerAction::Array { elem }, _) => {
+                let RirType::Array { len, .. } = self.program.types[materializer.ty.index()] else {
+                    unreachable!("verified array transfer")
+                };
+                match dir {
+                    MaterializerDir::RefToOwned => {
+                        let elems = (0..len).map(|index| {
+                            self.render_transfer(
+                                *elem,
+                                &format!("&({expr})[{index}]"),
+                                MaterializerDir::RefToOwned,
+                            )
+                        });
+                        format!("[{}]", comma(elems))
+                    }
+                    MaterializerDir::StagedToStored => {
+                        let names = (0..len)
+                            .map(|index| format!("field_{index}"))
+                            .collect::<Vec<_>>();
+                        let values = names.iter().map(|name| {
+                            self.render_transfer(*elem, name, MaterializerDir::StagedToStored)
+                        });
+                        format!(
+                            "{{ let [{}] = {expr}; [{}] }}",
+                            comma(names.iter().cloned()),
+                            comma(values)
+                        )
+                    }
+                }
+            }
+            (RirMaterializerAction::Enum { variants }, _) => {
+                self.render_transfer_enum(materializer.ty, variants, expr, dir)
+            }
+            (RirMaterializerAction::Optional { payload }, _) => {
+                let source = match dir {
+                    MaterializerDir::RefToOwned => format!("({expr}).as_ref()"),
+                    MaterializerDir::StagedToStored => format!("({expr})"),
+                };
+                format!(
+                    "{source}.map(|value| {})",
+                    self.render_transfer(*payload, "value", dir)
                 )
             }
-            super::rir::RirMaterializerAction::Tuple { fields } => {
-                let RirType::Tuple(tuple) = self.program.types[materializer.ty.index()] else {
-                    unreachable!("verified tuple materializer")
-                };
-                let tuple = &self.program.tuples[tuple.index()];
-                self.render_record_materializer(tuple.symbol.as_str(), &tuple.fields, fields, expr)
-            }
-            super::rir::RirMaterializerAction::Array { elem } => {
-                let RirType::Array { len, .. } = self.program.types[materializer.ty.index()] else {
-                    unreachable!("verified array materializer")
-                };
-                let elems = (0..len).map(|index| {
-                    self.render_materializer_ref(*elem, &format!("&({expr})[{index}]"))
-                });
-                format!("[{}]", comma(elems))
-            }
-            super::rir::RirMaterializerAction::Enum { variants } => {
-                self.render_enum_materializer(materializer.ty, variants, expr)
-            }
-            super::rir::RirMaterializerAction::Optional { payload } => format!(
-                "({expr}).as_ref().map(|value| {})",
-                self.render_materializer_ref(*payload, "value")
-            ),
-            super::rir::RirMaterializerAction::DynamicMaterialize { surface, variants } => {
-                self.render_dynamic_materializer(*surface, variants, expr)
+            (RirMaterializerAction::DynamicMaterialize { carrier, variants }, _) => {
+                self.render_transfer_dynamic(*carrier, variants, expr, dir)
             }
         }
     }
 
-    fn render_record_materializer(
+    fn render_copy(&self, materializer: &RirMaterializer, expr: &str) -> String {
+        match materializer
+            .copy
+            .as_ref()
+            .expect("verified Copy materializer evidence")
+        {
+            RirCopyEvidence::Leaf => format!("(*({expr}))"),
+            RirCopyEvidence::Struct { fields, .. } | RirCopyEvidence::Tuple { fields } => {
+                let (symbol, declarations) = match self.program.types[materializer.ty.index()] {
+                    RirType::Struct(id) => {
+                        let decl = &self.program.structs[id.index()];
+                        (decl.symbol.as_str(), decl.fields.as_slice())
+                    }
+                    RirType::Tuple(id) => {
+                        let decl = &self.program.tuples[id.index()];
+                        (decl.symbol.as_str(), decl.fields.as_slice())
+                    }
+                    _ => unreachable!("verified record Copy evidence"),
+                };
+                self.render_transfer_record(
+                    symbol,
+                    declarations,
+                    fields,
+                    expr,
+                    MaterializerDir::RefToOwned,
+                )
+            }
+            RirCopyEvidence::Array { elem } => {
+                let RirType::Array { len, .. } = self.program.types[materializer.ty.index()] else {
+                    unreachable!("verified array Copy evidence")
+                };
+                let elems = (0..len).map(|index| {
+                    self.render_transfer(
+                        *elem,
+                        &format!("&({expr})[{index}]"),
+                        MaterializerDir::RefToOwned,
+                    )
+                });
+                format!("[{}]", comma(elems))
+            }
+            RirCopyEvidence::Enum { variants } => {
+                if variants.is_empty() {
+                    "unreachable!()".to_string()
+                } else {
+                    self.render_transfer_enum(
+                        materializer.ty,
+                        variants,
+                        expr,
+                        MaterializerDir::RefToOwned,
+                    )
+                }
+            }
+            RirCopyEvidence::Optional { payload } => format!(
+                "({expr}).as_ref().map(|value| {})",
+                self.render_transfer(*payload, "value", MaterializerDir::RefToOwned)
+            ),
+        }
+    }
+
+    fn render_transfer_record(
         &self,
         symbol: &str,
         fields: &[RirField],
         actions: &[RirMaterializerId],
         expr: &str,
+        dir: MaterializerDir,
     ) -> String {
         struct_lit(
             symbol,
             fields.iter().zip(actions).map(|(field, action)| {
+                let source = match dir {
+                    MaterializerDir::RefToOwned => {
+                        format!("&({expr}).{}", field.symbol.as_str())
+                    }
+                    MaterializerDir::StagedToStored => {
+                        format!("({expr}).{}", field.symbol.as_str())
+                    }
+                };
                 field_init(
                     field.symbol.as_str(),
-                    self.render_materializer_ref(
-                        *action,
-                        &format!("&({expr}).{}", field.symbol.as_str()),
-                    ),
+                    self.render_transfer(*action, &source, dir),
                 )
             }),
         )
     }
 
-    fn render_enum_materializer(
+    fn render_transfer_enum(
         &self,
         ty: RirTypeId,
         actions: &[Vec<RirMaterializerId>],
         expr: &str,
+        dir: MaterializerDir,
     ) -> String {
         let RirType::Enum(id) = self.program.types[ty.index()] else {
             unreachable!("verified enum materializer")
@@ -1056,186 +1159,10 @@ impl<'a> RustValues<'a> {
                     let names = (0..variant.fields.len())
                         .map(|index| format!("field_{index}"))
                         .collect::<Vec<_>>();
-                    let pattern = tuple_variant(&path, names.iter().cloned());
                     let fields = names
                         .iter()
                         .zip(actions)
-                        .map(|(name, action)| self.render_materializer_ref(*action, name));
-                    format!("{pattern} => {}", tuple_variant(&path, fields))
-                }
-                RirVariantKind::Struct => {
-                    let names = variant
-                        .fields
-                        .iter()
-                        .map(|field| field.symbol.as_str().to_string())
-                        .collect::<Vec<_>>();
-                    let pattern = struct_variant(&path, names.iter().cloned());
-                    let fields = names.iter().zip(actions).map(|(name, action)| {
-                        field_init(name, self.render_materializer_ref(*action, name))
-                    });
-                    format!("{pattern} => {}", struct_variant(&path, fields))
-                }
-            }
-        });
-        match_expr(expr, arms)
-    }
-
-    fn render_dynamic_materializer(
-        &self,
-        surface: anvyx_frontend::air::ContractSurfaceId,
-        actions: &[super::rir::RirDynamicMaterializerVariant],
-        expr: &str,
-    ) -> String {
-        let carrier = self
-            .program
-            .dyn_carriers
-            .iter()
-            .find(|carrier| carrier.air_surface == surface)
-            .expect("verified dynamic carrier materializer");
-        let RirType::Enum(enm) = self.program.types[carrier.storage_ty.index()] else {
-            unreachable!("verified dynamic carrier materializer")
-        };
-        let decl = &self.program.enums[enm.index()];
-        let arms = carrier.variants.iter().map(|variant| {
-            let declaration = &decl.variants[variant.id.index()];
-            let path = variant_path(decl.symbol.as_str(), declaration.symbol.as_str());
-            let action = actions
-                .iter()
-                .find(|action| action.witness == variant.air_witness)
-                .expect("verified dynamic materializer variant");
-            let payload_ref = if variant.storage == RirDynStorage::Boxed {
-                "payload.as_ref()"
-            } else {
-                "payload"
-            };
-            let payload = self.render_materializer_ref(action.payload, payload_ref);
-            let payload = if variant.storage == RirDynStorage::Boxed {
-                format!("Box::new({payload})")
-            } else {
-                payload
-            };
-            format!("{path}(payload) => {}", tuple_variant(&path, [payload]))
-        });
-        match_expr(expr, arms)
-    }
-
-    pub(super) fn staged_commit_body(program: &'a RirProgram, id: RirMaterializerId) -> String {
-        let function = program
-            .functions
-            .first()
-            .expect("staged commit helper requires an executable program");
-        Self::new(program, function).render_staged_commit(id, "value")
-    }
-
-    pub(super) fn staged_commit(&self, id: RirMaterializerId, value: &str) -> String {
-        if self.program.materializers[id.index()]
-            .action
-            .requires_helper()
-        {
-            target::staged_commit_call(id, value)
-        } else {
-            self.render_staged_commit(id, value)
-        }
-    }
-
-    fn render_staged_commit(&self, id: RirMaterializerId, value: &str) -> String {
-        let materializer = &self.program.materializers[id.index()];
-        match &materializer.action {
-            super::rir::RirMaterializerAction::ManagedShare
-                if materializer.stages_collection(self.program) =>
-            {
-                target::collection_commit_staged_owner(value)
-            }
-            super::rir::RirMaterializerAction::Copy
-            | super::rir::RirMaterializerAction::ManagedShare
-            | super::rir::RirMaterializerAction::IdentityShare
-            | super::rir::RirMaterializerAction::CallableShare
-            | super::rir::RirMaterializerAction::ProviderMaterialize { .. } => value.to_string(),
-            super::rir::RirMaterializerAction::Struct { fields } => {
-                let RirType::Struct(strukt) = self.program.types[materializer.ty.index()] else {
-                    unreachable!("verified struct staged commit")
-                };
-                let strukt = &self.program.structs[strukt.index()];
-                struct_lit(
-                    strukt.symbol.as_str(),
-                    strukt.fields.iter().zip(fields).map(|(field, action)| {
-                        field_init(
-                            field.symbol.as_str(),
-                            self.staged_commit(
-                                *action,
-                                &format!("({value}).{}", field.symbol.as_str()),
-                            ),
-                        )
-                    }),
-                )
-            }
-            super::rir::RirMaterializerAction::Tuple { fields } => {
-                let RirType::Tuple(tuple) = self.program.types[materializer.ty.index()] else {
-                    unreachable!("verified tuple staged commit")
-                };
-                let tuple = &self.program.tuples[tuple.index()];
-                struct_lit(
-                    tuple.symbol.as_str(),
-                    tuple.fields.iter().zip(fields).map(|(field, action)| {
-                        field_init(
-                            field.symbol.as_str(),
-                            self.staged_commit(
-                                *action,
-                                &format!("({value}).{}", field.symbol.as_str()),
-                            ),
-                        )
-                    }),
-                )
-            }
-            super::rir::RirMaterializerAction::Array { elem } => {
-                let RirType::Array { len, .. } = self.program.types[materializer.ty.index()] else {
-                    unreachable!("verified array staged commit")
-                };
-                let names = (0..len)
-                    .map(|index| format!("field_{index}"))
-                    .collect::<Vec<_>>();
-                let values = names.iter().map(|name| self.staged_commit(*elem, name));
-                format!(
-                    "{{ let [{}] = {value}; [{}] }}",
-                    comma(names.iter().cloned()),
-                    comma(values)
-                )
-            }
-            super::rir::RirMaterializerAction::Enum { variants } => {
-                self.render_staged_enum_commit(materializer.ty, variants, value)
-            }
-            super::rir::RirMaterializerAction::Optional { payload } => format!(
-                "({value}).map(|value| {})",
-                self.staged_commit(*payload, "value")
-            ),
-            super::rir::RirMaterializerAction::DynamicMaterialize { surface, variants } => {
-                self.render_staged_dynamic_commit(*surface, variants, value)
-            }
-        }
-    }
-
-    fn render_staged_enum_commit(
-        &self,
-        ty: RirTypeId,
-        actions: &[Vec<RirMaterializerId>],
-        value: &str,
-    ) -> String {
-        let RirType::Enum(id) = self.program.types[ty.index()] else {
-            unreachable!("verified enum staged commit")
-        };
-        let decl = &self.program.enums[id.index()];
-        let arms = decl.variants.iter().zip(actions).map(|(variant, actions)| {
-            let path = variant_path(decl.symbol.as_str(), variant.symbol.as_str());
-            match variant.kind {
-                RirVariantKind::Unit => format!("{path} => {path}"),
-                RirVariantKind::Tuple => {
-                    let names = (0..variant.fields.len())
-                        .map(|index| format!("field_{index}"))
-                        .collect::<Vec<_>>();
-                    let fields = names
-                        .iter()
-                        .zip(actions)
-                        .map(|(name, action)| self.staged_commit(*action, name));
+                        .map(|(name, action)| self.render_transfer(*action, name, dir));
                     format!(
                         "{} => {}",
                         tuple_variant(&path, names.iter().cloned()),
@@ -1248,10 +1175,9 @@ impl<'a> RustValues<'a> {
                         .iter()
                         .map(|field| field.symbol.as_str().to_string())
                         .collect::<Vec<_>>();
-                    let fields = names
-                        .iter()
-                        .zip(actions)
-                        .map(|(name, action)| field_init(name, self.staged_commit(*action, name)));
+                    let fields = names.iter().zip(actions).map(|(name, action)| {
+                        field_init(name, self.render_transfer(*action, name, dir))
+                    });
                     format!(
                         "{} => {}",
                         struct_variant(&path, names.iter().cloned()),
@@ -1260,37 +1186,31 @@ impl<'a> RustValues<'a> {
                 }
             }
         });
-        match_expr(value, arms)
+        match_expr(expr, arms)
     }
 
-    fn render_staged_dynamic_commit(
+    fn render_transfer_dynamic(
         &self,
-        surface: anvyx_frontend::air::ContractSurfaceId,
-        actions: &[super::rir::RirDynamicMaterializerVariant],
-        value: &str,
+        carrier: RirDynCarrierId,
+        actions: &[RirMaterializerId],
+        expr: &str,
+        dir: MaterializerDir,
     ) -> String {
-        let carrier = self
-            .program
-            .dyn_carriers
-            .iter()
-            .find(|carrier| carrier.air_surface == surface)
-            .expect("verified dynamic staged commit");
+        let carrier = &self.program.dyn_carriers[carrier.index()];
         let RirType::Enum(enm) = self.program.types[carrier.storage_ty.index()] else {
-            unreachable!("verified dynamic staged commit")
+            unreachable!("verified dynamic materializer")
         };
         let decl = &self.program.enums[enm.index()];
         let arms = carrier.variants.iter().map(|variant| {
             let declaration = &decl.variants[variant.id.index()];
             let path = variant_path(decl.symbol.as_str(), declaration.symbol.as_str());
-            let action = actions
-                .iter()
-                .find(|action| action.witness == variant.air_witness)
-                .expect("verified dynamic staged commit variant");
-            let payload = if variant.storage == RirDynStorage::Boxed {
-                self.staged_commit(action.payload, "*payload")
-            } else {
-                self.staged_commit(action.payload, "payload")
+            let action = actions[variant.id.index()];
+            let source = match (dir, variant.storage) {
+                (MaterializerDir::RefToOwned, RirDynStorage::Boxed) => "payload.as_ref()",
+                (MaterializerDir::StagedToStored, RirDynStorage::Boxed) => "*payload",
+                (_, RirDynStorage::Inline) => "payload",
             };
+            let payload = self.render_transfer(action, source, dir);
             let payload = if variant.storage == RirDynStorage::Boxed {
                 format!("Box::new({payload})")
             } else {
@@ -1298,27 +1218,27 @@ impl<'a> RustValues<'a> {
             };
             format!("{path}(payload) => {}", tuple_variant(&path, [payload]))
         });
-        match_expr(value, arms)
+        match_expr(expr, arms)
     }
 
-    pub(super) fn stringify_arg(&self, mode: RirParamSemantic, value: &RirOperand) -> String {
+    pub(super) fn stringify_arg(&self, mode: RirPassMode, value: &RirOperand) -> String {
         match mode {
-            RirParamSemantic::Value => self.operand(value),
-            RirParamSemantic::SharedBorrow => {
+            RirPassMode::Value => self.operand(value),
+            RirPassMode::SharedBorrow => {
                 let RirOperand::Place(place) = value else {
                     unreachable!("verified stringify override place")
                 };
                 self.borrow_arg(place)
             }
-            RirParamSemantic::MutBorrow
-            | RirParamSemantic::MutPlace
-            | RirParamSemantic::DynBorrow
-            | RirParamSemantic::ScopedLambda
-            | RirParamSemantic::EscapingLambda
-            | RirParamSemantic::AnvCallback
-            | RirParamSemantic::StackCell
-            | RirParamSemantic::HeapCell
-            | RirParamSemantic::ScopedPlaceCell => unreachable!("verified stringify override mode"),
+            RirPassMode::MutBorrow
+            | RirPassMode::MutPlace
+            | RirPassMode::DynBorrow
+            | RirPassMode::ScopedLambda
+            | RirPassMode::EscapingLambda
+            | RirPassMode::AnvCallback
+            | RirPassMode::StackCell
+            | RirPassMode::HeapCell
+            | RirPassMode::ScopedPlaceCell => unreachable!("verified stringify override mode"),
         }
     }
 
@@ -1364,156 +1284,5 @@ impl<'a> RustValues<'a> {
                 format!("None::<{}>", self.policy.rust_ty(inner))
             }
         }
-    }
-
-    fn copy_struct_place(&self, place: &RirPlace) -> String {
-        let RirType::Struct(struct_id) = self.program.types[place.ty.index()] else {
-            unreachable!("verified struct copy place")
-        };
-        let strukt = &self.program.structs[struct_id.index()];
-        self.copy_record_place(place, strukt.symbol.as_str(), &strukt.fields)
-    }
-
-    fn copy_tuple_place(&self, place: &RirPlace) -> String {
-        let RirType::Tuple(tuple_id) = self.program.types[place.ty.index()] else {
-            unreachable!("verified tuple copy place")
-        };
-        let tuple = &self.program.tuples[tuple_id.index()];
-        self.copy_record_place(place, tuple.symbol.as_str(), &tuple.fields)
-    }
-
-    fn copy_record_place(&self, place: &RirPlace, symbol: &str, fields: &[RirField]) -> String {
-        let fields = fields.iter().map(|field| {
-            let field_place = self.places.record_field_place(place, field);
-            field_init(
-                field.symbol.as_str(),
-                self.operand(&RirOperand::Place(field_place)),
-            )
-        });
-        struct_lit(symbol, fields)
-    }
-
-    fn copy_array_place(&self, place: &RirPlace) -> String {
-        let RirType::Array { elem, len } = self.program.types[place.ty.index()] else {
-            unreachable!("verified array copy place")
-        };
-        let source = self.place(place);
-        let elems =
-            comma((0..len).map(|index| self.copy_from_ref(elem, &format!("&{source}[{index}]"))));
-        format!("[{elems}]")
-    }
-
-    fn copy_enum_place(&self, place: &RirPlace) -> String {
-        let source = self.place(place);
-        self.copy_enum_expr(&source, place.ty)
-    }
-
-    fn copy_enum_expr(&self, source: &str, ty: RirTypeId) -> String {
-        self.copy_enum_ref_expr(&format!("&{source}"), ty)
-    }
-
-    fn copy_enum_ref_expr(&self, source: &str, ty: RirTypeId) -> String {
-        let RirType::Enum(enum_id) = self.program.types[ty.index()] else {
-            unreachable!("verified enum copy expression")
-        };
-        let enm = &self.program.enums[enum_id.index()];
-        if enm.variants.is_empty() {
-            return "unreachable!()".to_string();
-        }
-        let arms = enm
-            .variants
-            .iter()
-            .map(|variant| self.copy_enum_variant_arm(enm, variant));
-        match_expr(source, arms)
-    }
-
-    fn copy_enum_variant_arm(&self, enm: &RirEnum, variant: &RirVariant) -> String {
-        let path = variant_path(enm.symbol.as_str(), variant.symbol.as_str());
-        match variant.kind {
-            RirVariantKind::Unit => format!("{path} => {path}"),
-            RirVariantKind::Tuple => {
-                let vars = (0..variant.fields.len())
-                    .map(|index| format!("f{index}"))
-                    .collect::<Vec<_>>();
-                let values = variant
-                    .fields
-                    .iter()
-                    .zip(&vars)
-                    .map(|(field, var)| self.value_from_ref(field.ty, var));
-                format!(
-                    "{} => {}",
-                    tuple_variant(&path, vars.iter().cloned()),
-                    tuple_variant(&path, values)
-                )
-            }
-            RirVariantKind::Struct => {
-                let vars = variant
-                    .fields
-                    .iter()
-                    .map(|field| field.symbol.as_str().to_string())
-                    .collect::<Vec<_>>();
-                let values = variant.fields.iter().zip(&vars).map(|(field, var)| {
-                    field_init(field.symbol.as_str(), self.value_from_ref(field.ty, var))
-                });
-                format!(
-                    "{} => {}",
-                    struct_variant(&path, vars.iter().cloned()),
-                    struct_variant(&path, values)
-                )
-            }
-        }
-    }
-
-    fn copy_from_ref(&self, ty: RirTypeId, expr: &str) -> String {
-        match self.program.types[ty.index()] {
-            RirType::Int | RirType::Float | RirType::Bool | RirType::Char | RirType::Flag(_) => {
-                format!("(*({expr}))")
-            }
-            RirType::Lambda(sig) if self.policy.lambda_sig_copyable(sig) => format!("(*({expr}))"),
-            RirType::Lambda(_) => unreachable!("verified copyable lambda value"),
-            RirType::Struct(id) => {
-                let strukt = &self.program.structs[id.index()];
-                if strukt.native_path.is_some() {
-                    format!("(*({expr}))")
-                } else {
-                    self.copy_record_from_ref(strukt.symbol.as_str(), &strukt.fields, expr)
-                }
-            }
-            RirType::Array { elem, len } => {
-                let elems = comma(
-                    (0..len).map(|index| self.value_from_ref(elem, &format!("&({expr})[{index}]"))),
-                );
-                format!("[{elems}]")
-            }
-            RirType::Tuple(id) => {
-                let tuple = &self.program.tuples[id.index()];
-                self.copy_record_from_ref(tuple.symbol.as_str(), &tuple.fields, expr)
-            }
-            RirType::Enum(id) if self.program.enums[id.index()].variants.is_empty() => {
-                "unreachable!()".to_string()
-            }
-            RirType::Enum(_) => self.copy_enum_ref_expr(expr, ty),
-            RirType::Option(inner) => format!(
-                "({expr}).as_ref().map(|value| {})",
-                self.value_from_ref(inner, "value")
-            ),
-            RirType::DataRef(_)
-            | RirType::String
-            | RirType::List(_)
-            | RirType::Map { .. }
-            | RirType::Slice(_)
-            | RirType::Void => unreachable!("verified copyable value"),
-        }
-    }
-
-    fn copy_record_from_ref(&self, symbol: &str, fields: &[RirField], expr: &str) -> String {
-        let fields = fields.iter().map(|field| {
-            let field_expr = format!("&({expr}).{}", field.symbol.as_str());
-            field_init(
-                field.symbol.as_str(),
-                self.value_from_ref(field.ty, &field_expr),
-            )
-        });
-        struct_lit(symbol, fields)
     }
 }

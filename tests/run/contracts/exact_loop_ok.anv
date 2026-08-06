@@ -1,0 +1,22 @@
+// @mode: run
+// @expect: success
+// @match: 7
+
+contract Scored {
+    fn score(self) -> int;
+}
+
+struct Sprite {
+    fn score(self) -> int {
+        7
+    }
+}
+
+fn main() {
+    let actor: dyn Scored = Sprite {};
+    var i = 0;
+    while i < 1 {
+        println(actor.score());
+        i += 1;
+    }
+}

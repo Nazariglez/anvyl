@@ -1,0 +1,80 @@
+// @mode: run
+// @expect: success
+// @match: ok
+
+contract Marker {
+    fn mark(self) -> int;
+}
+
+struct Large {
+    first: string,
+    second: string,
+    third: string,
+    fourth: string,
+
+    fn mark(self) -> int { 5 }
+}
+
+struct Leaf {
+    xs: [int],
+}
+
+enum Choice {
+    Value(Leaf),
+    None,
+}
+
+struct Payload {
+    pair: (Leaf, Leaf),
+    array: [Leaf; 1],
+    optional: Option<Leaf>,
+    choice: Choice,
+    slots: [string: Leaf],
+    dynamic: dyn Marker,
+}
+
+dataref Box {
+    payload: Payload,
+}
+
+fn mutate(ref payload: Payload) {
+    payload.pair = (Leaf { xs: [1, 9] }, payload.pair.1);
+}
+
+fn main() {
+    var box = Box {
+        payload: Payload {
+            pair: (Leaf { xs: [1] }, Leaf { xs: [2] }),
+            array: [Leaf { xs: [3] }],
+            optional: Option.Some(Leaf { xs: [4] }),
+            choice: Choice.Value(Leaf { xs: [5] }),
+            slots: ["x": Leaf { xs: [6] }],
+            dynamic: Large {
+                first: "a",
+                second: "b",
+                third: "c",
+                fourth: "d",
+            },
+        },
+    };
+    let alias = box.payload.pair.1.xs;
+    let dynamic = box.payload.dynamic;
+    mutate(box.payload);
+    assert(box.payload.pair.0.xs[1] == 9);
+    assert(box.payload.array[0].xs[0] == 3);
+    if let slot? = box.payload.slots["x"] {
+        assert(slot.xs[0] == 6);
+    };
+    assert(alias[0] == 2);
+    assert(dynamic.mark() == 5);
+    assert(box.payload.dynamic.mark() == 5);
+    match box.payload.optional {
+        Option.Some(leaf) => assert(leaf.xs[0] == 4),
+        Option.None => assert(false),
+    };
+    match box.payload.choice {
+        Choice.Value(leaf) => assert(leaf.xs[0] == 5),
+        Choice.None => assert(false),
+    };
+    println("ok");
+}
