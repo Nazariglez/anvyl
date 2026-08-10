@@ -1,14 +1,14 @@
 use serde::Serialize;
 
 #[derive(Serialize)]
-struct Output {
-    descriptors: Vec<anvyx_runtime::ProviderDescriptor>,
-    supports: Vec<anvyx_runtime::RustModuleSupport>,
+struct ProviderProbeEnvelope {
+    schema: u32,
+    package: anvyx_runtime::RawProviderPackage,
 }
 
 fn main() {
-    println!("{}", serde_json::to_string(&Output {
-        descriptors: {{provider_crate}}::provider_descriptors(),
-        supports: {{provider_crate}}::rust_module_supports(),
+    println!("{}", serde_json::to_string(&ProviderProbeEnvelope {
+        schema: 4,
+        package: {{provider_crate}}::rust_providers(),
     }).unwrap());
 }

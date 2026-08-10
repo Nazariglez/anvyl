@@ -11,7 +11,6 @@ anvyx-semantics = { path = "../semantics" }
 ecow = "0.2.6"
 indexmap = "2"
 inventory = "0.3"
-serde = { version = "1", features = ["derive"] }
 
 [dev-dependencies]
 trybuild = "1"

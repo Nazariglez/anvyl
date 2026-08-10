@@ -28,10 +28,17 @@ fn provider_probe_project(root: &Path) {
         "host/anvyx.toml",
         "[project]\nname = \"host\"\n",
     );
+    let runtime = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../runtime")
+        .canonicalize()
+        .unwrap();
     write(
         root.parent().unwrap(),
         "host/Cargo.toml",
-        "[package]\nname = \"host\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+        &format!(
+            "[package]\nname = \"host\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[dependencies]\nanvyx-runtime = {{ path = '{}' }}\n",
+            runtime.display()
+        ),
     );
     write(root.parent().unwrap(), "host/src/lib.rs", "");
 }
@@ -137,6 +144,128 @@ fn provider_probe_timeout_is_validated_through_the_cli() {
         "{stderr}"
     );
     assert!(stderr.contains("native provider package"), "{stderr}");
+}
+
+#[cfg(unix)]
+#[test]
+fn provider_probe_rejects_stale_schema() {
+    const MARKER: &str = "probe-replacement-schema-5";
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("game");
+    let cache = temp.path().join("cache");
+    let host = root.parent().unwrap().join("host");
+    provider_probe_project(&root);
+    write(
+        &host,
+        "src/lib.rs",
+        "use anvyx_runtime::function;\n\n#[function]\npub fn ping() {}\n\nanvyx_runtime::builtin_module! { name: \"host\", exports: [ping] }\n",
+    );
+
+    let first = anvyx()
+        .current_dir(&root)
+        .env("ANVYX_CACHE_DIR", &cache)
+        .args(["check", "src/main.anv"])
+        .output()
+        .unwrap();
+    assert!(first.status.success(), "{}", output_text(&first));
+
+    let probes = fs::read_dir(cache.join("crates"))
+        .unwrap()
+        .map(Result::unwrap)
+        .map(|entry| entry.path())
+        .filter(|path| path.join("src/main.rs").is_file())
+        .collect::<Vec<_>>();
+    let [probe] = probes.as_slice() else {
+        panic!("expected one cached provider probe, found {probes:?}");
+    };
+    let manifest = probe.join("Cargo.toml");
+    let source = probe.join("src/main.rs");
+    let manifest_text = fs::read_to_string(&manifest).unwrap();
+    let binary_name = manifest_text
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("name = \"")?.strip_suffix('\"'))
+        .expect("probe manifest package name");
+    use std::os::unix::fs::PermissionsExt;
+    let candidates = fs::read_dir(cache.join("target/debug/deps"))
+        .unwrap()
+        .map(Result::unwrap)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with(&format!("{binary_name}-")))
+                && path.is_file()
+                && fs::metadata(path)
+                    .is_ok_and(|metadata| metadata.permissions().mode() & 0o111 != 0)
+        })
+        .collect::<Vec<_>>();
+    let [binary] = candidates.as_slice() else {
+        panic!("expected one cached provider probe binary, found {candidates:?}");
+    };
+
+    let original_modified = fs::metadata(binary).unwrap().modified().unwrap();
+    let replacement_source = temp.path().join("replacement.rs");
+    write(
+        temp.path(),
+        "replacement.rs",
+        &format!(
+            r##"fn main() {{ print!("{{}}", r#"{{"schema":5,"package":{{"exports":[]}},"marker":"{MARKER}"}}"#); }}"##
+        ),
+    );
+    let replacement_binary = temp.path().join("replacement-probe");
+    let replacement = Command::new("rustc")
+        .args([
+            replacement_source.as_os_str(),
+            std::ffi::OsStr::new("-o"),
+            replacement_binary.as_os_str(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        replacement.status.success(),
+        "{}",
+        output_text(&replacement)
+    );
+    fs::copy(&replacement_binary, binary).unwrap();
+    fs::OpenOptions::new()
+        .write(true)
+        .open(binary)
+        .unwrap()
+        .set_times(fs::FileTimes::new().set_modified(original_modified))
+        .unwrap();
+    let probe_output = Command::new(binary).output().unwrap();
+    assert!(
+        probe_output.status.success(),
+        "{}",
+        output_text(&probe_output)
+    );
+    assert!(
+        String::from_utf8_lossy(&probe_output.stdout).contains(MARKER),
+        "replacement probe marker missing"
+    );
+
+    let source_before = fs::read(&source).unwrap();
+    let manifest_before = fs::read(&manifest).unwrap();
+    let binary_before = fs::read(binary).unwrap();
+    let output = anvyx()
+        .current_dir(&root)
+        .env("ANVYX_CACHE_DIR", &cache)
+        .args(["check", "src/main.anv"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success(), "{}", output_text(&output));
+    assert_eq!(fs::read(&source).unwrap(), source_before);
+    assert_eq!(fs::read(&manifest).unwrap(), manifest_before);
+    assert_eq!(fs::read(binary).unwrap(), binary_before);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("unsupported schema 5; expected 4"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("native provider package") && stderr.contains("host"),
+        "{stderr}"
+    );
 }
 
 #[test]

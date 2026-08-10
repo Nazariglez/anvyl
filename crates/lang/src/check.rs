@@ -5,7 +5,6 @@ use std::{
 };
 
 use anvyx_frontend::{
-    externs::{ExternInputs, PackageExternInputs},
     pipeline::{
         self, FrontendConfig, PackageModuleInput, PackageProgramInput, PackageSourceInput,
         Source as FrontendSource,
@@ -54,18 +53,6 @@ impl CheckFileInput {
         self.source_overrides = source_overrides;
         self
     }
-
-    pub fn file(&self) -> &Path {
-        &self.file
-    }
-
-    pub fn sources(&self) -> &SourceBundle {
-        &self.sources
-    }
-
-    pub fn source_overrides(&self) -> &[SourceOverride] {
-        &self.source_overrides
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -74,7 +61,6 @@ pub struct CheckPackageInput {
     root_file: PathBuf,
     packages: Vec<PackageSource>,
     sources: SourceBundle,
-    externs: Vec<PackageExternInputs>,
     source_overrides: Vec<SourceOverride>,
     config: FrontendConfig,
 }
@@ -110,7 +96,6 @@ impl CheckPackageInput {
             root_file,
             packages,
             sources,
-            externs: vec![],
             source_overrides: vec![],
             config: FrontendConfig::default(),
         })
@@ -127,58 +112,37 @@ impl CheckPackageInput {
         self.source_overrides = source_overrides;
         self
     }
-
-    #[must_use]
-    pub fn with_package_externs(
-        mut self,
-        externs: Vec<(PackageId, Vec<anvyx_externs::ProviderDescriptor>)>,
-    ) -> Self {
-        self.externs = externs
-            .into_iter()
-            .map(|(package, providers)| PackageExternInputs { package, providers })
-            .collect();
-        self
-    }
-
-    pub fn root_package(&self) -> &PackageId {
-        &self.root_package
-    }
-
-    pub fn root_file(&self) -> &Path {
-        &self.root_file
-    }
-
-    pub fn packages(&self) -> &[PackageSource] {
-        &self.packages
-    }
-
-    pub fn sources(&self) -> &SourceBundle {
-        &self.sources
-    }
-
-    pub fn source_overrides(&self) -> &[SourceOverride] {
-        &self.source_overrides
-    }
 }
 
 pub fn build_air_file(
     input: CheckFileInput,
+    catalog: &anvyx_externs::ProviderCatalog,
 ) -> Result<pipeline::AirBuildOutput, pipeline::AirBuildError<CheckError>> {
-    build_air_prepared(prepare_file(input).map_err(pipeline::AirBuildError::Fatal)?)
+    build_air_prepared(
+        prepare_file(input).map_err(pipeline::AirBuildError::Fatal)?,
+        catalog,
+    )
 }
 
-pub fn check_file(input: CheckFileInput) -> CheckResult {
-    check_prepared(prepare_file(input)?)
+pub fn check_file(input: CheckFileInput, catalog: &anvyx_externs::ProviderCatalog) -> CheckResult {
+    check_prepared(prepare_file(input)?, catalog)
 }
 
 pub fn build_air_package(
     input: CheckPackageInput,
+    catalog: &anvyx_externs::ProviderCatalog,
 ) -> Result<pipeline::AirBuildOutput, pipeline::AirBuildError<CheckError>> {
-    build_air_prepared(prepare_package(input).map_err(pipeline::AirBuildError::Fatal)?)
+    build_air_prepared(
+        prepare_package(input).map_err(pipeline::AirBuildError::Fatal)?,
+        catalog,
+    )
 }
 
-pub fn check_package(input: CheckPackageInput) -> CheckResult {
-    check_prepared(prepare_package(input)?)
+pub fn check_package(
+    input: CheckPackageInput,
+    catalog: &anvyx_externs::ProviderCatalog,
+) -> CheckResult {
+    check_prepared(prepare_package(input)?, catalog)
 }
 
 fn prepare_file(input: CheckFileInput) -> Result<PreparedCheck, CheckError> {
@@ -205,7 +169,6 @@ fn prepare_file(input: CheckFileInput) -> Result<PreparedCheck, CheckError> {
         packages: HashMap::new(),
         cached_sources: vec![main],
         ownership: SourceOwnership::new(&[])?,
-        externs: vec![],
         source_overrides,
         sources,
         config,
@@ -218,7 +181,6 @@ fn prepare_package(input: CheckPackageInput) -> Result<PreparedCheck, CheckError
         root_file,
         packages,
         sources,
-        externs,
         source_overrides,
         config,
     } = input;
@@ -258,7 +220,6 @@ fn prepare_package(input: CheckPackageInput) -> Result<PreparedCheck, CheckError
         packages: package_inputs,
         cached_sources,
         ownership,
-        externs,
         source_overrides,
         sources,
         config,
@@ -271,7 +232,6 @@ struct PreparedCheck {
     packages: HashMap<PackageId, PackageSourceInput>,
     cached_sources: Vec<PackageModuleInput>,
     ownership: SourceOwnership,
-    externs: Vec<PackageExternInputs>,
     source_overrides: Vec<SourceOverride>,
     sources: SourceBundle,
     config: FrontendConfig,
@@ -279,29 +239,32 @@ struct PreparedCheck {
 
 fn build_air_prepared(
     input: PreparedCheck,
+    catalog: &anvyx_externs::ProviderCatalog,
 ) -> Result<pipeline::AirBuildOutput, pipeline::AirBuildError<CheckError>> {
-    run_prepared(input, |input, config| {
-        pipeline::build_air_packages(input, config, &pipeline::AirRootConfig::entry_main())
+    run_prepared(input, catalog, |input, config, catalog| {
+        pipeline::build_air_packages(
+            input,
+            config,
+            catalog,
+            &pipeline::AirRootConfig::entry_main(),
+        )
     })
     .map_err(pipeline::AirBuildError::Fatal)?
 }
 
-fn check_prepared(input: PreparedCheck) -> CheckResult {
-    run_prepared(input, run_check_packages)?
-}
-
-fn run_check_packages(
-    input: PackageProgramInput<'_, PackageSourceEnvironment<'_>>,
-    config: FrontendConfig,
-) -> CheckResult {
-    pipeline::check_packages(input, config)
+fn check_prepared(input: PreparedCheck, catalog: &anvyx_externs::ProviderCatalog) -> CheckResult {
+    run_prepared(input, catalog, |input, config, catalog| {
+        pipeline::check_packages(input, config, catalog)
+    })?
 }
 
 fn run_prepared<T>(
     input: PreparedCheck,
+    catalog: &anvyx_externs::ProviderCatalog,
     run: impl for<'a, 'b> FnOnce(
         PackageProgramInput<'a, PackageSourceEnvironment<'b>>,
         FrontendConfig,
+        &anvyx_externs::ProviderCatalog,
     ) -> T,
 ) -> Result<T, CheckError> {
     let PreparedCheck {
@@ -310,10 +273,9 @@ fn run_prepared<T>(
         mut packages,
         cached_sources,
         ownership,
-        externs,
         source_overrides,
         sources,
-        mut config,
+        config,
     } = input;
     if let Some(core) = system_package_input(PackageId::core(), sources.core()) {
         packages.insert(PackageId::core(), core);
@@ -335,8 +297,7 @@ fn run_prepared<T>(
         preloaded_modules: preloaded_modules(&sources),
         source_loader: &mut source_loader,
     };
-    config.externs = system_externs(&sources, externs);
-    Ok(run(input, config))
+    Ok(run(input, config, catalog))
 }
 
 fn read_main(file: &Path, overrides: &[SourceOverride]) -> Result<String, CheckError> {
@@ -402,26 +363,6 @@ fn read_package_root(
     let code = read_main(entry, source_overrides)?;
     SourceText::new(code, entry.display().to_string())
         .map(|source| source.with_path(path.to_path_buf()))
-}
-
-fn system_externs(sources: &SourceBundle, mut packages: Vec<PackageExternInputs>) -> ExternInputs {
-    if let Some(core) = sources.core()
-        && !core.providers().is_empty()
-    {
-        packages.push(PackageExternInputs {
-            package: PackageId::core(),
-            providers: core.providers().to_vec(),
-        });
-    }
-    if let Some(std) = sources.std()
-        && !std.providers().is_empty()
-    {
-        packages.push(PackageExternInputs {
-            package: PackageId::std(),
-            providers: std.providers().to_vec(),
-        });
-    }
-    ExternInputs { packages }
 }
 
 fn system_package_input(

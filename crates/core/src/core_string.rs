@@ -98,11 +98,10 @@ pub fn str_replace(s: &str, from: &str, to: &str) -> AnvString {
 }
 
 anvyx_runtime::builtin_module! {
-    name: "core_string",
-    source: include_str!("core_string.anv"),
-    exports: [
-        str_len, str_contains, str_starts_with, str_ends_with, str_find, str_to_upper,
-        str_to_lower, str_trim, str_trim_start, str_trim_end, str_substring, str_char_at,
-        str_split, str_replace
-    ],
-}
+name: "core_string",
+root: false,
+exports: [
+    str_len, str_contains, str_starts_with, str_ends_with, str_find, str_to_upper,
+    str_to_lower, str_trim, str_trim_start, str_trim_end, str_substring, str_char_at,
+    str_split, str_replace
+],}

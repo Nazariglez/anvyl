@@ -26,9 +26,7 @@ use crate::{
         MethodReceiver, MethodSig, ModuleOrigin, Mutability, NominalKind, Param, Program,
         ReturnSpec, Stmt, StmtNode, Type, TypeParam, VariantKind, Visibility,
     },
-    externs::{
-        ExternProvenance, RawExternModule, RawExterns, catalog::ExternCatalog, raw_module_scope,
-    },
+    externs::{RawExternModule, RawExterns, catalog::ExternCatalog, raw_module_scope},
     resolve::{ModuleId, ModulePath, PackageId, PackageModulePath, ResolveResult, SourceFileId},
     semantic_id::{ExternalNominalId, NominalId, SourceDeclId},
     source::SourceId,
@@ -2156,6 +2154,7 @@ impl DeclarationIndex {
         root: &Program,
         resolved: &ResolveResult,
         externs: &RawExterns,
+        providers: &anvyx_externs::ProviderCatalog,
     ) -> Self {
         let mut index = Self::default();
         let modules = Self::source_modules(root, resolved);
@@ -2170,6 +2169,7 @@ impl DeclarationIndex {
             );
         }
         index.collect_extern_headers(externs, &source_extern_policies);
+        index.collect_provider_extern_headers(providers);
         index.apply_public_import_reexports(&modules, resolved);
         index.close_exported_active_modules();
         index.build_import_scopes(&modules, resolved);
@@ -3413,14 +3413,50 @@ impl DeclarationIndex {
         externs: &RawExterns,
         source_policies: &SourceExternPolicies,
     ) {
-        for group in &externs.groups {
-            let policies = match &group.provenance {
-                ExternProvenance::Source { .. } => Some(source_policies),
-                ExternProvenance::Provider { .. } => None,
-            };
-            for module in &group.modules {
-                self.collect_extern_module(module, policies);
+        for module in &externs.modules {
+            self.collect_extern_module(module, Some(source_policies));
+        }
+    }
+
+    fn collect_provider_extern_headers(&mut self, providers: &anvyx_externs::ProviderCatalog) {
+        for (package, _, module) in providers.modules() {
+            let scope = crate::externs::provider_module_scope(package, &module.path);
+            let mut decls = self.modules.remove(&scope).unwrap_or_default();
+            for ty in &module.types {
+                let name = Ident::new(&ty.name);
+                let key = self.register_external_nominal(scope.clone(), name);
+                self.insert_local_type(
+                    &mut decls,
+                    &scope,
+                    name,
+                    TypeBinding::Nominal(key.id.clone()),
+                    true,
+                    None,
+                );
+                self.extern_type_policies
+                    .insert(key.id, AccessPolicy::default());
             }
+            for function in &module.functions {
+                let name = Ident::new(&function.name);
+                let value = ResolvedValue {
+                    module: scope.clone(),
+                    name,
+                    decl: ValueDecl::Func(FuncSig {
+                        kind: CallableKind::ExternFunction,
+                        generics: GenericParams::default(),
+                        ty: Type::Func {
+                            params: vec![],
+                            ret: Box::new(ReturnSpec::void()),
+                        },
+                        param_spans: ParamTypeSpans::default(),
+                        default_sites: vec![],
+                        required_params: 0,
+                        policy: AccessPolicy::default(),
+                    }),
+                };
+                self.insert_local_value(&mut decls, &scope, name, value, true, None);
+            }
+            self.modules.insert(scope, decls);
         }
     }
 
@@ -3433,7 +3469,7 @@ impl DeclarationIndex {
         let mut decls = self.modules.remove(&scope).unwrap_or_default();
 
         for ty in &module.types {
-            let name = Ident::new(&ty.name);
+            let name = Ident::new(&ty.decl.name);
             let key = self.register_external_nominal(scope.clone(), name);
             let span = ty.site.span;
             if self.insert_local_type(

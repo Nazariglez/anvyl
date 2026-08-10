@@ -230,7 +230,7 @@ pub(super) fn check_extern_lit(
     }
 
     let extern_type = tc.extern_type(owner);
-    if extern_type.constructor_fields().is_none() {
+    if extern_type.required_init_fields().is_none() {
         tc.push_error(TypeError::InvalidStructLiteral {
             name: key.name,
             kind: "extern".to_string(),

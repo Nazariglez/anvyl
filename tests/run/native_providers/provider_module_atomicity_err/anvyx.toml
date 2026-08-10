@@ -1,0 +1,6 @@
+[project]
+name = "provider_module_atomicity"
+entry = "src/main.anv"
+
+[dependencies]
+host = { path = "provider" }

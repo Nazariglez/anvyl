@@ -33,6 +33,5 @@ impl Thing {
 
 anvyx_runtime::builtin_module! {
     name: "host",
-    source: "",
     exports: [Thing],
 }

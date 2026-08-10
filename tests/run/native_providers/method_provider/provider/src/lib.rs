@@ -141,6 +141,5 @@ pub fn fov_of(camera: Camera) -> f64 {
 
 anvyx_runtime::builtin_module! {
     name: "host",
-    source: "",
     exports: [len2_of, fov_of, Vec2, CloneValue, Camera, Glyph],
 }

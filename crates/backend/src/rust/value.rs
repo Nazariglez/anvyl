@@ -254,6 +254,9 @@ impl<'a> RustValues<'a> {
             RirOperand::Place(place) if self.places.physical_ref_root(place)
         );
         match owned.source {
+            super::rir::RirOwnedSource::Direct | super::rir::RirOwnedSource::Transfer { .. } => {
+                value
+            }
             super::rir::RirOwnedSource::Reuse(_)
                 if physical_ref
                     && matches!(
@@ -271,7 +274,6 @@ impl<'a> RustValues<'a> {
                 };
                 self.materialize_ref(materializer, &source)
             }
-            super::rir::RirOwnedSource::Transfer { .. } => value,
         }
     }
 

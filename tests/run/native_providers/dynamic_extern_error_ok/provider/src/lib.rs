@@ -22,6 +22,5 @@ pub fn make_counter<'cx>(ctx: &mut Ctx<'cx, '_>) -> AnvRef<'cx, Counter> {
 
 anvyx_runtime::builtin_module! {
     name: "host",
-    source: "",
     exports: [Counter, make_counter],
 }

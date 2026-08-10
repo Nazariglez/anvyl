@@ -16,6 +16,54 @@ fn ty(module: ModulePath, name: &str) -> ExternTypeKey {
     }
 }
 
+fn empty_rust_package() -> RawProviderPackage {
+    RawProviderPackage {
+        exports: vec![RawProviderExport::Rust(RawRustProviderExport {
+            provider: ProviderId {
+                name: "host".to_string(),
+            },
+            modules: vec![RawRustModuleExport {
+                descriptor: ExternModuleDescriptor {
+                    path: module(&["host"]),
+                    types: vec![],
+                    functions: vec![],
+                },
+                types: vec![],
+                bindings: vec![],
+            }],
+        })],
+    }
+}
+
+#[test]
+fn catalog_reports_only_the_first_duplicate_module() {
+    let wire = serde_json::to_value(empty_rust_package()).expect("serialize package");
+    let mut first = wire["exports"][0].clone();
+    first["Rust"]["modules"][0]["descriptor"]["path"]["segments"][0] = serde_json::json!("first");
+    let mut middle = first.clone();
+    middle["Rust"]["provider"]["name"] = serde_json::json!("middle");
+    let mut fresh = middle["Rust"]["modules"][0].clone();
+    fresh["descriptor"]["path"]["segments"][0] = serde_json::json!("fresh");
+    middle["Rust"]["modules"] = serde_json::json!([fresh, first["Rust"]["modules"][0].clone()]);
+    let mut later = first.clone();
+    later["Rust"]["provider"]["name"] = serde_json::json!("later");
+    later["Rust"]["modules"][0]["descriptor"]["path"]["segments"][0] = serde_json::json!("fresh");
+    let package = serde_json::from_value(serde_json::json!({
+        "exports": [first, middle, later],
+    }))
+    .expect("deserialize package");
+
+    let error = ProviderCatalog::try_new(vec![(
+        ProviderPackageKey("host".to_string()),
+        package,
+        Some("host".to_string()),
+    )])
+    .expect_err("duplicate module must reject the package")
+    .to_string();
+    assert_eq!(error, "duplicate provider module `first` in package `host`");
+    assert!(!error.contains("fresh"));
+}
+
 fn valid_provider() -> ProviderDescriptor {
     ProviderDescriptor {
         provider: ProviderId {
@@ -118,6 +166,33 @@ fn valid_provider() -> ProviderDescriptor {
     }
 }
 
+#[test]
+fn builds_descriptor_only_provider() {
+    let descriptor = valid_provider();
+    let provider = descriptor.provider.clone();
+    let package = ProviderPackageKey("host".to_string());
+    let catalog = ProviderCatalog::try_new(vec![(
+        package.clone(),
+        RawProviderPackage {
+            exports: vec![RawProviderExport::Descriptor(descriptor)],
+        },
+        None,
+    )])
+    .expect("descriptor-only provider must validate");
+    let key = ExternBindingKey {
+        target: ExternBindingTarget::Function(ExternFunctionKey {
+            module: module(&["math"]),
+            name: "visit".to_string(),
+        }),
+        operation: ExternBindingOp::Call,
+    };
+
+    assert_eq!(
+        catalog.binding(&package, &provider, &key),
+        Err(ProviderCatalogError::DescriptorOnly)
+    );
+}
+
 fn param(ty: ExternTypeExpr) -> ExternParam {
     ExternParam {
         name: None,
@@ -137,6 +212,24 @@ fn function_with_signature(
         ret,
     };
     validate(&provider)
+}
+
+#[test]
+fn rejects_invalid_crate_aliases_for_empty_rust_exports() {
+    for alias in ["", "not-an-ident", "type", "r#self"] {
+        let result = ProviderCatalog::try_new(vec![(
+            ProviderPackageKey("test".to_string()),
+            empty_rust_package(),
+            Some(alias.to_string()),
+        )]);
+        assert!(matches!(
+            result,
+            Err(ProviderCatalogError::InvalidCrateAlias {
+                alias: rejected,
+                ..
+            }) if rejected == alias
+        ));
+    }
 }
 
 #[test]
@@ -167,15 +260,15 @@ fn rejects_invalid_names() {
     let errors = validate(&provider).unwrap_err();
 
     assert!(errors.contains(&ExternDescriptorError::InvalidName {
-        kind: NameKind::Provider,
+        kind: "provider",
         name: String::new(),
     }));
     assert!(errors.contains(&ExternDescriptorError::InvalidName {
-        kind: NameKind::Field,
+        kind: "field",
         name: "__get_x".to_string(),
     }));
     assert!(errors.contains(&ExternDescriptorError::InvalidName {
-        kind: NameKind::Function,
+        kind: "function",
         name: "2d".to_string(),
     }));
 }
@@ -197,19 +290,19 @@ fn rejects_invalid_module_and_type_names() {
     let errors = validate(&provider).unwrap_err();
 
     assert!(errors.contains(&ExternDescriptorError::InvalidName {
-        kind: NameKind::ModuleSegment,
+        kind: "module segment",
         name: "bad-name".to_string(),
     }));
     assert!(errors.contains(&ExternDescriptorError::InvalidName {
-        kind: NameKind::Type,
+        kind: "type",
         name: "1Vec2".to_string(),
     }));
     assert!(errors.contains(&ExternDescriptorError::InvalidName {
-        kind: NameKind::Param,
+        kind: "parameter",
         name: "__x".to_string(),
     }));
     assert!(errors.contains(&ExternDescriptorError::InvalidName {
-        kind: NameKind::NamedType,
+        kind: "named type",
         name: String::new(),
     }));
 }
@@ -292,15 +385,15 @@ fn rejects_invalid_member_names() {
     let errors = validate(&provider).unwrap_err();
 
     assert!(errors.contains(&ExternDescriptorError::InvalidName {
-        kind: NameKind::FieldInit,
+        kind: "field initializer",
         name: "bad-field".to_string(),
     }));
     assert!(errors.contains(&ExternDescriptorError::InvalidName {
-        kind: NameKind::Method,
+        kind: "method",
         name: "2len".to_string(),
     }));
     assert!(errors.contains(&ExternDescriptorError::InvalidName {
-        kind: NameKind::Static,
+        kind: "static",
         name: "__zero".to_string(),
     }));
 }
@@ -502,7 +595,7 @@ fn rejects_non_return_void() {
     let errors = validate(&provider).unwrap_err();
 
     assert!(errors.contains(&ExternDescriptorError::VoidType {
-        context: TypeContext::Nested,
+        context: "nested type position",
     }));
 }
 
@@ -519,7 +612,7 @@ fn rejects_invalid_named_module() {
 
     assert!(errors.contains(&ExternDescriptorError::EmptyModulePath));
     assert!(errors.contains(&ExternDescriptorError::VoidType {
-        context: TypeContext::Nested,
+        context: "nested type position",
     }));
 }
 
@@ -589,11 +682,11 @@ fn checks_callback_types() {
         })
     );
     assert!(errors.contains(&ExternDescriptorError::VoidType {
-        context: TypeContext::Param,
+        context: "parameter position",
     }));
     assert!(errors.contains(&ExternDescriptorError::EmptyModulePath));
     assert!(errors.contains(&ExternDescriptorError::InvalidName {
-        kind: NameKind::NamedType,
+        kind: "named type",
         name: String::new(),
     }));
 }

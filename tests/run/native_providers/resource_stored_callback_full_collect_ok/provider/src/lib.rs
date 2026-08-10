@@ -47,6 +47,5 @@ pub fn fire_slot<'cx>(ctx: &mut Ctx<'cx, '_>, slot: AnvRef<'cx, Slot<'cx>>) -> R
 
 anvyx_runtime::builtin_module! {
     name: "host",
-    source: "",
     exports: [Counter, Slot, make_counter, counter_value, make_slot, collect_all, fire_slot],
 }

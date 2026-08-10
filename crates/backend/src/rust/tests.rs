@@ -98,8 +98,8 @@ fn emit_retained_callback_registry_before_heap() {
     air::finalize_materialization(&mut program);
     air::finalize_materialization(&mut program);
     let verified = air::verify(&program).expect("AIR verify failed");
-    let source = generate(&verified, host_escaping_lambda_retained_plan_config())
-        .expect("generation failed");
+    let config = host_escaping_lambda_retained_plan_config();
+    let source = generate(&verified, config.config, &config.catalog).expect("generation failed");
     let source = source.as_str();
     let callbacks = source
         .find(&format!(
@@ -294,7 +294,10 @@ fn stringify_override_noncopy_value_receiver_is_target_gap() {
 
     assert_plan_gap(
         program,
-        RustPlanConfig::default(),
+        TestPlanConfig {
+            config: RustPlanConfig::default(),
+            catalog: anvyx_externs::ProviderCatalog::default(),
+        },
         RustTargetGapKind::NonCopyValueRequired,
     );
 }
@@ -864,6 +867,10 @@ fn struct_field_read_program() -> Program {
         "_println",
         vec![(string, ParamMode::SharedBorrow)],
         void,
+        air::ExternAbi {
+            params: vec![anvyx_externs::ExternTypeExpr::String],
+            ret: anvyx_externs::ExternTypeExpr::Void,
+        },
     );
     let point_local = air::LocalId::from_index(0);
     let text = air::LocalId::from_index(1);
@@ -911,60 +918,65 @@ fn struct_field_read_program() -> Program {
     program.set_entry(main);
     program
 }
-mod enums {}
-mod arrays {}
-
-mod lists {}
-
-mod slices {}
-fn native_callback_sig() -> anvyx_runtime::ExternCallbackSignature {
-    anvyx_runtime::ExternCallbackSignature {
-        params: vec![anvyx_runtime::ExternCallbackParam {
-            ty: anvyx_runtime::ExternTypeExpr::Int,
-            escape: anvyx_runtime::CallbackEscape::NonEscaping,
-        }],
-        ret: Box::new(anvyx_runtime::ExternTypeExpr::Int),
-        policy: anvyx_runtime::CallbackPolicy {
-            escape: anvyx_runtime::CallbackEscape::NonEscaping,
-            thread: anvyx_runtime::CallbackThread::SameThread,
-        },
-    }
+struct TestProvider {
+    provider: anvyx_runtime::ProviderId,
+    module: anvyx_externs::ModulePath,
+    functions: Vec<FunctionFixture>,
 }
 
-fn host_escaping_lambda_support() -> anvyx_runtime::RustProviderSupport {
-    let mut callback = native_callback_sig();
-    callback.policy.escape = anvyx_runtime::CallbackEscape::Escaping;
-    host_lambda_support_with(anvyx_runtime::RustParamAbi::EscapingLambda(callback))
+struct FunctionFixture {
+    descriptor: anvyx_externs::ExternFunctionDescriptor,
+    support: FunctionSupport,
 }
 
-fn host_escaping_lambda_retained_support() -> anvyx_runtime::RustProviderSupport {
+struct FunctionSupport {
+    path: anvyx_externs::RustPath,
+    abi: anvyx_externs::RustExternAbi,
+}
+
+fn host_escaping_lambda_support() -> TestProvider {
+    host_lambda_support()
+}
+
+fn host_escaping_lambda_retained_support() -> TestProvider {
     let mut support = host_escaping_lambda_support();
-    support.modules[0].bindings.push(function_binding(
-        "host_lambda",
-        "host",
-        &["host", "trigger"],
-        "trigger",
-        vec![],
-        anvyx_runtime::RustReturnAbi::Void,
-        false,
+    support.functions.push(function_fixture(
+        function_descriptor(
+            "trigger",
+            vec![],
+            anvyx_externs::ExternTypeExpr::Void,
+            false,
+        ),
+        function_support(
+            "host",
+            &["host", "trigger"],
+            vec![],
+            anvyx_externs::RustReturnAdapter::Void,
+        ),
     ));
     support
 }
-fn host_lambda_support_with(
-    param: anvyx_runtime::RustParamAbi,
-) -> anvyx_runtime::RustProviderSupport {
-    let mut binding = function_binding(
-        "host_lambda",
+
+fn host_lambda_support() -> TestProvider {
+    let mut support = function_support(
         "host",
         &["host", "apply"],
-        "apply",
-        vec![param],
-        anvyx_runtime::RustReturnAbi::Void,
-        false,
+        vec![anvyx_externs::RustParamAdapter::EscapingLambda],
+        anvyx_externs::RustReturnAdapter::Void,
     );
-    binding.abi.support = anvyx_runtime::RustAbiSupport::NeedsWrapperConversion;
-    binding.abi.ctx = anvyx_runtime::RustWrapperCtx::None;
-    provider_support("host_lambda", vec![binding])
+    support.abi.ctx = anvyx_externs::RustCallContext::None;
+    provider_support(
+        "host_lambda",
+        vec![function_fixture(
+            function_descriptor(
+                "apply",
+                vec![callback_param(anvyx_externs::CallbackEscape::Escaping)],
+                anvyx_externs::ExternTypeExpr::Void,
+                false,
+            ),
+            support,
+        )],
+    )
 }
 
 fn host_lambda_extern(
@@ -978,6 +990,10 @@ fn host_lambda_extern(
         "apply",
         vec![(lambda_ty, ParamMode::Value)],
         void,
+        air::ExternAbi {
+            params: vec![callback_param(anvyx_externs::CallbackEscape::Escaping).ty],
+            ret: anvyx_externs::ExternTypeExpr::Void,
+        },
         ExternMember::FreeFunction,
     );
     program.externs[id.index()].binding = Some(provider_binding("host_lambda", "apply"));
@@ -990,6 +1006,10 @@ fn host_trigger_extern(program: &mut Program, void: air::TypeId) -> air::ExternI
         "trigger",
         vec![],
         void,
+        air::ExternAbi {
+            params: vec![],
+            ret: anvyx_externs::ExternTypeExpr::Void,
+        },
         ExternMember::FreeFunction,
     );
     program.externs[id.index()].binding = Some(provider_binding("host_lambda", "trigger"));
@@ -1111,28 +1131,34 @@ fn plan_source(mut program: Program) -> RustSource {
     air::finalize_materialization(&mut program);
     air::finalize_materialization(&mut program);
     let verified = air::verify(&program).expect("AIR verify failed");
-    let source = generate(&verified, rust_plan_config()).expect("generation failed");
+    let config = rust_plan_config();
+    let source = generate(&verified, config.config, &config.catalog).expect("generation failed");
     std::hint::black_box(program);
     source
 }
 
-fn rust_plan_config() -> RustPlanConfig {
-    RustPlanConfig {
-        symbol_prefix: "anv".into(),
-        native_providers: vec![
+struct TestPlanConfig {
+    config: RustPlanConfig,
+    catalog: anvyx_externs::ProviderCatalog,
+}
+
+fn rust_plan_config() -> TestPlanConfig {
+    TestPlanConfig {
+        config: RustPlanConfig::default(),
+        catalog: test_provider_catalog(vec![
             core_runtime_support(),
             core_string_support(),
             core_int_support(),
             fallible_host_support(),
             host_mut_support(),
-        ],
+        ]),
     }
 }
 
-fn host_escaping_lambda_retained_plan_config() -> RustPlanConfig {
-    RustPlanConfig {
-        symbol_prefix: "anv".into(),
-        native_providers: vec![host_escaping_lambda_retained_support()],
+fn host_escaping_lambda_retained_plan_config() -> TestPlanConfig {
+    TestPlanConfig {
+        config: RustPlanConfig::default(),
+        catalog: test_provider_catalog(vec![host_escaping_lambda_retained_support()]),
     }
 }
 fn workspace_crate_path(name: &str) -> String {
@@ -1197,18 +1223,19 @@ fn run_source(source: RustSource) -> source_job::RustSourceJobOutput {
         },
     }
 }
-fn plan_gaps(mut program: Program, config: RustPlanConfig) -> Vec<RustTargetGap> {
+fn plan_gaps(mut program: Program, config: TestPlanConfig) -> Vec<RustTargetGap> {
     air::finalize_materialization(&mut program);
     air::finalize_materialization(&mut program);
     let verified = air::verify(&program).expect("AIR verify failed");
-    let Err(RustPlanError::TargetGaps(gaps)) = plan(&verified, config) else {
+    let Err(RustPlanError::TargetGaps(gaps)) = plan(&verified, config.config, &config.catalog)
+    else {
         panic!("expected target gap");
     };
     std::hint::black_box(program);
     gaps.0
 }
 
-fn assert_plan_gap(program: Program, config: RustPlanConfig, kind: RustTargetGapKind) {
+fn assert_plan_gap(program: Program, config: TestPlanConfig, kind: RustTargetGapKind) {
     assert!(
         plan_gaps(program, config)
             .iter()
@@ -1219,170 +1246,329 @@ fn assert_plan_gap(program: Program, config: RustPlanConfig, kind: RustTargetGap
 fn assert_default_plan_gap(program: Program, kind: RustTargetGapKind) {
     assert_plan_gap(program, rust_plan_config(), kind);
 }
-fn core_runtime_support() -> anvyx_runtime::RustProviderSupport {
-    use anvyx_runtime::{ExternTypeExpr, RustParamAbi, RustReturnAbi};
+fn core_runtime_support() -> TestProvider {
+    use anvyx_externs::{ExternTypeExpr, RustParamAdapter, RustReturnAdapter};
 
     provider_support(
         "core_runtime",
         vec![
-            function_binding(
-                "core_runtime",
-                "anvyx_core",
-                &["__anvyx_native", "core_runtime", "_println"],
-                "_println",
-                vec![RustParamAbi::Borrow(ExternTypeExpr::String)],
-                RustReturnAbi::Void,
-                false,
+            function_fixture(
+                function_descriptor(
+                    "_println",
+                    vec![borrowed_param(ExternTypeExpr::String)],
+                    ExternTypeExpr::Void,
+                    false,
+                ),
+                function_support(
+                    "anvyx_core",
+                    &[
+                        "__anvyx_native_package",
+                        "core_runtime",
+                        "__anvyx_native",
+                        "_println",
+                    ],
+                    vec![RustParamAdapter::Borrow],
+                    RustReturnAdapter::Void,
+                ),
             ),
-            function_binding(
-                "core_runtime",
-                "anvyx_core",
-                &["__anvyx_native", "core_runtime", "_assert"],
-                "_assert",
-                vec![
-                    RustParamAbi::Value(ExternTypeExpr::Bool),
-                    RustParamAbi::Borrow(ExternTypeExpr::String),
-                ],
-                RustReturnAbi::Void,
-                false,
+            function_fixture(
+                function_descriptor(
+                    "_assert",
+                    vec![
+                        value_param(ExternTypeExpr::Bool),
+                        borrowed_param(ExternTypeExpr::String),
+                    ],
+                    ExternTypeExpr::Void,
+                    false,
+                ),
+                function_support(
+                    "anvyx_core",
+                    &[
+                        "__anvyx_native_package",
+                        "core_runtime",
+                        "__anvyx_native",
+                        "_assert",
+                    ],
+                    vec![RustParamAdapter::Value, RustParamAdapter::Borrow],
+                    RustReturnAdapter::Void,
+                ),
             ),
         ],
     )
 }
 
-fn core_string_support() -> anvyx_runtime::RustProviderSupport {
-    use anvyx_runtime::{ExternTypeExpr, RustParamAbi, RustReturnAbi};
+fn core_string_support() -> TestProvider {
+    use anvyx_externs::{ExternTypeExpr, RustParamAdapter, RustReturnAdapter};
 
     provider_support(
         "core_string",
-        vec![function_binding(
-            "core_string",
-            "anvyx_core",
-            &["__anvyx_native", "core_string", "str_len"],
-            "str_len",
-            vec![RustParamAbi::Borrow(ExternTypeExpr::String)],
-            RustReturnAbi::Value(ExternTypeExpr::Int),
-            false,
+        vec![function_fixture(
+            function_descriptor(
+                "str_len",
+                vec![borrowed_param(ExternTypeExpr::String)],
+                ExternTypeExpr::Int,
+                false,
+            ),
+            function_support(
+                "anvyx_core",
+                &[
+                    "__anvyx_native_package",
+                    "core_string",
+                    "__anvyx_native",
+                    "str_len",
+                ],
+                vec![RustParamAdapter::Borrow],
+                RustReturnAdapter::Value,
+            ),
         )],
     )
 }
 
-fn core_int_support() -> anvyx_runtime::RustProviderSupport {
-    use anvyx_runtime::{ExternTypeExpr, RustParamAbi, RustReturnAbi};
+fn core_int_support() -> TestProvider {
+    use anvyx_externs::{ExternTypeExpr, RustParamAdapter, RustReturnAdapter};
 
     provider_support(
         "core_int",
-        vec![function_binding(
-            "core_int",
-            "anvyx_core",
-            &["__anvyx_native", "core_int", "int_abs"],
-            "int_abs",
-            vec![RustParamAbi::Value(ExternTypeExpr::Int)],
-            RustReturnAbi::Value(ExternTypeExpr::Int),
-            false,
+        vec![function_fixture(
+            function_descriptor(
+                "int_abs",
+                vec![value_param(ExternTypeExpr::Int)],
+                ExternTypeExpr::Int,
+                false,
+            ),
+            function_support(
+                "anvyx_core",
+                &[
+                    "__anvyx_native_package",
+                    "core_int",
+                    "__anvyx_native",
+                    "int_abs",
+                ],
+                vec![RustParamAdapter::Value],
+                RustReturnAdapter::Value,
+            ),
         )],
     )
 }
 
-fn fallible_host_support() -> anvyx_runtime::RustProviderSupport {
-    use anvyx_runtime::{ExternTypeExpr, RustParamAbi, RustReturnAbi};
+fn fallible_host_support() -> TestProvider {
+    use anvyx_externs::{ExternTypeExpr, RustParamAdapter, RustReturnAdapter};
 
     provider_support(
         "fallible_host",
-        vec![function_binding(
-            "fallible_host",
-            "host",
-            &["fallible"],
-            "fallible",
-            vec![RustParamAbi::Value(ExternTypeExpr::Int)],
-            RustReturnAbi::Value(ExternTypeExpr::Int),
-            true,
+        vec![function_fixture(
+            function_descriptor(
+                "fallible",
+                vec![value_param(ExternTypeExpr::Int)],
+                ExternTypeExpr::Int,
+                true,
+            ),
+            function_support(
+                "host",
+                &["fallible"],
+                vec![RustParamAdapter::Value],
+                RustReturnAdapter::Value,
+            ),
         )],
     )
 }
 
-fn host_mut_support() -> anvyx_runtime::RustProviderSupport {
-    use anvyx_runtime::{ExternTypeExpr, RustParamAbi, RustReturnAbi};
+fn host_mut_support() -> TestProvider {
+    use anvyx_externs::{ExternTypeExpr, RustParamAdapter, RustReturnAdapter};
 
     provider_support(
         "host",
         vec![
-            function_binding(
-                "host",
-                "host",
-                &["host", "touch"],
-                "touch",
-                vec![RustParamAbi::MutBorrow(ExternTypeExpr::Int)],
-                RustReturnAbi::Void,
-                false,
+            function_fixture(
+                function_descriptor(
+                    "touch",
+                    vec![mutable_param(ExternTypeExpr::Int)],
+                    ExternTypeExpr::Void,
+                    false,
+                ),
+                function_support(
+                    "host",
+                    &["host", "touch"],
+                    vec![RustParamAdapter::MutBorrow],
+                    RustReturnAdapter::Void,
+                ),
             ),
-            function_binding(
-                "host",
-                "host",
-                &["host", "touch_place"],
-                "touch_place",
-                vec![RustParamAbi::MutPlace(ExternTypeExpr::Int)],
-                RustReturnAbi::Void,
-                false,
+            function_fixture(
+                function_descriptor(
+                    "touch_place",
+                    vec![mutable_param(ExternTypeExpr::Int)],
+                    ExternTypeExpr::Void,
+                    false,
+                ),
+                function_support(
+                    "host",
+                    &["host", "touch_place"],
+                    vec![RustParamAdapter::MutPlace],
+                    RustReturnAdapter::Void,
+                ),
             ),
         ],
     )
 }
 
-fn provider_support(
-    provider: &str,
-    bindings: Vec<anvyx_runtime::RustExternBinding>,
-) -> anvyx_runtime::RustProviderSupport {
-    anvyx_runtime::RustProviderSupport {
-        package: "<core>".to_string(),
-        provider: anvyx_runtime::ProviderId {
-            name: provider.to_string(),
-        },
-        cargo: anvyx_runtime::RustProviderCargo::default(),
-        modules: vec![anvyx_runtime::RustModuleSupport {
-            module: anvyx_runtime::ModulePath {
-                segments: vec![provider.to_string()],
-            },
-            types: vec![],
-            bindings,
-        }],
+fn function_fixture(
+    descriptor: anvyx_externs::ExternFunctionDescriptor,
+    support: FunctionSupport,
+) -> FunctionFixture {
+    FunctionFixture {
+        descriptor,
+        support,
     }
 }
 
-fn function_binding(
-    provider: &str,
+fn function_descriptor(
+    name: &str,
+    params: Vec<anvyx_externs::ExternParam>,
+    ret: anvyx_externs::ExternTypeExpr,
+    fallible: bool,
+) -> anvyx_externs::ExternFunctionDescriptor {
+    anvyx_externs::ExternFunctionDescriptor {
+        name: name.to_string(),
+        doc: None,
+        signature: anvyx_externs::ExternSignature { params, ret },
+        effects: anvyx_externs::ExternEffects { fallible },
+    }
+}
+
+fn value_param(ty: anvyx_externs::ExternTypeExpr) -> anvyx_externs::ExternParam {
+    extern_param(
+        ty,
+        anvyx_externs::ParamFlow::Value,
+        anvyx_externs::CallbackEscape::NonEscaping,
+    )
+}
+
+fn borrowed_param(ty: anvyx_externs::ExternTypeExpr) -> anvyx_externs::ExternParam {
+    extern_param(
+        ty,
+        anvyx_externs::ParamFlow::Borrow,
+        anvyx_externs::CallbackEscape::NonEscaping,
+    )
+}
+
+fn mutable_param(ty: anvyx_externs::ExternTypeExpr) -> anvyx_externs::ExternParam {
+    extern_param(
+        ty,
+        anvyx_externs::ParamFlow::MutBorrow,
+        anvyx_externs::CallbackEscape::NonEscaping,
+    )
+}
+
+fn callback_param(escape: anvyx_externs::CallbackEscape) -> anvyx_externs::ExternParam {
+    extern_param(
+        anvyx_externs::ExternTypeExpr::Callback(anvyx_externs::ExternCallbackSignature {
+            params: vec![anvyx_externs::ExternCallbackParam {
+                ty: anvyx_externs::ExternTypeExpr::Int,
+                escape: anvyx_externs::CallbackEscape::NonEscaping,
+            }],
+            ret: Box::new(anvyx_externs::ExternTypeExpr::Int),
+            policy: anvyx_externs::CallbackPolicy {
+                escape,
+                thread: anvyx_externs::CallbackThread::SameThread,
+            },
+        }),
+        anvyx_externs::ParamFlow::Value,
+        escape,
+    )
+}
+
+fn extern_param(
+    ty: anvyx_externs::ExternTypeExpr,
+    flow: anvyx_externs::ParamFlow,
+    escape: anvyx_externs::CallbackEscape,
+) -> anvyx_externs::ExternParam {
+    anvyx_externs::ExternParam {
+        name: None,
+        ty,
+        flow,
+        escape,
+    }
+}
+
+fn provider_support(provider: &str, functions: Vec<FunctionFixture>) -> TestProvider {
+    TestProvider {
+        provider: anvyx_runtime::ProviderId {
+            name: provider.to_string(),
+        },
+        module: anvyx_externs::ModulePath {
+            segments: vec![provider.to_string()],
+        },
+        functions,
+    }
+}
+
+fn test_provider_catalog(supports: Vec<TestProvider>) -> anvyx_externs::ProviderCatalog {
+    let inputs = supports
+        .into_iter()
+        .map(|support| {
+            let alias = support
+                .functions
+                .first()
+                .map(|function| function.support.path.crate_name.to_string())
+                .unwrap_or_else(|| "host".to_string());
+            let key = anvyx_externs::ProviderPackageKey(support.provider.name.clone());
+            let (functions, bindings) = support
+                .functions
+                .into_iter()
+                .map(|function| {
+                    let name = function.descriptor.name.clone();
+                    (
+                        function.descriptor,
+                        anvyx_externs::RawRustExternBinding {
+                            target: anvyx_externs::RawModuleBindingTarget::Function(name),
+                            operation: anvyx_externs::ExternBindingOp::Call,
+                            path: anvyx_externs::RawRustSymbolPath(function.support.path.segments),
+                            abi: function.support.abi,
+                        },
+                    )
+                })
+                .unzip();
+            let package = anvyx_externs::RawProviderPackage {
+                exports: vec![anvyx_externs::RawProviderExport::Rust(
+                    anvyx_externs::RawRustProviderExport {
+                        provider: support.provider,
+                        modules: vec![anvyx_externs::RawRustModuleExport {
+                            descriptor: anvyx_externs::ExternModuleDescriptor {
+                                path: support.module,
+                                types: vec![],
+                                functions,
+                            },
+                            types: vec![],
+                            bindings,
+                        }],
+                    },
+                )],
+            };
+            (key, package, Some(alias))
+        })
+        .collect();
+    anvyx_externs::ProviderCatalog::try_new(inputs).expect("valid test provider catalog")
+}
+
+fn function_support(
     crate_name: &str,
     segments: &[&str],
-    name: &str,
-    params: Vec<anvyx_runtime::RustParamAbi>,
-    ret: anvyx_runtime::RustReturnAbi,
-    fallible: bool,
-) -> anvyx_runtime::RustExternBinding {
-    anvyx_runtime::RustExternBinding {
-        key: anvyx_runtime::ExternBindingKey {
-            target: anvyx_runtime::ExternBindingTarget::Function(
-                anvyx_runtime::ExternFunctionKey {
-                    module: anvyx_runtime::ModulePath {
-                        segments: vec![provider.to_string()],
-                    },
-                    name: name.to_string(),
-                },
-            ),
-            operation: anvyx_runtime::ExternBindingOp::Call,
-        },
-        path: anvyx_runtime::RustPath {
-            crate_name: crate_name.to_string(),
+    params: Vec<anvyx_externs::RustParamAdapter>,
+    ret: anvyx_externs::RustReturnAdapter,
+) -> FunctionSupport {
+    FunctionSupport {
+        path: anvyx_externs::RustPath {
+            crate_name: crate_name.into(),
             segments: segments.iter().map(ToString::to_string).collect(),
         },
-        abi: anvyx_runtime::RustExternAbi {
+        abi: anvyx_externs::RustExternAbi {
             params,
             ret,
-            fallible,
-            support: anvyx_runtime::RustAbiSupport::Direct,
-            ctx: anvyx_runtime::RustWrapperCtx::HiddenRuntime,
+            ctx: anvyx_externs::RustCallContext::HiddenRuntime,
         },
     }
 }
+
 fn air_module(path: &[&str]) -> air::Module {
     air::Module {
         path: path.iter().map(|segment| Ident::new(*segment)).collect(),
@@ -1394,6 +1580,7 @@ fn runtime_extern(
     name: &str,
     params: Vec<(air::TypeId, ParamMode)>,
     return_type: air::TypeId,
+    abi: air::ExternAbi,
 ) -> air::ExternId {
     let id = extern_in_module(
         program,
@@ -1401,6 +1588,7 @@ fn runtime_extern(
         name,
         params,
         return_type,
+        abi,
         ExternMember::FreeFunction,
     );
     program.externs[id.index()].binding = Some(provider_binding("core_runtime", name));
@@ -1414,6 +1602,10 @@ fn fallible_extern(program: &mut Program, int: air::TypeId) -> air::ExternId {
         "fallible",
         vec![(int, ParamMode::Value)],
         int,
+        air::ExternAbi {
+            params: vec![anvyx_externs::ExternTypeExpr::Int],
+            ret: anvyx_externs::ExternTypeExpr::Int,
+        },
         ExternMember::FreeFunction,
     );
     let decl = &mut program.externs[id.index()];
@@ -1423,17 +1615,31 @@ fn fallible_extern(program: &mut Program, int: air::TypeId) -> air::ExternId {
 }
 
 fn provider_binding(provider: &str, name: &str) -> ExternBindingDecl {
-    ExternBindingDecl {
-        package: anvyx_frontend::resolve::PackageId::core(),
-        provider: anvyx_runtime::ProviderId {
+    provider_binding_in(
+        anvyx_externs::ProviderPackageKey(provider.to_string()),
+        anvyx_runtime::ProviderId {
             name: provider.to_string(),
         },
+        anvyx_runtime::ModulePath {
+            segments: vec![provider.to_string()],
+        },
+        name,
+    )
+}
+
+fn provider_binding_in(
+    package: anvyx_externs::ProviderPackageKey,
+    provider: anvyx_runtime::ProviderId,
+    module: anvyx_runtime::ModulePath,
+    name: &str,
+) -> ExternBindingDecl {
+    ExternBindingDecl {
+        package,
+        provider,
         key: anvyx_runtime::ExternBindingKey {
             target: anvyx_runtime::ExternBindingTarget::Function(
                 anvyx_runtime::ExternFunctionKey {
-                    module: anvyx_runtime::ModulePath {
-                        segments: vec![provider.to_string()],
-                    },
+                    module,
                     name: name.to_string(),
                 },
             ),
@@ -1448,10 +1654,10 @@ fn extern_in_module(
     name: &str,
     params: Vec<(air::TypeId, ParamMode)>,
     return_type: air::TypeId,
+    abi: air::ExternAbi,
     member: ExternMember,
 ) -> air::ExternId {
     let module = program.alloc_module(air_module(path));
-    let abi = test_extern_abi(program, &params, return_type);
     let id = program.alloc_extern(ExternDecl {
         name: Ident::new(name),
         span: None,
@@ -1489,86 +1695,5 @@ fn set_extern_param_escape(
         program.externs[id.index()].abi.params.get_mut(index)
     {
         callback.policy.escape = escape;
-    }
-}
-fn test_extern_abi(
-    program: &Program,
-    params: &[(air::TypeId, ParamMode)],
-    ret: air::TypeId,
-) -> air::ExternAbi {
-    air::ExternAbi {
-        params: params
-            .iter()
-            .map(|(ty, _)| test_type_abi(program, *ty))
-            .collect(),
-        ret: test_type_abi(program, ret),
-    }
-}
-
-fn test_type_abi(program: &Program, ty: air::TypeId) -> anvyx_runtime::ExternTypeExpr {
-    use anvyx_runtime::ExternTypeExpr;
-    match program.type_arena.data(ty) {
-        TypeData::Void => ExternTypeExpr::Void,
-        TypeData::Bool => ExternTypeExpr::Bool,
-        TypeData::Int => ExternTypeExpr::Int,
-        TypeData::Float => ExternTypeExpr::Float,
-        TypeData::String => ExternTypeExpr::String,
-        TypeData::Char => ExternTypeExpr::Char,
-        TypeData::Optional(inner) => {
-            ExternTypeExpr::Option(Box::new(test_type_abi(program, *inner)))
-        }
-        TypeData::List(inner) => ExternTypeExpr::List(Box::new(test_type_abi(program, *inner))),
-        TypeData::Slice(inner) => ExternTypeExpr::Slice(Box::new(test_type_abi(program, *inner))),
-        TypeData::Array { elem, len } => ExternTypeExpr::Array {
-            elem: Box::new(test_type_abi(program, *elem)),
-            len: *len as u64,
-        },
-        TypeData::Map { key, value, .. } => ExternTypeExpr::Map(
-            Box::new(test_type_abi(program, *key)),
-            Box::new(test_type_abi(program, *value)),
-        ),
-        TypeData::Tuple(fields) => ExternTypeExpr::Tuple(
-            fields
-                .iter()
-                .map(|ty| test_type_abi(program, *ty))
-                .collect(),
-        ),
-        TypeData::Function(sig) => {
-            ExternTypeExpr::Callback(anvyx_runtime::ExternCallbackSignature {
-                params: sig
-                    .params
-                    .iter()
-                    .map(|param| anvyx_runtime::ExternCallbackParam {
-                        ty: test_type_abi(program, param.ty),
-                        escape: anvyx_runtime::CallbackEscape::NonEscaping,
-                    })
-                    .collect(),
-                ret: Box::new(test_type_abi(program, sig.ret.ty())),
-                policy: anvyx_runtime::CallbackPolicy {
-                    escape: anvyx_runtime::CallbackEscape::NonEscaping,
-                    thread: anvyx_runtime::CallbackThread::SameThread,
-                },
-            })
-        }
-        TypeData::Extern(ext) => {
-            let ext = program.extern_type(*ext);
-            let (module, name) = ext
-                .binding
-                .as_ref()
-                .map_or((None, ext.name.to_string()), |binding| {
-                    (Some(binding.key.module.clone()), binding.key.name.clone())
-                });
-            ExternTypeExpr::Named {
-                module,
-                name,
-                args: vec![],
-            }
-        }
-        TypeData::Any
-        | TypeData::Aggregate(_)
-        | TypeData::Enum(_)
-        | TypeData::Flag(_)
-        | TypeData::DataRef(_)
-        | TypeData::Dyn(_) => ExternTypeExpr::Any,
     }
 }

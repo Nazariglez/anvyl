@@ -15,6 +15,5 @@ pub fn clear_bits<'cx>(
 
 anvyx_runtime::builtin_module! {
     name: "host",
-    source: "",
     exports: [echo_bits, clear_bits],
 }

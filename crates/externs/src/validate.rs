@@ -1,11 +1,11 @@
-use std::{collections::HashSet, fmt};
+use std::collections::HashSet;
 
-use crate::{descriptor::*, keys::*};
+use crate::{callback_escape_matches, descriptor::*, keys::*};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ExternDescriptorError {
     InvalidName {
-        kind: NameKind,
+        kind: &'static str,
         name: String,
     },
     EmptyModulePath,
@@ -78,7 +78,7 @@ pub enum ExternDescriptorError {
         align: u64,
     },
     VoidType {
-        context: TypeContext,
+        context: &'static str,
     },
     InvalidAbiType {
         position: AbiPosition,
@@ -92,7 +92,7 @@ pub enum ExternDescriptorError {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum NameKind {
+enum NameKind {
     Provider,
     ModuleSegment,
     Type,
@@ -106,7 +106,7 @@ pub enum NameKind {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum TypeContext {
+enum TypeContext {
     Param,
     Nested,
 }
@@ -117,9 +117,9 @@ enum ValidationMode {
     SourceModule,
 }
 
-impl fmt::Display for NameKind {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
+impl NameKind {
+    fn as_str(self) -> &'static str {
+        match self {
             Self::Provider => "provider",
             Self::ModuleSegment => "module segment",
             Self::Type => "type",
@@ -130,16 +130,16 @@ impl fmt::Display for NameKind {
             Self::Static => "static",
             Self::Param => "parameter",
             Self::NamedType => "named type",
-        })
+        }
     }
 }
 
-impl fmt::Display for TypeContext {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
+impl TypeContext {
+    fn as_str(self) -> &'static str {
+        match self {
             Self::Param => "parameter position",
             Self::Nested => "nested type position",
-        })
+        }
     }
 }
 
@@ -535,11 +535,11 @@ fn check_callback_escape(
     let ExternTypeExpr::Callback(callback) = ty else {
         return;
     };
-    if let Err(mismatch) = effective_callback_escape(escape, callback) {
+    if !callback_escape_matches(escape, callback) {
         errors.push(ExternDescriptorError::CallbackEscapeMismatch {
             param: param.map(str::to_string),
-            param_escape: mismatch.param_escape,
-            policy_escape: mismatch.policy_escape,
+            param_escape: escape,
+            policy_escape: callback.policy.escape,
         });
     }
 }
@@ -553,7 +553,7 @@ fn check_type_expr(
     if let Err(violations) = ty.classify_abi(position.abi_position()) {
         for violation in violations {
             if mode == ValidationMode::SourceModule
-                && violation.reason == AbiTypeError::GenericNamedArgsUnsupported
+                && violation.1 == AbiTypeError::GenericNamedArgsUnsupported
             {
                 continue;
             }
@@ -563,15 +563,18 @@ fn check_type_expr(
     check_type_names(ty, errors);
 }
 
-fn push_abi_violation(violation: AbiTypeViolation, errors: &mut Vec<ExternDescriptorError>) {
-    if violation.reason == AbiTypeError::VoidOutsideReturn {
+fn push_abi_violation(
+    violation: (AbiPosition, AbiTypeError),
+    errors: &mut Vec<ExternDescriptorError>,
+) {
+    if violation.1 == AbiTypeError::VoidOutsideReturn {
         errors.push(ExternDescriptorError::VoidType {
-            context: void_type_context(violation.position),
+            context: void_type_context(violation.0).as_str(),
         });
     } else {
         errors.push(ExternDescriptorError::InvalidAbiType {
-            position: violation.position,
-            reason: violation.reason,
+            position: violation.0,
+            reason: violation.1,
         });
     }
 }
@@ -585,7 +588,8 @@ fn void_type_context(position: AbiPosition) -> TypeContext {
         AbiPosition::Return
         | AbiPosition::CallbackReturn
         | AbiPosition::Field
-        | AbiPosition::Nested => TypeContext::Nested,
+        | AbiPosition::Nested
+        | AbiPosition::NestedParam => TypeContext::Nested,
     }
 }
 
@@ -643,7 +647,7 @@ fn check_module_path(path: &ModulePath, errors: &mut Vec<ExternDescriptorError>)
 fn check_name(kind: NameKind, name: &str, errors: &mut Vec<ExternDescriptorError>) {
     if !is_valid_extern_name(name) {
         errors.push(ExternDescriptorError::InvalidName {
-            kind,
+            kind: kind.as_str(),
             name: name.to_string(),
         });
     }

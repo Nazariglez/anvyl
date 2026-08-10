@@ -5,6 +5,5 @@ pub fn open_window() -> i64 { 11 }
 
 anvyx_runtime::builtin_module! {
     name: "window",
-    source: "",
-    exports: [open_window],
-}
+    root: false,
+    exports: [open_window],}

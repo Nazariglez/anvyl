@@ -1,0 +1,5 @@
+// @mode: run
+// @expect: error
+// @contains: duplicate provider `host`
+
+fn main() {}

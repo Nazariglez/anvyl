@@ -1,0 +1,7 @@
+[project]
+name = "same_provider_name_packages"
+entry = "src/main.anv"
+
+[dependencies]
+left = { path = "left" }
+right = { path = "right" }

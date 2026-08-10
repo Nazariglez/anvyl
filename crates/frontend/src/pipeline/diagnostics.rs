@@ -11,13 +11,12 @@ use crate::{
     conditional::ConditionalError,
     diagnostic::Diagnostic,
     externs::{
-        ExternInputError, ExternProvenance, RawExternDecl, RawExternFunctionKey,
-        RawExternIdentityKey, RawExternMemberKey, RawExternScope, RawExternTypeKey,
-        UnsupportedSourceKind, UnsupportedSourceParamReason,
+        ExternInputError, RawExternDecl, RawExternIdentityKey, UnsupportedSourceKind,
+        UnsupportedSourceParamReason,
         catalog::{
-            ExternCatalogContext, ExternCatalogError, ExternContextItem, InvalidExternTypeReason,
+            ExternCatalogContext, ExternCatalogError, ExternContextItem, ExternOrigin,
+            InvalidExternTypeReason,
         },
-        raw_module_scope,
     },
     lexer::{Delimiter, Op, Token},
     resolve::{ModuleId, PackageId, PackageModulePath, ResolveError},
@@ -223,29 +222,10 @@ fn resolve_error_label(error: &ResolveError) -> &'static str {
 
 pub(super) fn diagnose_extern_input_error(error: &ExternInputError) -> Diagnostic {
     let message = match error {
-        ExternInputError::InvalidProviderDescriptor {
-            package,
-            provider,
-            error,
-        } => format!(
-            "invalid extern descriptor from provider '{}' in package '{}': {}",
-            provider.name,
-            package,
-            render_extern_descriptor_error(error, None)
-        ),
-        ExternInputError::DuplicateProviderModule {
-            package,
-            module,
-            first,
-            duplicate,
-        } => format!(
-            "duplicate provider module '{module}' in package '{}' declared by providers '{}' and '{}'",
-            package, first.name, duplicate.name
-        ),
-        ExternInputError::InvalidRawDescriptor { decl, scope, error } => format!(
+        ExternInputError::InvalidRawDescriptor { decl, error } => format!(
             "invalid extern descriptor from {}: {}",
             render_raw_decl(decl),
-            render_extern_descriptor_error(error, Some(scope))
+            render_extern_descriptor_error(error, Some(&decl.scope))
         ),
         ExternInputError::DuplicateRawIdentity {
             key,
@@ -253,7 +233,7 @@ pub(super) fn diagnose_extern_input_error(error: &ExternInputError) -> Diagnosti
             duplicate,
         } => render_duplicate_raw_identity(
             render_raw_identity_kind(key),
-            &render_extern_identity_label(key, first, duplicate),
+            &render_source_raw_identity_key(key),
             first,
             duplicate,
         ),
@@ -282,8 +262,6 @@ fn label_extern_input_error(diagnostic: Diagnostic, error: &ExternInputError) ->
         ExternInputError::UnsupportedSource { kind, span } => {
             diagnostic.with_primary_message(*span, unsupported_source_label(kind))
         }
-        ExternInputError::InvalidProviderDescriptor { .. }
-        | ExternInputError::DuplicateProviderModule { .. } => diagnostic,
     }
 }
 
@@ -361,12 +339,12 @@ fn render_raw_identity_kind(key: &RawExternIdentityKey) -> &'static str {
     match key {
         RawExternIdentityKey::Function(_) => "function",
         RawExternIdentityKey::Type(_) => "type",
-        RawExternIdentityKey::Member(key) => render_raw_member_kind(key),
+        RawExternIdentityKey::Member { selector, .. } => render_raw_member_kind(selector),
     }
 }
 
-fn render_raw_member_kind(key: &RawExternMemberKey) -> &'static str {
-    match &key.selector {
+fn render_raw_member_kind(selector: &anvyx_externs::ExternMemberSelector) -> &'static str {
+    match selector {
         anvyx_externs::ExternMemberSelector::Field(_) => "field",
         anvyx_externs::ExternMemberSelector::Method(_) => "method",
         anvyx_externs::ExternMemberSelector::Static(_) => "static method",
@@ -375,65 +353,12 @@ fn render_raw_member_kind(key: &RawExternMemberKey) -> &'static str {
     }
 }
 
-fn render_raw_identity_key(key: &RawExternIdentityKey) -> String {
-    match key {
-        RawExternIdentityKey::Function(key) => render_raw_function_key(key),
-        RawExternIdentityKey::Type(key) => render_raw_type_key(key),
-        RawExternIdentityKey::Member(key) => render_raw_member_key(key),
-    }
-}
-
-fn render_extern_identity_label(
-    key: &RawExternIdentityKey,
-    first: &RawExternDecl,
-    duplicate: &RawExternDecl,
-) -> String {
-    if is_source_raw_identity(key, first, duplicate) {
-        render_source_raw_identity_key(key)
-    } else {
-        render_raw_identity_key(key)
-    }
-}
-
-fn is_source_raw_identity(
-    key: &RawExternIdentityKey,
-    first: &RawExternDecl,
-    duplicate: &RawExternDecl,
-) -> bool {
-    let Some(first_scope) = source_provenance_scope(&first.provenance) else {
-        return false;
-    };
-    let Some(duplicate_scope) = source_provenance_scope(&duplicate.provenance) else {
-        return false;
-    };
-
-    first_scope == duplicate_scope && raw_identity_scope(key) == first_scope
-}
-
-fn source_provenance_scope(provenance: &ExternProvenance) -> Option<&RawExternScope> {
-    match provenance {
-        ExternProvenance::Source { module } => Some(module),
-        ExternProvenance::Provider { .. } => None,
-    }
-}
-
-fn raw_identity_scope(key: &RawExternIdentityKey) -> &RawExternScope {
-    match key {
-        RawExternIdentityKey::Function(key) => &key.module,
-        RawExternIdentityKey::Type(key) => &key.module,
-        RawExternIdentityKey::Member(key) => &key.owner.module,
-    }
-}
-
 fn render_source_raw_identity_key(key: &RawExternIdentityKey) -> String {
     match key {
-        RawExternIdentityKey::Function(key) => key.name.clone(),
-        RawExternIdentityKey::Type(key) => key.name.clone(),
-        RawExternIdentityKey::Member(key) => format!(
-            "{}.{}",
-            key.owner.name.as_str(),
-            render_extern_member_selector(&key.selector)
-        ),
+        RawExternIdentityKey::Function(name) | RawExternIdentityKey::Type(name) => name.clone(),
+        RawExternIdentityKey::Member { owner, selector } => {
+            format!("{owner}.{}", render_extern_member_selector(selector))
+        }
     }
 }
 
@@ -451,54 +376,28 @@ fn render_duplicate_raw_identity(
 }
 
 fn render_raw_decl(decl: &RawExternDecl) -> String {
-    render_extern_provenance(&decl.provenance)
+    if is_root_module_id(&decl.scope) {
+        "source root".to_string()
+    } else {
+        format!("source module '{}'", decl.scope)
+    }
 }
 
-fn render_extern_provenance(provenance: &ExternProvenance) -> String {
-    match provenance {
-        ExternProvenance::Provider { package, provider } => {
+fn render_extern_origin(origin: &ExternOrigin) -> String {
+    match origin {
+        ExternOrigin::Provider { package, provider } => {
             format!("provider '{}' in package '{}'", provider.name, package)
         }
-        ExternProvenance::Source { module } if is_raw_root_scope(module) => {
-            "source root".to_string()
-        }
-        ExternProvenance::Source { module } => {
-            format!("source module '{}'", render_raw_scope(module))
-        }
+        ExternOrigin::Source => "source".to_string(),
     }
 }
 
-fn render_raw_function_key(key: &RawExternFunctionKey) -> String {
-    render_raw_scoped_name(&key.module, &key.name)
-}
-
-fn render_raw_type_key(key: &RawExternTypeKey) -> String {
-    render_raw_scoped_name(&key.module, &key.name)
-}
-
-fn render_raw_member_key(key: &RawExternMemberKey) -> String {
-    format!(
-        "{}.{}",
-        render_raw_type_key(&key.owner),
-        render_extern_member_selector(&key.selector)
-    )
-}
-
-fn render_raw_scoped_name(scope: &RawExternScope, name: &str) -> String {
-    match scope {
-        RawExternScope::Module(module) if is_root_module_id(module) => name.to_string(),
-        RawExternScope::Module(module) => format!("{module}.{name}"),
+fn render_raw_scoped_name(scope: &ModuleId, name: &str) -> String {
+    if is_root_module_id(scope) {
+        name.to_string()
+    } else {
+        format!("{scope}.{name}")
     }
-}
-
-fn render_raw_scope(scope: &RawExternScope) -> String {
-    match scope {
-        RawExternScope::Module(module) => format!("{module}"),
-    }
-}
-
-fn is_raw_root_scope(scope: &RawExternScope) -> bool {
-    matches!(scope, RawExternScope::Module(module) if is_root_module_id(module))
 }
 
 fn is_root_module_id(module: &ModuleId) -> bool {
@@ -1888,10 +1787,7 @@ fn render_extern_catalog_error(
             render_surface_type(found, type_ctx)
         ),
     };
-    format!(
-        "{message} from {}",
-        render_extern_provenance(&context.provenance)
-    )
+    format!("{message} from {}", render_extern_origin(&context.origin))
 }
 
 fn render_callback_escape(escape: CallbackEscape) -> &'static str {
@@ -1911,6 +1807,7 @@ fn render_abi_position(position: AbiPosition) -> &'static str {
         AbiPosition::CallbackReturn => "callback return position",
         AbiPosition::Field => "field position",
         AbiPosition::Nested => "nested type position",
+        AbiPosition::NestedParam => "nested parameter type position",
     }
 }
 
@@ -1985,10 +1882,7 @@ fn render_extern_context_member(
 }
 
 fn is_source_extern_context(context: &ExternCatalogContext) -> bool {
-    match &context.provenance {
-        ExternProvenance::Source { module } => raw_module_scope(module) == context.module,
-        ExternProvenance::Provider { .. } => false,
-    }
+    matches!(context.origin, ExternOrigin::Source)
 }
 
 fn render_scoped_name(module: &ModuleScope, name: Ident) -> String {
@@ -2415,7 +2309,7 @@ fn render_const_value(value: &ConstValue) -> String {
 
 fn render_extern_descriptor_error(
     error: &ExternDescriptorError,
-    raw_scope: Option<&RawExternScope>,
+    raw_scope: Option<&ModuleId>,
 ) -> String {
     match error {
         ExternDescriptorError::InvalidName { kind, name } => {
@@ -2528,7 +2422,7 @@ fn render_extern_descriptor_error(
     }
 }
 
-fn render_extern_type_key(key: &ExternTypeKey, raw_scope: Option<&RawExternScope>) -> String {
+fn render_extern_type_key(key: &ExternTypeKey, raw_scope: Option<&ModuleId>) -> String {
     match raw_scope {
         Some(scope) => render_raw_scoped_name(scope, &key.name),
         None => format!("{}.{}", key.module, key.name),

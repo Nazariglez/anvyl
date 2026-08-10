@@ -3692,8 +3692,8 @@ fn verify_extern_abi(
             cx.push(
                 site.clone(),
                 VerifyErrorKind::BadExtern(BadExtern::InvalidAbi {
-                    position: violation.position,
-                    reason: violation.reason,
+                    position: violation.0,
+                    reason: violation.1,
                 }),
             );
         }
@@ -7823,10 +7823,10 @@ fn rvalue_owned_sources_valid(cx: &VerifyCx<'_>, function: FunctionId, value: &R
         | RValue::DynWeaken { value: owned, .. }
         | RValue::DynDowncast { value: owned, .. }
         | RValue::FunctionValue { value: owned, .. }
-        | RValue::OptionalSome { value: owned, .. }
         | RValue::ListPush { value: owned, .. } => valid(owned, false),
+        RValue::OptionalSome { value: owned, .. } => valid(owned, true),
         RValue::Aggregate { kind, fields, .. } => fields.iter().all(|owned| {
-            valid(owned, false)
+            valid(owned, matches!(kind, AggregateCtor::EnumVariant { .. }))
                 && (!matches!(kind, AggregateCtor::ArrayFill)
                     || matches!(owned.source, ValueSource::Reusable))
         }),

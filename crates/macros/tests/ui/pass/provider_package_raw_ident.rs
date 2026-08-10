@@ -8,7 +8,7 @@ mod r#type {
 
     anvyx_runtime::builtin_module! {
         name: "raw",
-        source: "",
+    root: false,
         exports: [ping],
     }
 }

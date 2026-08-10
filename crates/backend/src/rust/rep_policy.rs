@@ -55,53 +55,28 @@ enum RustMaterializerNode {
     },
 }
 
-#[derive(Debug, Clone, Default)]
-pub struct RustMaterializerGraph {
+#[derive(Debug, Clone)]
+pub struct RustMaterializerGraph<'a> {
     nodes: Vec<RustMaterializerNode>,
     types: Vec<TypeId>,
     positions: Vec<RustRecipePosition>,
     entries: BTreeMap<(TypeId, RustRecipePosition), RirMaterializerId>,
     filled: bool,
-    native_types: HashMap<
-        (
-            String,
-            anvyx_runtime::ProviderId,
-            anvyx_runtime::ExternTypeKey,
-        ),
-        anvyx_runtime::RustTypeBinding,
-    >,
+    provider_catalog: &'a anvyx_externs::ProviderCatalog,
     callables: HashMap<TypeId, RirMaterializerAction>,
 }
 
-impl RustMaterializerGraph {
-    pub fn with_native_support(supports: &[anvyx_runtime::RustProviderSupport]) -> Self {
-        let mut graph = Self::default();
-        for support in supports {
-            for module in &support.modules {
-                for ty in &module.types {
-                    graph.native_types.insert(
-                        (
-                            support.package.clone(),
-                            support.provider.clone(),
-                            ty.key.clone(),
-                        ),
-                        ty.clone(),
-                    );
-                }
-            }
+impl<'a> RustMaterializerGraph<'a> {
+    pub fn with_provider_catalog(catalog: &'a anvyx_externs::ProviderCatalog) -> Self {
+        Self {
+            nodes: vec![],
+            types: vec![],
+            positions: vec![],
+            entries: BTreeMap::new(),
+            filled: false,
+            provider_catalog: catalog,
+            callables: HashMap::new(),
         }
-        graph
-    }
-
-    pub fn native_type(
-        &self,
-        binding: &air::ExternTypeBindingDecl,
-    ) -> Option<&anvyx_runtime::RustTypeBinding> {
-        self.native_types.get(&(
-            binding.package.as_str().to_string(),
-            binding.provider.clone(),
-            binding.key.clone(),
-        ))
     }
 
     pub fn set_callable_materializers(
@@ -277,18 +252,21 @@ impl RustMaterializerGraph {
         let action = if let TypeData::Extern(extern_id) = plan.program.type_arena.data(ty) {
             let decl = plan.program.extern_type(*extern_id);
             let native = decl.binding.as_ref().and_then(|binding| {
-                self.native_types.get(&(
-                    binding.package.as_str().to_string(),
-                    binding.provider.clone(),
-                    binding.key.clone(),
-                ))
+                self.provider_catalog
+                    .native_type_parts(&binding.package, &binding.provider, &binding.key)
+                    .map(|(native, _, _)| native)
+                    .ok()
             });
             match (decl.rep, decl.materialization, native) {
                 (
                     air::ExternRep::Inline,
                     Some(mode @ anvyx_runtime::ExternMaterialization::Copy),
                     Some(native),
-                ) if native.validated_materializer(mode).is_some() => {
+                ) if native
+                    .materializer
+                    .as_ref()
+                    .is_some_and(|binding| binding.mode == mode) =>
+                {
                     fill.then_some(RirMaterializerAction::Copy)
                 }
                 (
@@ -297,7 +275,9 @@ impl RustMaterializerGraph {
                     Some(native),
                 ) => {
                     let binding = native
-                        .validated_materializer(mode)
+                        .materializer
+                        .as_ref()
+                        .filter(|binding| binding.mode == mode)
                         .ok_or(RustRecipeGap::UnsupportedType(ty))?;
                     fill.then(|| RirMaterializerAction::ProviderMaterialize {
                         binding: binding.clone(),

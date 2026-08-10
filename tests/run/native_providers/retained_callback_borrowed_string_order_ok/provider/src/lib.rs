@@ -40,6 +40,5 @@ pub fn close() -> RuntimeResult<()> {
 
 anvyx_runtime::builtin_module! {
     name: "host",
-    source: "",
     exports: [log_and_fire, retain, close],
 }

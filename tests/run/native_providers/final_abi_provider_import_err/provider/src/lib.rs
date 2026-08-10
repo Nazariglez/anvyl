@@ -11,6 +11,5 @@ pub fn secret_value(secret: Secret) -> i64 {
 
 anvyx_runtime::builtin_module! {
     name: "host",
-    source: "",
     exports: [secret_value],
 }

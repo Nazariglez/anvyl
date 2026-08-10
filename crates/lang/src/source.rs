@@ -134,7 +134,6 @@ impl ModuleSource {
 pub struct SystemPackageSource {
     root: SourceText,
     modules: Vec<ModuleSource>,
-    providers: Vec<anvyx_externs::ProviderDescriptor>,
 }
 
 impl SystemPackageSource {
@@ -143,21 +142,7 @@ impl SystemPackageSource {
         for module in &modules {
             insert_unique_path(&mut paths, module.path(), "duplicate system module path")?;
         }
-        Ok(Self {
-            root,
-            modules,
-            providers: vec![],
-        })
-    }
-
-    pub fn with_providers(
-        root: SourceText,
-        modules: Vec<ModuleSource>,
-        providers: Vec<anvyx_externs::ProviderDescriptor>,
-    ) -> Result<Self, CheckError> {
-        let mut source = Self::new(root, modules)?;
-        source.providers = providers;
-        Ok(source)
+        Ok(Self { root, modules })
     }
 
     pub fn root(&self) -> &SourceText {
@@ -170,10 +155,6 @@ impl SystemPackageSource {
 
     pub fn modules(&self) -> &[ModuleSource] {
         &self.modules
-    }
-
-    pub fn providers(&self) -> &[anvyx_externs::ProviderDescriptor] {
-        &self.providers
     }
 }
 

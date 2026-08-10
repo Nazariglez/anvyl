@@ -169,6 +169,49 @@ pub enum ExternTypeExpr {
     Callback(ExternCallbackSignature),
 }
 
+impl ExternTypeExpr {
+    pub fn rewrite_names(
+        &mut self,
+        rewrite: &mut impl FnMut(&mut Option<ModulePath>, &mut String),
+    ) {
+        match self {
+            Self::Named { module, name, args } => {
+                rewrite(module, name);
+                for arg in args {
+                    arg.rewrite_names(rewrite);
+                }
+            }
+            Self::List(inner) | Self::Option(inner) | Self::Slice(inner) => {
+                inner.rewrite_names(rewrite);
+            }
+            Self::Array { elem, .. } => elem.rewrite_names(rewrite),
+            Self::Map(key, value) | Self::Result(key, value) => {
+                key.rewrite_names(rewrite);
+                value.rewrite_names(rewrite);
+            }
+            Self::Tuple(fields) => {
+                for field in fields {
+                    field.rewrite_names(rewrite);
+                }
+            }
+            Self::Callback(callback) => {
+                for param in &mut callback.params {
+                    param.ty.rewrite_names(rewrite);
+                }
+                callback.ret.rewrite_names(rewrite);
+            }
+            Self::Void
+            | Self::Unit
+            | Self::Bool
+            | Self::Int
+            | Self::Float
+            | Self::String
+            | Self::Char
+            | Self::Any => {}
+        }
+    }
+}
+
 impl fmt::Display for ExternTypeExpr {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -262,22 +305,24 @@ pub enum AbiPosition {
     CallbackReturn,
     Field,
     Nested,
+    NestedParam,
 }
 
 impl AbiPosition {
     fn allows_direct_capability(self) -> bool {
         matches!(
             self,
-            Self::ParamValue | Self::ParamBorrow | Self::ParamMutBorrow
+            Self::ParamValue | Self::ParamBorrow | Self::ParamMutBorrow | Self::NestedParam
         )
     }
-}
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum AbiTypeClass {
-    Value,
-    ParamOnly,
-    ReturnOnly,
+    fn nested_param(self) -> Self {
+        if self.allows_direct_capability() {
+            Self::NestedParam
+        } else {
+            Self::Nested
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -290,12 +335,6 @@ pub enum AbiTypeError {
     CallbackReturnUnsupported,
     CallbackThreadUnsupported,
     GenericNamedArgsUnsupported,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct AbiTypeViolation {
-    pub position: AbiPosition,
-    pub reason: AbiTypeError,
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -316,24 +355,11 @@ pub struct ExternCallbackParam {
     pub escape: CallbackEscape,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct CallbackEscapeMismatch {
-    pub param_escape: CallbackEscape,
-    pub policy_escape: CallbackEscape,
-}
-
-pub fn effective_callback_escape(
+pub(crate) fn callback_escape_matches(
     param_escape: CallbackEscape,
     callback: &ExternCallbackSignature,
-) -> Result<CallbackEscape, CallbackEscapeMismatch> {
-    if callback.policy.escape == param_escape {
-        Ok(param_escape)
-    } else {
-        Err(CallbackEscapeMismatch {
-            param_escape,
-            policy_escape: callback.policy.escape,
-        })
-    }
+) -> bool {
+    callback.policy.escape == param_escape
 }
 
 impl ExternCallbackSignature {
@@ -366,11 +392,11 @@ impl ExternTypeExpr {
     pub fn classify_abi(
         &self,
         position: AbiPosition,
-    ) -> Result<AbiTypeClass, Vec<AbiTypeViolation>> {
+    ) -> Result<(), Vec<(AbiPosition, AbiTypeError)>> {
         let mut violations = vec![];
-        let class = self.classify_abi_inner(position, &mut violations);
+        self.classify_abi_inner(position, &mut violations);
         if violations.is_empty() {
-            Ok(class)
+            Ok(())
         } else {
             Err(violations)
         }
@@ -379,17 +405,13 @@ impl ExternTypeExpr {
     fn classify_abi_inner(
         &self,
         position: AbiPosition,
-        violations: &mut Vec<AbiTypeViolation>,
-    ) -> AbiTypeClass {
+        violations: &mut Vec<(AbiPosition, AbiTypeError)>,
+    ) {
         match self {
             Self::Void => {
                 if position != AbiPosition::Return && position != AbiPosition::CallbackReturn {
-                    violations.push(AbiTypeViolation {
-                        position,
-                        reason: AbiTypeError::VoidOutsideReturn,
-                    });
+                    violations.push((position, AbiTypeError::VoidOutsideReturn));
                 }
-                AbiTypeClass::ReturnOnly
             }
             Self::Unit
             | Self::Bool
@@ -397,62 +419,62 @@ impl ExternTypeExpr {
             | Self::Float
             | Self::String
             | Self::Char
-            | Self::Any => AbiTypeClass::Value,
-            Self::Option(inner) | Self::Array { elem: inner, .. } | Self::List(inner) => {
+            | Self::Any => {}
+            Self::Option(inner) => inner.classify_abi_inner(position.nested_param(), violations),
+            Self::Array { elem: inner, .. } | Self::List(inner) => {
                 inner.classify_nested(violations);
-                AbiTypeClass::Value
             }
-            Self::Result(ok, err) | Self::Map(ok, err) => {
+            Self::Result(ok, err) => {
+                let nested = position.nested_param();
+                ok.classify_abi_inner(nested, violations);
+                err.classify_abi_inner(nested, violations);
+            }
+            Self::Map(ok, err) => {
                 ok.classify_nested(violations);
                 err.classify_nested(violations);
-                AbiTypeClass::Value
             }
             Self::Tuple(fields) => {
                 for field in fields {
                     field.classify_nested(violations);
                 }
-                AbiTypeClass::Value
             }
             Self::Slice(inner) => {
-                let reason = if position == AbiPosition::Nested {
+                let reason = if matches!(position, AbiPosition::Nested | AbiPosition::NestedParam) {
                     AbiTypeError::SliceNested
                 } else {
                     AbiTypeError::SliceOutsideParam
                 };
                 if !position.allows_direct_capability() {
-                    violations.push(AbiTypeViolation { position, reason });
+                    violations.push((position, reason));
                 }
                 inner.classify_nested(violations);
-                AbiTypeClass::ParamOnly
             }
             Self::Named { args, .. } => {
                 if !args.is_empty() {
-                    violations.push(AbiTypeViolation {
-                        position,
-                        reason: AbiTypeError::GenericNamedArgsUnsupported,
-                    });
+                    violations.push((position, AbiTypeError::GenericNamedArgsUnsupported));
                 }
                 for arg in args {
                     arg.classify_nested(violations);
                 }
-                AbiTypeClass::Value
             }
             Self::Callback(callback) => {
                 let reason = match position {
-                    AbiPosition::Nested | AbiPosition::CallbackParam => {
+                    AbiPosition::Nested | AbiPosition::NestedParam | AbiPosition::CallbackParam => {
                         AbiTypeError::CallbackNested
                     }
                     AbiPosition::CallbackReturn => AbiTypeError::CallbackReturnUnsupported,
                     _ => AbiTypeError::CallbackOutsideParam,
                 };
-                if !position.allows_direct_capability() {
-                    violations.push(AbiTypeViolation { position, reason });
+                if !matches!(
+                    position,
+                    AbiPosition::ParamValue
+                        | AbiPosition::ParamBorrow
+                        | AbiPosition::ParamMutBorrow
+                ) {
+                    violations.push((position, reason));
                 }
                 if callback.policy.thread != CallbackThread::SameThread {
-                    violations.push(AbiTypeViolation {
-                        position,
-                        reason: AbiTypeError::CallbackThreadUnsupported,
-                    });
+                    violations.push((position, AbiTypeError::CallbackThreadUnsupported));
                 }
                 for param in &callback.params {
                     param
@@ -462,12 +484,11 @@ impl ExternTypeExpr {
                 callback
                     .ret
                     .classify_abi_inner(AbiPosition::CallbackReturn, violations);
-                AbiTypeClass::ParamOnly
             }
         }
     }
 
-    fn classify_nested(&self, violations: &mut Vec<AbiTypeViolation>) {
+    fn classify_nested(&self, violations: &mut Vec<(AbiPosition, AbiTypeError)>) {
         self.classify_abi_inner(AbiPosition::Nested, violations);
     }
 

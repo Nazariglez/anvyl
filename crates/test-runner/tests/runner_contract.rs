@@ -121,7 +121,7 @@ fn write_stderr_provider(dir: &Path) -> PathBuf {
     .expect("provider Cargo manifest");
     fs::write(
         provider.join("src/lib.rs"),
-        "use anvyx_runtime::function;\n\n#[function]\npub fn stderr_probe() -> i64 {\n    eprintln!(\"runner stderr\");\n    0\n}\n\nanvyx_runtime::builtin_module! {\n    name: \"host\",\n    source: \"\",\n    exports: [stderr_probe],\n}\n",
+        "use anvyx_runtime::function;\n\n#[function]\npub fn stderr_probe() -> i64 {\n    eprintln!(\"runner stderr\");\n    0\n}\n\nanvyx_runtime::builtin_module! {\n    name: \"host\",\n    exports: [stderr_probe],\n}\n",
     )
     .expect("provider source");
     let source = dir.join("src");

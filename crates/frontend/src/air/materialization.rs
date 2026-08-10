@@ -274,14 +274,18 @@ fn finalize_owned_children(rvalue: &mut RValue, disposition: &Disposition<'_>) {
         | RValue::DynWeaken { value, .. }
         | RValue::DynDowncast { value, .. }
         | RValue::FunctionValue { value, .. }
-        | RValue::OptionalSome { value, .. }
         | RValue::ListPush { value, .. } => finalize_owned(value, disposition, false),
+        RValue::OptionalSome { value, .. } => finalize_owned(value, disposition, true),
         RValue::Aggregate { kind, fields, .. } => {
             for field in fields {
                 if matches!(kind, super::AggregateCtor::ArrayFill) {
                     field.source = ValueSource::Reusable;
                 } else {
-                    finalize_owned(field, disposition, false);
+                    finalize_owned(
+                        field,
+                        disposition,
+                        matches!(kind, super::AggregateCtor::EnumVariant { .. }),
+                    );
                 }
             }
         }

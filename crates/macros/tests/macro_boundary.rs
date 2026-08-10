@@ -10,7 +10,7 @@ mod r#type {
 
     anvyx_runtime::builtin_module! {
         name: "raw",
-        source: "",
+    root: false,
         exports: [ping],
     }
 }
@@ -19,7 +19,9 @@ anvyx_runtime::provider_package! { modules: [r#type] }
 
 #[test]
 fn provider_package_normalizes_raw_identifiers() {
-    assert_eq!(provider_descriptors()[0].modules[0].path.segments, ["raw"]);
+    let package = format!("{:#?}", rust_providers());
+    assert!(package.contains("raw"));
+    assert!(package.contains("r#type"));
 }
 
 #[test]

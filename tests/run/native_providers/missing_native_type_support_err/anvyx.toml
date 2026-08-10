@@ -1,0 +1,6 @@
+[project]
+name = "missing_native_type_support"
+entry = "src/main.anv"
+
+[dependencies]
+host = { path = "provider" }

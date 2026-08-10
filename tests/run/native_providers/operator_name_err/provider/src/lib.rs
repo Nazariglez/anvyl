@@ -1,8 +1,3 @@
-use anvyx_runtime::{
-    ExternBindingTarget::Member, ExternMemberKey, ExternMemberSelector::Operator,
-    RustModuleSupport,
-};
-
 mod descriptor {
     use anvyx_runtime::{methods, AnvyxInline};
 
@@ -32,25 +27,17 @@ mod descriptor {
 
     anvyx_runtime::builtin_module! {
         name: "host",
-        source: "",
         exports: [Vec2],
     }
 }
 
-pub use descriptor::{Vec2, provider_descriptors};
+pub use descriptor::Vec2;
 
-pub fn rust_module_supports() -> Vec<RustModuleSupport> {
-    let mut supports = descriptor::rust_module_supports();
-    for support in &mut supports {
-        support.bindings.retain(|binding| {
-            !matches!(
-                &binding.key.target,
-                Member(ExternMemberKey {
-                    selector: Operator(_),
-                    ..
-                })
-            )
-        });
-    }
-    supports
+pub fn rust_providers() -> anvyx_runtime::RawProviderPackage {
+    let mut wire = serde_json::to_value(descriptor::rust_providers()).unwrap();
+    wire["exports"][0]["Rust"]["modules"][0]["bindings"]
+        .as_array_mut()
+        .unwrap()
+        .retain(|binding| binding["target"]["Member"]["selector"].get("Operator").is_none());
+    serde_json::from_value(wire).unwrap()
 }

@@ -1,0 +1,6 @@
+[project]
+name = "duplicate_provider_id"
+entry = "src/main.anv"
+
+[dependencies]
+host = { path = "provider" }

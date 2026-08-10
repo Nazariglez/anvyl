@@ -1,6 +1,7 @@
-use anvyx_externs::{
-    AbiPosition, CALLBACK_WRAPPER_MAX_ARITY, CallbackEscape, CallbackPolicy, CallbackThread,
-    ExternCallbackParam, ExternCallbackSignature, ExternTypeExpr,
+pub use anvyx_externs::{
+    CALLBACK_WRAPPER_MAX_ARITY, CallbackEscape, CallbackPolicy, CallbackThread,
+    ExternCallbackParam, ExternCallbackSignature, ExternTypeExpr, ParamFlow, RustParamAdapter,
+    RustReturnAdapter,
 };
 use proc_macro2::TokenStream;
 use quote::{ToTokens, quote};
@@ -13,90 +14,23 @@ use syn::{
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BoundaryParam {
     pub name: String,
-    pub ty: BoundaryType,
+    pub ty: ExternTypeExpr,
     pub flow: ParamFlow,
-    pub abi: ParamAbi,
-    pub conversion: BoundaryConversion,
+    pub abi: RustParamAdapter,
     pub init_presence: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BoundaryReturn {
-    pub ty: BoundaryType,
-    pub abi: ReturnAbi,
+    pub ty: ExternTypeExpr,
+    pub abi: RustReturnAdapter,
     pub fallible: bool,
-    pub conversion: BoundaryConversion,
 }
 
 #[derive(Clone, Copy)]
 pub struct OwnerReturn<'a> {
     pub rust_owner: &'a Ident,
     pub export_name: &'a str,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum BoundaryType {
-    Void,
-    Unit,
-    Bool,
-    Int,
-    Float,
-    String,
-    Char,
-    Named(String),
-    Callback(BoundaryCallback),
-    Option(Box<BoundaryType>),
-    Result(Box<BoundaryType>, Box<BoundaryType>),
-    Tuple(Vec<BoundaryType>),
-    Array { elem: Box<BoundaryType>, len: u64 },
-    List(Box<BoundaryType>),
-    Map(Box<BoundaryType>, Box<BoundaryType>),
-    Slice(Box<BoundaryType>),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BoundaryCallback {
-    pub params: Vec<BoundaryType>,
-    pub ret: Box<BoundaryType>,
-    pub escape: CallbackEscape,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ParamFlow {
-    Value,
-    Borrow,
-    MutBorrow,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ParamAbi {
-    Value(BoundaryType),
-    OwnedNamed(BoundaryType),
-    Borrow(BoundaryType),
-    MutPlace(BoundaryType),
-    ScopedLambda(BoundaryCallback),
-    EscapingLambda(BoundaryCallback),
-    AnvCallback(BoundaryCallback),
-    InitField(Box<ParamAbi>),
-    Option(Box<ParamAbi>),
-    Result(Box<ParamAbi>, Box<ParamAbi>),
-    Slice(Box<ParamAbi>),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ReturnAbi {
-    Void,
-    Value(BoundaryType),
-    OwnedNamed(BoundaryType),
-    Option(Box<ReturnAbi>),
-    Result(Box<ReturnAbi>, Box<ReturnAbi>),
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BoundaryConversion {
-    Direct,
-    NeedsWrapper,
-    Unsupported,
 }
 
 pub fn validate_callable_signature(
@@ -282,20 +216,18 @@ pub fn classify_param(pat_ty: &syn::PatType, has_ctx: bool) -> syn::Result<Bound
             "#[function(ctx)] MutPlace parameters only support bool, i64, f64, char, and Option of those payloads",
         ));
     }
-    if ty == BoundaryType::Void {
+    if ty == ExternTypeExpr::Void {
         return Err(syn::Error::new_spanned(
             &pat_ty.ty,
             "#[function] parameters cannot be void",
         ));
     }
     let abi = param_abi_for_source(&pat_ty.ty, &ty, flow)?;
-    let conversion = param_conversion(&ty, flow);
     Ok(BoundaryParam {
         name: ident.ident.to_string(),
         ty,
         flow,
         abi,
-        conversion,
         init_presence: false,
     })
 }
@@ -317,26 +249,20 @@ pub fn classify_init_param(pat_ty: &syn::PatType) -> syn::Result<BoundaryParam> 
             "AnvInitField<T> only supports value payloads",
         ));
     }
-    if ty == BoundaryType::Void {
+    if ty == ExternTypeExpr::Void {
         return Err(syn::Error::new_spanned(
             inner,
             "AnvInitField<T> payload cannot be void",
         ));
     }
     let abi = param_abi_for_source(inner, &ty, flow)?;
-    let conversion = param_conversion(&ty, flow);
     Ok(BoundaryParam {
         name: ident.ident.to_string(),
         ty,
         flow,
-        abi: ParamAbi::InitField(Box::new(abi)),
-        conversion,
+        abi: RustParamAdapter::InitField(Box::new(abi)),
         init_presence: true,
     })
-}
-
-pub fn classify_return(output: &ReturnType) -> syn::Result<BoundaryReturn> {
-    classify_provider_return(output)
 }
 
 pub fn classify_provider_return(output: &ReturnType) -> syn::Result<BoundaryReturn> {
@@ -356,10 +282,9 @@ fn classify_provider_return_inner(
 ) -> syn::Result<BoundaryReturn> {
     match output {
         ReturnType::Default => Ok(BoundaryReturn {
-            ty: BoundaryType::Void,
-            abi: ReturnAbi::Void,
+            ty: ExternTypeExpr::Void,
+            abi: RustReturnAdapter::Void,
             fallible: false,
-            conversion: BoundaryConversion::Direct,
         }),
         ReturnType::Type(_, ty) => classify_return_type(ty, owner),
     }
@@ -371,12 +296,10 @@ fn classify_hidden_return_payload_inner(
 ) -> syn::Result<BoundaryReturn> {
     let (ty, _) = classify_type_inner(source, Position::Return, owner)?;
     let abi = return_abi_for_source(source, &ty)?;
-    let conversion = return_conversion_for_type(&ty);
     Ok(BoundaryReturn {
         ty,
         abi,
         fallible: true,
-        conversion,
     })
 }
 
@@ -398,30 +321,27 @@ fn classify_return_type(
         reject_wrapper_element(source, &ok, ok_flow)?;
         let (err, err_flow) = classify_type_inner(err_ty, Position::WrapperElement, owner)?;
         reject_wrapper_element(source, &err, err_flow)?;
-        let abi = ReturnAbi::Result(
+        let abi = RustReturnAdapter::Result(
             Box::new(return_abi_for_source(ok_ty, &ok)?),
             Box::new(return_abi_for_source(err_ty, &err)?),
         );
-        let ty = BoundaryType::Result(Box::new(ok), Box::new(err));
+        let ty = ExternTypeExpr::Result(Box::new(ok), Box::new(err));
         return Ok(BoundaryReturn {
             abi,
-            conversion: return_conversion_for_type(&ty),
             ty,
             fallible: false,
         });
     }
     let (ty, _) = classify_type_inner(source, Position::Return, owner)?;
     let abi = return_abi_for_source(source, &ty)?;
-    let conversion = return_conversion_for_type(&ty);
     Ok(BoundaryReturn {
         ty,
         abi,
         fallible: false,
-        conversion,
     })
 }
 
-pub fn classify_field_type(source: &Type) -> syn::Result<BoundaryType> {
+pub fn classify_field_type(source: &Type) -> syn::Result<ExternTypeExpr> {
     let (ty, flow) = classify_type(source, Position::WrapperElement)?;
     if flow != ParamFlow::Value {
         return Err(syn::Error::new_spanned(
@@ -436,7 +356,7 @@ pub fn classify_field_type(source: &Type) -> syn::Result<BoundaryType> {
 pub(crate) fn classify_type(
     ty: &Type,
     position: Position,
-) -> syn::Result<(BoundaryType, ParamFlow)> {
+) -> syn::Result<(ExternTypeExpr, ParamFlow)> {
     classify_type_inner(ty, position, None)
 }
 
@@ -444,9 +364,11 @@ fn classify_type_inner(
     ty: &Type,
     position: Position,
     owner: Option<OwnerReturn<'_>>,
-) -> syn::Result<(BoundaryType, ParamFlow)> {
+) -> syn::Result<(ExternTypeExpr, ParamFlow)> {
     match ty {
-        Type::Tuple(tuple) if tuple.elems.is_empty() => Ok((BoundaryType::Unit, ParamFlow::Value)),
+        Type::Tuple(tuple) if tuple.elems.is_empty() => {
+            Ok((ExternTypeExpr::Unit, ParamFlow::Value))
+        }
         Type::Tuple(tuple) => {
             let fields = tuple
                 .elems
@@ -457,7 +379,7 @@ fn classify_type_inner(
                     Ok(ty)
                 })
                 .collect::<syn::Result<Vec<_>>>()?;
-            Ok((BoundaryType::Tuple(fields), ParamFlow::Value))
+            Ok((ExternTypeExpr::Tuple(fields), ParamFlow::Value))
         }
         Type::Array(array) => {
             let syn::Expr::Lit(len) = &array.len else {
@@ -475,7 +397,7 @@ fn classify_type_inner(
             let (elem, flow) = classify_type_inner(&array.elem, Position::WrapperElement, owner)?;
             reject_wrapper_element(&array.elem, &elem, flow)?;
             Ok((
-                BoundaryType::Array {
+                ExternTypeExpr::Array {
                     elem: Box::new(elem),
                     len: len.base10_parse()?,
                 },
@@ -496,7 +418,7 @@ fn classify_type_inner(
                 ));
             }
             if matches!(reference.elem.as_ref(), Type::Path(path) if path_is(path, &["str"])) {
-                return Ok((BoundaryType::String, ParamFlow::Borrow));
+                return Ok((ExternTypeExpr::String, ParamFlow::Borrow));
             }
             Err(syn::Error::new_spanned(
                 reference,
@@ -515,7 +437,7 @@ fn classify_path(
     path: &TypePath,
     position: Position,
     owner: Option<OwnerReturn<'_>>,
-) -> syn::Result<(BoundaryType, ParamFlow)> {
+) -> syn::Result<(ExternTypeExpr, ParamFlow)> {
     if path.qself.is_some() {
         return Err(syn::Error::new_spanned(
             path,
@@ -546,7 +468,7 @@ fn classify_path(
                 "callback wrappers are only supported in parameter position",
             ));
         }
-        return Ok((BoundaryType::Callback(callback), ParamFlow::Value));
+        return Ok((ExternTypeExpr::Callback(callback), ParamFlow::Value));
     }
     if let Some(inner) = mut_place_type_arg(path)? {
         if position != Position::Param {
@@ -560,19 +482,19 @@ fn classify_path(
         return Ok((ty, ParamFlow::MutBorrow));
     }
     if let Some(owner) = owner_name(path, owner) {
-        return Ok((BoundaryType::Named(owner), ParamFlow::Value));
+        return Ok((named_type_expr(&owner), ParamFlow::Value));
     }
     if path_is(path, &["bool"]) {
-        return Ok((BoundaryType::Bool, ParamFlow::Value));
+        return Ok((ExternTypeExpr::Bool, ParamFlow::Value));
     }
     if path_is(path, &["i64"]) {
-        return Ok((BoundaryType::Int, ParamFlow::Value));
+        return Ok((ExternTypeExpr::Int, ParamFlow::Value));
     }
     if path_is(path, &["f64"]) {
-        return Ok((BoundaryType::Float, ParamFlow::Value));
+        return Ok((ExternTypeExpr::Float, ParamFlow::Value));
     }
     if path_is(path, &["char"]) {
-        return Ok((BoundaryType::Char, ParamFlow::Value));
+        return Ok((ExternTypeExpr::Char, ParamFlow::Value));
     }
     if path_is(path, &["String"]) || path_is(path, &["std", "string", "String"]) {
         return Err(syn::Error::new_spanned(
@@ -581,7 +503,7 @@ fn classify_path(
         ));
     }
     if path_is(path, &["AnvString"]) || path_is(path, &["anvyx_runtime", "AnvString"]) {
-        return Ok((BoundaryType::String, ParamFlow::Value));
+        return Ok((ExternTypeExpr::String, ParamFlow::Value));
     }
     for rejected in [
         "f32", "usize", "isize", "i8", "i16", "i32", "u8", "u16", "u32", "u64",
@@ -594,9 +516,10 @@ fn classify_path(
         }
     }
     if let Some(inner) = one_type_arg(path, &[&["Option"], &["std", "option", "Option"]])? {
-        let (ty, flow) = classify_type_inner(inner, Position::WrapperElement, owner)?;
-        reject_wrapper_element(inner, &ty, flow)?;
-        return Ok((BoundaryType::Option(Box::new(ty)), ParamFlow::Value));
+        let nested = nested_position(position);
+        let (ty, flow) = classify_type_inner(inner, nested, owner)?;
+        reject_nested_element(inner, &ty, flow, nested)?;
+        return Ok((ExternTypeExpr::Option(Box::new(ty)), ParamFlow::Value));
     }
     if let Some((ok_ty, err_ty)) = result_type_args(path)? {
         if is_runtime_error(err_ty) {
@@ -605,12 +528,13 @@ fn classify_path(
                 "Result<T, RuntimeError> is a hidden runtime failure shape; use RuntimeResult<T> only as a return type",
             ));
         }
-        let (ok, ok_flow) = classify_type_inner(ok_ty, Position::WrapperElement, owner)?;
-        reject_wrapper_element(ok_ty, &ok, ok_flow)?;
-        let (err, err_flow) = classify_type_inner(err_ty, Position::WrapperElement, owner)?;
-        reject_wrapper_element(err_ty, &err, err_flow)?;
+        let nested = nested_position(position);
+        let (ok, ok_flow) = classify_type_inner(ok_ty, nested, owner)?;
+        reject_nested_element(ok_ty, &ok, ok_flow, nested)?;
+        let (err, err_flow) = classify_type_inner(err_ty, nested, owner)?;
+        reject_nested_element(err_ty, &err, err_flow, nested)?;
         return Ok((
-            BoundaryType::Result(Box::new(ok), Box::new(err)),
+            ExternTypeExpr::Result(Box::new(ok), Box::new(err)),
             ParamFlow::Value,
         ));
     }
@@ -642,7 +566,7 @@ fn classify_path(
         let inner = args[0];
         let (ty, flow) = classify_type_inner(inner, Position::WrapperElement, owner)?;
         reject_wrapper_element(inner, &ty, flow)?;
-        return Ok((BoundaryType::List(Box::new(ty)), ParamFlow::Value));
+        return Ok((ExternTypeExpr::List(Box::new(ty)), ParamFlow::Value));
     }
     if let Some(args) = runtime_cx_type_args(path, &[&["AnvMap"], &["anvyx_runtime", "AnvMap"]], 2)?
     {
@@ -651,14 +575,14 @@ fn classify_path(
         let (value, value_flow) = classify_type_inner(args[1], Position::WrapperElement, owner)?;
         reject_wrapper_element(args[1], &value, value_flow)?;
         return Ok((
-            BoundaryType::Map(Box::new(key), Box::new(value)),
+            ExternTypeExpr::Map(Box::new(key), Box::new(value)),
             ParamFlow::Value,
         ));
     }
     if let Some(args) =
         runtime_cx_type_args(path, &[&["AnvSlice"], &["anvyx_runtime", "AnvSlice"]], 1)?
     {
-        if position != Position::Param {
+        if !matches!(position, Position::Param | Position::NestedParam) {
             return Err(syn::Error::new_spanned(
                 path,
                 "AnvSlice is only supported in parameter position",
@@ -667,10 +591,10 @@ fn classify_path(
         let inner = args[0];
         let (ty, flow) = classify_type_inner(inner, Position::WrapperElement, owner)?;
         reject_wrapper_element(inner, &ty, flow)?;
-        return Ok((BoundaryType::Slice(Box::new(ty)), ParamFlow::Value));
+        return Ok((ExternTypeExpr::Slice(Box::new(ty)), ParamFlow::Value));
     }
     if let Some(resource) = anv_ref_type_arg_for_owner(path, owner)? {
-        return Ok((BoundaryType::Named(resource), ParamFlow::Value));
+        return Ok((named_type_expr(&resource), ParamFlow::Value));
     }
     if path.path.segments.len() == 1 {
         let segment = path.path.segments.first().expect("checked len");
@@ -688,7 +612,7 @@ fn classify_path(
         }
         if matches!(segment.arguments, PathArguments::None) {
             return Ok((
-                BoundaryType::Named(segment.ident.to_string()),
+                named_type_expr(&segment.ident.to_string()),
                 ParamFlow::Value,
             ));
         }
@@ -704,11 +628,11 @@ fn classify_path(
 }
 
 pub fn type_with_override(
-    inferred: &BoundaryType,
+    inferred: &ExternTypeExpr,
     override_ty: Option<&str>,
     span: proc_macro2::Span,
     mismatch: impl Into<String>,
-) -> syn::Result<BoundaryType> {
+) -> syn::Result<ExternTypeExpr> {
     let Some(override_ty) = override_ty else {
         return Ok(inferred.clone());
     };
@@ -716,7 +640,7 @@ pub fn type_with_override(
     if override_ty == *inferred
         || matches!(
             (inferred, &override_ty),
-            (BoundaryType::Named(_), BoundaryType::Named(_))
+            (ExternTypeExpr::Named { .. }, ExternTypeExpr::Named { .. })
         )
     {
         Ok(override_ty)
@@ -725,42 +649,30 @@ pub fn type_with_override(
     }
 }
 
-pub fn type_expr_tokens(ty: &BoundaryType) -> TokenStream {
-    type_expr_tokens_at(ty, &quote! { anvyx_runtime })
+pub fn type_expr_tokens(ty: &ExternTypeExpr) -> TokenStream {
+    extern_type_expr_tokens(ty)
 }
 
-pub fn named_type_expr_tokens(name: &str) -> TokenStream {
-    extern_type_expr_tokens(&named_type_expr(name), &quote! { anvyx_runtime })
-}
-
-pub fn externs_type_expr_tokens(ty: &BoundaryType) -> TokenStream {
-    type_expr_tokens_at(ty, &quote! { anvyx_externs })
-}
-
-fn type_expr_tokens_at(ty: &BoundaryType, root: &TokenStream) -> TokenStream {
-    extern_type_expr_tokens(&extern_type_expr(ty), root)
-}
-
-fn extern_type_expr_tokens(ty: &ExternTypeExpr, root: &TokenStream) -> TokenStream {
+fn extern_type_expr_tokens(ty: &ExternTypeExpr) -> TokenStream {
     match ty {
-        ExternTypeExpr::Void => quote! { #root::ExternTypeExpr::Void },
-        ExternTypeExpr::Unit => quote! { #root::ExternTypeExpr::Unit },
-        ExternTypeExpr::Bool => quote! { #root::ExternTypeExpr::Bool },
-        ExternTypeExpr::Int => quote! { #root::ExternTypeExpr::Int },
-        ExternTypeExpr::Float => quote! { #root::ExternTypeExpr::Float },
-        ExternTypeExpr::String => quote! { #root::ExternTypeExpr::String },
-        ExternTypeExpr::Char => quote! { #root::ExternTypeExpr::Char },
-        ExternTypeExpr::Any => quote! { #root::ExternTypeExpr::Any },
+        ExternTypeExpr::Void => quote! { anvyx_runtime::ExternTypeExpr::Void },
+        ExternTypeExpr::Unit => quote! { anvyx_runtime::ExternTypeExpr::Unit },
+        ExternTypeExpr::Bool => quote! { anvyx_runtime::ExternTypeExpr::Bool },
+        ExternTypeExpr::Int => quote! { anvyx_runtime::ExternTypeExpr::Int },
+        ExternTypeExpr::Float => quote! { anvyx_runtime::ExternTypeExpr::Float },
+        ExternTypeExpr::String => quote! { anvyx_runtime::ExternTypeExpr::String },
+        ExternTypeExpr::Char => quote! { anvyx_runtime::ExternTypeExpr::Char },
+        ExternTypeExpr::Any => quote! { anvyx_runtime::ExternTypeExpr::Any },
         ExternTypeExpr::Named { module, name, args } => {
             let module = if let Some(module) = module {
                 let segments = module.segments.iter();
-                quote! { Some(#root::ModulePath { segments: vec![#(#segments.to_string()),*] }) }
+                quote! { Some(anvyx_runtime::ModulePath { segments: vec![#(#segments.to_string()),*] }) }
             } else {
                 quote! { None }
             };
-            let args = args.iter().map(|arg| extern_type_expr_tokens(arg, root));
+            let args = args.iter().map(extern_type_expr_tokens);
             quote! {
-                #root::ExternTypeExpr::Named {
+                anvyx_runtime::ExternTypeExpr::Named {
                     module: #module,
                     name: #name.to_string(),
                     args: vec![#(#args),*],
@@ -768,84 +680,71 @@ fn extern_type_expr_tokens(ty: &ExternTypeExpr, root: &TokenStream) -> TokenStre
             }
         }
         ExternTypeExpr::Callback(callback) => {
-            let signature = callback_signature_tokens_at(callback, root);
-            quote! { #root::ExternTypeExpr::Callback(#signature) }
+            let signature = callback_signature_tokens(callback);
+            quote! { anvyx_runtime::ExternTypeExpr::Callback(#signature) }
         }
         ExternTypeExpr::Option(inner) => {
-            let inner = extern_type_expr_tokens(inner, root);
-            quote! { #root::ExternTypeExpr::Option(Box::new(#inner)) }
+            let inner = extern_type_expr_tokens(inner);
+            quote! { anvyx_runtime::ExternTypeExpr::Option(Box::new(#inner)) }
         }
         ExternTypeExpr::Result(ok, err) => {
-            let ok = extern_type_expr_tokens(ok, root);
-            let err = extern_type_expr_tokens(err, root);
-            quote! { #root::ExternTypeExpr::Result(Box::new(#ok), Box::new(#err)) }
+            let ok = extern_type_expr_tokens(ok);
+            let err = extern_type_expr_tokens(err);
+            quote! { anvyx_runtime::ExternTypeExpr::Result(Box::new(#ok), Box::new(#err)) }
         }
         ExternTypeExpr::Tuple(fields) => {
-            let fields = fields
-                .iter()
-                .map(|field| extern_type_expr_tokens(field, root));
-            quote! { #root::ExternTypeExpr::Tuple(vec![#(#fields),*]) }
+            let fields = fields.iter().map(extern_type_expr_tokens);
+            quote! { anvyx_runtime::ExternTypeExpr::Tuple(vec![#(#fields),*]) }
         }
         ExternTypeExpr::Array { elem, len } => {
-            let elem = extern_type_expr_tokens(elem, root);
-            quote! { #root::ExternTypeExpr::Array { elem: Box::new(#elem), len: #len } }
+            let elem = extern_type_expr_tokens(elem);
+            quote! { anvyx_runtime::ExternTypeExpr::Array { elem: Box::new(#elem), len: #len } }
         }
         ExternTypeExpr::List(inner) => {
-            let inner = extern_type_expr_tokens(inner, root);
-            quote! { #root::ExternTypeExpr::List(Box::new(#inner)) }
+            let inner = extern_type_expr_tokens(inner);
+            quote! { anvyx_runtime::ExternTypeExpr::List(Box::new(#inner)) }
         }
         ExternTypeExpr::Map(key, value) => {
-            let key = extern_type_expr_tokens(key, root);
-            let value = extern_type_expr_tokens(value, root);
-            quote! { #root::ExternTypeExpr::Map(Box::new(#key), Box::new(#value)) }
+            let key = extern_type_expr_tokens(key);
+            let value = extern_type_expr_tokens(value);
+            quote! { anvyx_runtime::ExternTypeExpr::Map(Box::new(#key), Box::new(#value)) }
         }
         ExternTypeExpr::Slice(inner) => {
-            let inner = extern_type_expr_tokens(inner, root);
-            quote! { #root::ExternTypeExpr::Slice(Box::new(#inner)) }
+            let inner = extern_type_expr_tokens(inner);
+            quote! { anvyx_runtime::ExternTypeExpr::Slice(Box::new(#inner)) }
         }
     }
 }
 
 fn callback_signature_tokens(callback: &ExternCallbackSignature) -> TokenStream {
-    callback_signature_tokens_at(callback, &quote! { anvyx_runtime })
-}
-
-fn callback_signature_tokens_at(
-    callback: &ExternCallbackSignature,
-    root: &TokenStream,
-) -> TokenStream {
     let params = callback.params.iter().map(|param| {
-        let ty = extern_type_expr_tokens(&param.ty, root);
-        let escape = callback_escape_tokens_at(param.escape, root);
+        let ty = extern_type_expr_tokens(&param.ty);
+        let escape = callback_escape_tokens(param.escape);
         quote! {
-            #root::ExternCallbackParam {
+            anvyx_runtime::ExternCallbackParam {
                 ty: #ty,
                 escape: #escape,
             }
         }
     });
-    let ret = extern_type_expr_tokens(&callback.ret, root);
-    let escape = callback_escape_tokens_at(callback.policy.escape, root);
+    let ret = extern_type_expr_tokens(&callback.ret);
+    let escape = callback_escape_tokens(callback.policy.escape);
     quote! {
-        #root::ExternCallbackSignature {
+        anvyx_runtime::ExternCallbackSignature {
             params: vec![#(#params),*],
             ret: Box::new(#ret),
-            policy: #root::CallbackPolicy {
+            policy: anvyx_runtime::CallbackPolicy {
                 escape: #escape,
-                thread: #root::CallbackThread::SameThread,
+                thread: anvyx_runtime::CallbackThread::SameThread,
             },
         }
     }
 }
 
 fn callback_escape_tokens(escape: CallbackEscape) -> TokenStream {
-    callback_escape_tokens_at(escape, &quote! { anvyx_runtime })
-}
-
-fn callback_escape_tokens_at(escape: CallbackEscape, root: &TokenStream) -> TokenStream {
     match escape {
-        CallbackEscape::NonEscaping => quote! { #root::CallbackEscape::NonEscaping },
-        CallbackEscape::Escaping => quote! { #root::CallbackEscape::Escaping },
+        CallbackEscape::NonEscaping => quote! { anvyx_runtime::CallbackEscape::NonEscaping },
+        CallbackEscape::Escaping => quote! { anvyx_runtime::CallbackEscape::Escaping },
     }
 }
 
@@ -858,140 +757,157 @@ pub fn flow_tokens(flow: ParamFlow) -> TokenStream {
 }
 
 pub fn param_escape_tokens(param: &BoundaryParam) -> TokenStream {
-    match &param.ty {
-        BoundaryType::Callback(callback) => callback_escape_tokens(callback.escape),
-        _ => callback_escape_tokens(CallbackEscape::NonEscaping),
+    let escape = match &param.ty {
+        ExternTypeExpr::Callback(callback) => callback.policy.escape,
+        _ => CallbackEscape::NonEscaping,
+    };
+    callback_escape_tokens(escape)
+}
+
+pub fn owned_named_param(name: String, ty: ExternTypeExpr) -> BoundaryParam {
+    BoundaryParam {
+        name,
+        ty,
+        flow: ParamFlow::Value,
+        abi: RustParamAdapter::OwnedNamed,
+        init_presence: false,
     }
 }
 
-pub fn param_abi_tokens(abi: &ParamAbi) -> TokenStream {
-    match abi {
-        ParamAbi::Value(ty) => {
-            let ty = type_expr_tokens(ty);
-            quote! { anvyx_runtime::RustParamAbi::Value(#ty) }
+pub fn init_return_matches(ret: &BoundaryReturn, export_name: &str) -> bool {
+    match (&ret.ty, &ret.abi, ret.fallible) {
+        (ExternTypeExpr::Named { name, .. }, RustReturnAdapter::OwnedNamed, _) => {
+            name == export_name
         }
-        ParamAbi::OwnedNamed(ty) => {
-            let ty = type_expr_tokens(ty);
-            quote! { anvyx_runtime::RustParamAbi::OwnedNamed(#ty) }
+        (ExternTypeExpr::Result(ok, _), RustReturnAdapter::Result(ok_abi, _), false) => {
+            matches!(ok.as_ref(), ExternTypeExpr::Named { name, .. } if name == export_name)
+                && matches!(ok_abi.as_ref(), RustReturnAdapter::OwnedNamed)
         }
-        ParamAbi::Borrow(ty) => {
-            let ty = type_expr_tokens(ty);
-            quote! { anvyx_runtime::RustParamAbi::Borrow(#ty) }
-        }
-        ParamAbi::MutPlace(ty) => {
-            let ty = type_expr_tokens(ty);
-            quote! { anvyx_runtime::RustParamAbi::MutPlace(#ty) }
-        }
-        ParamAbi::ScopedLambda(callback) => {
-            let callback = callback_signature_tokens(&extern_callback_signature(callback));
-            quote! { anvyx_runtime::RustParamAbi::ScopedLambda(#callback) }
-        }
-        ParamAbi::EscapingLambda(callback) => {
-            let callback = callback_signature_tokens(&extern_callback_signature(callback));
-            quote! { anvyx_runtime::RustParamAbi::EscapingLambda(#callback) }
-        }
-        ParamAbi::AnvCallback(callback) => {
-            let callback = callback_signature_tokens(&extern_callback_signature(callback));
-            quote! { anvyx_runtime::RustParamAbi::AnvCallback(#callback) }
-        }
-        ParamAbi::InitField(inner) => {
-            let inner = param_abi_tokens(inner);
-            quote! { anvyx_runtime::RustParamAbi::InitField(Box::new(#inner)) }
-        }
-        ParamAbi::Option(inner) => {
-            let inner = param_abi_tokens(inner);
-            quote! { anvyx_runtime::RustParamAbi::Option(Box::new(#inner)) }
-        }
-        ParamAbi::Result(ok, err) => {
-            let ok = param_abi_tokens(ok);
-            let err = param_abi_tokens(err);
-            quote! { anvyx_runtime::RustParamAbi::Result(Box::new(#ok), Box::new(#err)) }
-        }
-        ParamAbi::Slice(inner) => {
-            let inner = param_abi_tokens(inner);
-            quote! { anvyx_runtime::RustParamAbi::Slice(Box::new(#inner)) }
-        }
+        _ => false,
     }
 }
 
-pub fn return_abi_tokens(abi: &ReturnAbi) -> TokenStream {
-    match abi {
-        ReturnAbi::Void => quote! { anvyx_runtime::RustReturnAbi::Void },
-        ReturnAbi::Value(ty) => {
-            let ty = type_expr_tokens(ty);
-            quote! { anvyx_runtime::RustReturnAbi::Value(#ty) }
+pub fn receiver_abi_tokens(mutable: bool, place: bool) -> TokenStream {
+    if place {
+        quote! { anvyx_runtime::RustParamAdapter::MutPlace }
+    } else if mutable {
+        quote! { anvyx_runtime::RustParamAdapter::MutBorrow }
+    } else {
+        quote! { anvyx_runtime::RustParamAdapter::Borrow }
+    }
+}
+
+pub fn param_abi_tokens(adapter: &RustParamAdapter) -> TokenStream {
+    match adapter {
+        RustParamAdapter::Value => quote! { anvyx_runtime::RustParamAdapter::Value },
+        RustParamAdapter::OwnedNamed => quote! { anvyx_runtime::RustParamAdapter::OwnedNamed },
+        RustParamAdapter::Borrow => quote! { anvyx_runtime::RustParamAdapter::Borrow },
+        RustParamAdapter::MutBorrow => quote! { anvyx_runtime::RustParamAdapter::MutBorrow },
+        RustParamAdapter::MutPlace => quote! { anvyx_runtime::RustParamAdapter::MutPlace },
+        RustParamAdapter::ScopedLambda => quote! { anvyx_runtime::RustParamAdapter::ScopedLambda },
+        RustParamAdapter::EscapingLambda => {
+            quote! { anvyx_runtime::RustParamAdapter::EscapingLambda }
         }
-        ReturnAbi::OwnedNamed(ty) => {
-            let ty = type_expr_tokens(ty);
-            quote! { anvyx_runtime::RustReturnAbi::OwnedNamed(#ty) }
+        RustParamAdapter::AnvCallback => quote! { anvyx_runtime::RustParamAdapter::AnvCallback },
+        RustParamAdapter::InitField(inner) => {
+            abi_nested_tokens("RustParamAdapter", "InitField", &param_abi_tokens(inner))
         }
-        ReturnAbi::Option(inner) => {
-            let inner = return_abi_tokens(inner);
-            quote! { anvyx_runtime::RustReturnAbi::Option(Box::new(#inner)) }
+        RustParamAdapter::Option(inner) => {
+            abi_nested_tokens("RustParamAdapter", "Option", &param_abi_tokens(inner))
         }
-        ReturnAbi::Result(ok, err) => {
-            let ok = return_abi_tokens(ok);
-            let err = return_abi_tokens(err);
-            quote! { anvyx_runtime::RustReturnAbi::Result(Box::new(#ok), Box::new(#err)) }
+        RustParamAdapter::Result(ok, err) => abi_result_tokens(
+            "RustParamAdapter",
+            &param_abi_tokens(ok),
+            &param_abi_tokens(err),
+        ),
+        RustParamAdapter::Slice(inner) => {
+            abi_nested_tokens("RustParamAdapter", "Slice", &param_abi_tokens(inner))
         }
     }
 }
 
-pub fn param_abi(ty: &BoundaryType, flow: ParamFlow) -> ParamAbi {
+pub fn return_abi_tokens(adapter: &RustReturnAdapter) -> TokenStream {
+    match adapter {
+        RustReturnAdapter::Void => quote! { anvyx_runtime::RustReturnAdapter::Void },
+        RustReturnAdapter::Value => quote! { anvyx_runtime::RustReturnAdapter::Value },
+        RustReturnAdapter::OwnedNamed => quote! { anvyx_runtime::RustReturnAdapter::OwnedNamed },
+        RustReturnAdapter::Option(inner) => {
+            abi_nested_tokens("RustReturnAdapter", "Option", &return_abi_tokens(inner))
+        }
+        RustReturnAdapter::Result(ok, err) => abi_result_tokens(
+            "RustReturnAdapter",
+            &return_abi_tokens(ok),
+            &return_abi_tokens(err),
+        ),
+    }
+}
+
+fn abi_nested_tokens(root: &str, variant: &str, inner: &TokenStream) -> TokenStream {
+    let root = Ident::new(root, proc_macro2::Span::call_site());
+    let variant = Ident::new(variant, proc_macro2::Span::call_site());
+    quote! { anvyx_runtime::#root::#variant(Box::new(#inner)) }
+}
+
+fn abi_result_tokens(root: &str, ok: &TokenStream, err: &TokenStream) -> TokenStream {
+    let root = Ident::new(root, proc_macro2::Span::call_site());
+    quote! { anvyx_runtime::#root::Result(Box::new(#ok), Box::new(#err)) }
+}
+
+pub fn param_abi(ty: &ExternTypeExpr, flow: ParamFlow) -> RustParamAdapter {
     match flow {
-        ParamFlow::MutBorrow => ParamAbi::MutPlace(ty.clone()),
-        ParamFlow::Borrow => ParamAbi::Borrow(ty.clone()),
+        ParamFlow::MutBorrow => RustParamAdapter::MutPlace,
+        ParamFlow::Borrow => RustParamAdapter::Borrow,
         ParamFlow::Value => match ty {
-            BoundaryType::Option(inner) => {
-                ParamAbi::Option(Box::new(param_abi(inner, ParamFlow::Value)))
+            ExternTypeExpr::Option(inner) => {
+                RustParamAdapter::Option(Box::new(param_abi(inner, ParamFlow::Value)))
             }
-            BoundaryType::Result(ok, err) => ParamAbi::Result(
+            ExternTypeExpr::Result(ok, err) => RustParamAdapter::Result(
                 Box::new(param_abi(ok, ParamFlow::Value)),
                 Box::new(param_abi(err, ParamFlow::Value)),
             ),
-            BoundaryType::Callback(callback) => match callback.escape {
-                CallbackEscape::NonEscaping => ParamAbi::ScopedLambda(callback.clone()),
-                CallbackEscape::Escaping => ParamAbi::EscapingLambda(callback.clone()),
+            ExternTypeExpr::Callback(callback) => match callback.policy.escape {
+                CallbackEscape::NonEscaping => RustParamAdapter::ScopedLambda,
+                CallbackEscape::Escaping => RustParamAdapter::EscapingLambda,
             },
-            BoundaryType::Slice(inner) => {
-                ParamAbi::Slice(Box::new(param_abi(inner, ParamFlow::Value)))
+            ExternTypeExpr::Slice(inner) => {
+                RustParamAdapter::Slice(Box::new(param_abi(inner, ParamFlow::Value)))
             }
-            _ => ParamAbi::Value(ty.clone()),
+            _ => RustParamAdapter::Value,
         },
     }
 }
 
 fn param_abi_for_source(
     source: &Type,
-    ty: &BoundaryType,
+    ty: &ExternTypeExpr,
     flow: ParamFlow,
-) -> syn::Result<ParamAbi> {
+) -> syn::Result<RustParamAdapter> {
     if flow != ParamFlow::Value {
         return Ok(param_abi(ty, flow));
     }
     match ty {
-        BoundaryType::Callback(callback) if is_anv_callback_source(source) => {
-            Ok(ParamAbi::AnvCallback(callback.clone()))
+        ExternTypeExpr::Callback(_) if is_anv_callback_source(source) => {
+            Ok(RustParamAdapter::AnvCallback)
         }
-        BoundaryType::Named(_) if is_anv_ref_source(source)? => Ok(ParamAbi::Value(ty.clone())),
-        BoundaryType::Named(_) => Ok(ParamAbi::OwnedNamed(ty.clone())),
-        BoundaryType::Option(inner) => match option_type_arg(source)? {
-            Some(source_inner) => Ok(ParamAbi::Option(Box::new(param_abi_for_source(
+        ExternTypeExpr::Named { .. } if is_anv_ref_source(source)? => Ok(RustParamAdapter::Value),
+        ExternTypeExpr::Named { .. } => Ok(RustParamAdapter::OwnedNamed),
+        ExternTypeExpr::Option(inner) => match option_type_arg(source)? {
+            Some(source_inner) => Ok(RustParamAdapter::Option(Box::new(param_abi_for_source(
                 source_inner,
                 inner,
                 ParamFlow::Value,
             )?))),
             None => Ok(param_abi(ty, flow)),
         },
-        BoundaryType::Result(ok, err) => match result_args(source)? {
-            Some((source_ok, source_err)) => Ok(ParamAbi::Result(
+        ExternTypeExpr::Result(ok, err) => match result_args(source)? {
+            Some((source_ok, source_err)) => Ok(RustParamAdapter::Result(
                 Box::new(param_abi_for_source(source_ok, ok, ParamFlow::Value)?),
                 Box::new(param_abi_for_source(source_err, err, ParamFlow::Value)?),
             )),
             None => Ok(param_abi(ty, flow)),
         },
-        BoundaryType::Slice(inner) => match slice_type_arg(source)? {
-            Some(source_inner) => Ok(ParamAbi::Slice(Box::new(param_abi_for_source(
+        ExternTypeExpr::Slice(inner) => match slice_type_arg(source)? {
+            Some(source_inner) => Ok(RustParamAdapter::Slice(Box::new(param_abi_for_source(
                 source_inner,
                 inner,
                 ParamFlow::Value,
@@ -1002,63 +918,71 @@ fn param_abi_for_source(
     }
 }
 
-pub fn param_abi_for_override(original: &ParamAbi, ty: &BoundaryType, flow: ParamFlow) -> ParamAbi {
+pub fn param_abi_for_override(
+    original: &RustParamAdapter,
+    ty: &ExternTypeExpr,
+    flow: ParamFlow,
+) -> RustParamAdapter {
     match (original, ty) {
-        (ParamAbi::InitField(inner), _) => {
-            ParamAbi::InitField(Box::new(param_abi_for_override(inner, ty, flow)))
+        (RustParamAdapter::InitField(inner), _) => {
+            RustParamAdapter::InitField(Box::new(param_abi_for_override(inner, ty, flow)))
         }
         _ if flow != ParamFlow::Value => param_abi(ty, flow),
-        (ParamAbi::OwnedNamed(_), BoundaryType::Named(_)) => ParamAbi::OwnedNamed(ty.clone()),
-        (ParamAbi::Value(_), BoundaryType::Named(_)) => ParamAbi::Value(ty.clone()),
-        (ParamAbi::AnvCallback(_), BoundaryType::Callback(callback)) => {
-            ParamAbi::AnvCallback(callback.clone())
+        (RustParamAdapter::OwnedNamed, ExternTypeExpr::Named { .. }) => {
+            RustParamAdapter::OwnedNamed
         }
-        (ParamAbi::Option(inner), BoundaryType::Option(ty)) => ParamAbi::Option(Box::new(
-            param_abi_for_override(inner, ty, ParamFlow::Value),
-        )),
-        (ParamAbi::Result(ok, err), BoundaryType::Result(ok_ty, err_ty)) => ParamAbi::Result(
-            Box::new(param_abi_for_override(ok, ok_ty, ParamFlow::Value)),
-            Box::new(param_abi_for_override(err, err_ty, ParamFlow::Value)),
+        (RustParamAdapter::Value, ExternTypeExpr::Named { .. }) => RustParamAdapter::Value,
+        (RustParamAdapter::AnvCallback, ExternTypeExpr::Callback(_)) => {
+            RustParamAdapter::AnvCallback
+        }
+        (RustParamAdapter::Option(inner), ExternTypeExpr::Option(ty)) => RustParamAdapter::Option(
+            Box::new(param_abi_for_override(inner, ty, ParamFlow::Value)),
         ),
-        (ParamAbi::Slice(inner), BoundaryType::Slice(ty)) => ParamAbi::Slice(Box::new(
-            param_abi_for_override(inner, ty, ParamFlow::Value),
-        )),
+        (RustParamAdapter::Result(ok, err), ExternTypeExpr::Result(ok_ty, err_ty)) => {
+            RustParamAdapter::Result(
+                Box::new(param_abi_for_override(ok, ok_ty, ParamFlow::Value)),
+                Box::new(param_abi_for_override(err, err_ty, ParamFlow::Value)),
+            )
+        }
+        (RustParamAdapter::Slice(inner), ExternTypeExpr::Slice(ty)) => RustParamAdapter::Slice(
+            Box::new(param_abi_for_override(inner, ty, ParamFlow::Value)),
+        ),
         _ => param_abi(ty, flow),
     }
 }
 
-pub fn return_abi(ty: &BoundaryType) -> ReturnAbi {
+pub fn return_abi(ty: &ExternTypeExpr) -> RustReturnAdapter {
     match ty {
-        BoundaryType::Void => ReturnAbi::Void,
-        BoundaryType::Option(inner) => ReturnAbi::Option(Box::new(return_abi(inner))),
-        BoundaryType::Result(ok, err) => {
-            ReturnAbi::Result(Box::new(return_abi(ok)), Box::new(return_abi(err)))
+        ExternTypeExpr::Void => RustReturnAdapter::Void,
+        ExternTypeExpr::Option(inner) => RustReturnAdapter::Option(Box::new(return_abi(inner))),
+        ExternTypeExpr::Result(ok, err) => {
+            RustReturnAdapter::Result(Box::new(return_abi(ok)), Box::new(return_abi(err)))
         }
-        BoundaryType::Callback(_) | BoundaryType::Slice(_) => {
+        ExternTypeExpr::Callback(_) | ExternTypeExpr::Slice(_) => {
             unreachable!("callbacks and slices are rejected in return position")
         }
-        _ => ReturnAbi::Value(ty.clone()),
+        _ => RustReturnAdapter::Value,
     }
 }
 
-fn return_abi_for_source(source: &Type, ty: &BoundaryType) -> syn::Result<ReturnAbi> {
+fn return_abi_for_source(source: &Type, ty: &ExternTypeExpr) -> syn::Result<RustReturnAdapter> {
     match ty {
-        BoundaryType::Named(_) if is_anv_ref_source(source)? => Ok(ReturnAbi::Value(ty.clone())),
-        BoundaryType::Named(_) => Ok(ReturnAbi::OwnedNamed(ty.clone())),
-        BoundaryType::Option(inner) => {
+        ExternTypeExpr::Named { .. } if is_anv_ref_source(source)? => Ok(RustReturnAdapter::Value),
+        ExternTypeExpr::Named { .. } => Ok(RustReturnAdapter::OwnedNamed),
+        ExternTypeExpr::Option(inner) => {
             let Some(source_inner) = option_type_arg(source)? else {
                 return Ok(return_abi(ty));
             };
-            Ok(ReturnAbi::Option(Box::new(return_abi_for_source(
+            Ok(RustReturnAdapter::Option(Box::new(return_abi_for_source(
                 source_inner,
                 inner,
             )?)))
         }
-        BoundaryType::Result(ok, err) => {
+        ExternTypeExpr::Result(ok, err) => {
             let Some((source_ok, source_err)) = result_args(source)? else {
                 return Ok(return_abi(ty));
             };
-            Ok(ReturnAbi::Result(
+            Ok(RustReturnAdapter::Result(
                 Box::new(return_abi_for_source(source_ok, ok)?),
                 Box::new(return_abi_for_source(source_err, err)?),
             ))
@@ -1067,11 +991,16 @@ fn return_abi_for_source(source: &Type, ty: &BoundaryType) -> syn::Result<Return
     }
 }
 
-pub fn return_abi_for_override(original: &ReturnAbi, ty: &BoundaryType) -> ReturnAbi {
+pub fn return_abi_for_override(
+    original: &RustReturnAdapter,
+    ty: &ExternTypeExpr,
+) -> RustReturnAdapter {
     match (original, ty) {
-        (ReturnAbi::OwnedNamed(_), BoundaryType::Named(_)) => ReturnAbi::OwnedNamed(ty.clone()),
-        (ReturnAbi::Option(_), BoundaryType::Option(_))
-        | (ReturnAbi::Result(_, _), BoundaryType::Result(_, _)) => original.clone(),
+        (RustReturnAdapter::OwnedNamed, ExternTypeExpr::Named { .. }) => {
+            RustReturnAdapter::OwnedNamed
+        }
+        (RustReturnAdapter::Option(_), ExternTypeExpr::Option(_))
+        | (RustReturnAdapter::Result(_, _), ExternTypeExpr::Result(_, _)) => original.clone(),
         _ => return_abi(ty),
     }
 }
@@ -1093,10 +1022,7 @@ fn owner_name(path: &TypePath, owner: Option<OwnerReturn<'_>>) -> Option<String>
 }
 
 fn is_anv_callback_source(source: &Type) -> bool {
-    let Type::Path(path) = source else {
-        return false;
-    };
-    path_is(path, &["AnvCallback"]) || path_is(path, &["anvyx_runtime", "AnvCallback"])
+    matches!(source, Type::Path(path) if path_is(path, &["AnvCallback"]) || path_is(path, &["anvyx_runtime", "AnvCallback"]))
 }
 
 fn is_anv_ref_source(source: &Type) -> syn::Result<bool> {
@@ -1106,27 +1032,22 @@ fn is_anv_ref_source(source: &Type) -> syn::Result<bool> {
     Ok(anv_ref_type_arg(path)?.is_some())
 }
 
-pub fn conversion_tokens(conversion: BoundaryConversion) -> TokenStream {
-    match conversion {
-        BoundaryConversion::Direct => quote! { anvyx_runtime::RustAbiSupport::Direct },
-        BoundaryConversion::NeedsWrapper => {
-            quote! { anvyx_runtime::RustAbiSupport::NeedsWrapperConversion }
-        }
-        BoundaryConversion::Unsupported => quote! { anvyx_runtime::RustAbiSupport::Unsupported },
-    }
-}
-
 pub fn has_callback_wrapper(params: &[BoundaryParam]) -> bool {
-    params
-        .iter()
-        .any(|param| matches!(param.ty, BoundaryType::Callback(_)))
+    params.iter().any(|param| {
+        matches!(
+            param.abi,
+            RustParamAdapter::ScopedLambda
+                | RustParamAdapter::EscapingLambda
+                | RustParamAdapter::AnvCallback
+        )
+    })
 }
 
 pub fn callback_wrapper_requires_ctxless(params: &[BoundaryParam]) -> bool {
     params.iter().any(|param| {
         matches!(
             param.abi,
-            ParamAbi::ScopedLambda(_) | ParamAbi::EscapingLambda(_)
+            RustParamAdapter::ScopedLambda | RustParamAdapter::EscapingLambda
         )
     })
 }
@@ -1143,7 +1064,7 @@ pub fn validate_callback_wrapper_precheck(
     if has_receiver
         && params
             .iter()
-            .any(|param| matches!(param.abi, ParamAbi::ScopedLambda(_)))
+            .any(|param| matches!(param.abi, RustParamAdapter::ScopedLambda))
     {
         return Err(syn::Error::new_spanned(
             error_target,
@@ -1159,82 +1080,23 @@ pub fn validate_callback_wrapper_precheck(
     Ok(true)
 }
 
-pub fn merge_conversions(
-    items: impl IntoIterator<Item = BoundaryConversion>,
-) -> BoundaryConversion {
-    items
-        .into_iter()
-        .fold(BoundaryConversion::Direct, |current, item| {
-            match (current, item) {
-                (BoundaryConversion::Unsupported, _) | (_, BoundaryConversion::Unsupported) => {
-                    BoundaryConversion::Unsupported
-                }
-                (BoundaryConversion::NeedsWrapper, _) | (_, BoundaryConversion::NeedsWrapper) => {
-                    BoundaryConversion::NeedsWrapper
-                }
-                (BoundaryConversion::Direct, BoundaryConversion::Direct) => {
-                    BoundaryConversion::Direct
-                }
-            }
-        })
-}
-
-pub fn signature_conversion(params: &[BoundaryParam], ret: &BoundaryReturn) -> BoundaryConversion {
-    merge_conversions(
-        params
-            .iter()
-            .map(|param| param.conversion)
-            .chain(std::iter::once(ret.conversion)),
-    )
-}
-
-fn mut_place_macro_payload_supported(ty: &BoundaryType) -> bool {
+fn mut_place_macro_payload_supported(ty: &ExternTypeExpr) -> bool {
     match ty {
-        BoundaryType::Bool | BoundaryType::Int | BoundaryType::Float | BoundaryType::Char => true,
-        BoundaryType::Option(inner) => mut_place_macro_payload_supported(inner),
-        BoundaryType::Void
-        | BoundaryType::Unit
-        | BoundaryType::String
-        | BoundaryType::Named(_)
-        | BoundaryType::Callback(_)
-        | BoundaryType::Result(_, _)
-        | BoundaryType::Tuple(_)
-        | BoundaryType::Array { .. }
-        | BoundaryType::List(_)
-        | BoundaryType::Map(_, _)
-        | BoundaryType::Slice(_) => false,
+        ExternTypeExpr::Bool
+        | ExternTypeExpr::Int
+        | ExternTypeExpr::Float
+        | ExternTypeExpr::Char => true,
+        ExternTypeExpr::Option(inner) => mut_place_macro_payload_supported(inner),
+        _ => false,
     }
-}
-
-fn param_conversion(ty: &BoundaryType, flow: ParamFlow) -> BoundaryConversion {
-    if flow == ParamFlow::MutBorrow {
-        return BoundaryConversion::Direct;
-    }
-    match ty {
-        BoundaryType::Callback(_) => BoundaryConversion::NeedsWrapper,
-        _ if abi_supported_at(ty, AbiPosition::ParamValue) => BoundaryConversion::Direct,
-        _ => BoundaryConversion::Unsupported,
-    }
-}
-
-pub fn return_conversion_for_type(ty: &BoundaryType) -> BoundaryConversion {
-    match ty {
-        BoundaryType::Callback(_) | BoundaryType::Slice(_) => BoundaryConversion::Unsupported,
-        _ if abi_supported_at(ty, AbiPosition::Return) => BoundaryConversion::Direct,
-        _ => BoundaryConversion::Unsupported,
-    }
-}
-
-fn abi_supported_at(ty: &BoundaryType, position: AbiPosition) -> bool {
-    extern_type_expr(ty).classify_abi(position).is_ok()
 }
 
 pub(crate) fn reject_wrapper_element(
     ty: &Type,
-    classified: &BoundaryType,
+    classified: &ExternTypeExpr,
     flow: ParamFlow,
 ) -> syn::Result<()> {
-    if matches!(classified, BoundaryType::Void | BoundaryType::Slice(_)) {
+    if matches!(classified, ExternTypeExpr::Void | ExternTypeExpr::Slice(_)) {
         return Err(syn::Error::new_spanned(
             ty,
             "unsupported wrapper element type",
@@ -1249,9 +1111,29 @@ pub(crate) fn reject_wrapper_element(
     Ok(())
 }
 
+fn nested_position(position: Position) -> Position {
+    match position {
+        Position::Param | Position::NestedParam => Position::NestedParam,
+        Position::Return | Position::WrapperElement => Position::WrapperElement,
+    }
+}
+
+fn reject_nested_element(
+    ty: &Type,
+    classified: &ExternTypeExpr,
+    flow: ParamFlow,
+    position: Position,
+) -> syn::Result<()> {
+    if position == Position::NestedParam && matches!(classified, ExternTypeExpr::Slice(_)) {
+        return Ok(());
+    }
+    reject_wrapper_element(ty, classified, flow)
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Position {
     Param,
+    NestedParam,
     Return,
     WrapperElement,
 }
@@ -1302,7 +1184,7 @@ fn path_is(path: &TypePath, segments: &[&str]) -> bool {
             .all(|(actual, expected)| actual.ident == expected)
 }
 
-fn callback_wrapper_type(path: &TypePath) -> syn::Result<Option<BoundaryCallback>> {
+fn callback_wrapper_type(path: &TypePath) -> syn::Result<Option<ExternCallbackSignature>> {
     let escape =
         if path_is(path, &["ScopedLambda"]) || path_is(path, &["anvyx_runtime", "ScopedLambda"]) {
             CallbackEscape::NonEscaping
@@ -1397,19 +1279,22 @@ fn callback_wrapper_type(path: &TypePath) -> syn::Result<Option<BoundaryCallback
         ));
     };
     let (mut ret, flow) = classify_type(ret_ty, Position::WrapperElement)?;
-    if ret == BoundaryType::Unit {
-        ret = BoundaryType::Void;
+    if ret == ExternTypeExpr::Unit {
+        ret = ExternTypeExpr::Void;
     }
-    if flow != ParamFlow::Value || !callback_return_supported(&ret) {
+    if flow != ParamFlow::Value || !ret.callback_wrapper_return_supported() {
         return Err(syn::Error::new_spanned(
             ret_ty,
             "unsupported callback wrapper return type",
         ));
     }
-    Ok(Some(BoundaryCallback {
+    Ok(Some(ExternCallbackSignature {
         params,
         ret: Box::new(ret),
-        escape,
+        policy: CallbackPolicy {
+            escape,
+            thread: CallbackThread::SameThread,
+        },
     }))
 }
 
@@ -1422,7 +1307,10 @@ fn callback_wrapper_signature_error(escape: CallbackEscape) -> &'static str {
     }
 }
 
-fn callback_wrapper_params(ty: &Type, escape: CallbackEscape) -> syn::Result<Vec<BoundaryType>> {
+fn callback_wrapper_params(
+    ty: &Type,
+    escape: CallbackEscape,
+) -> syn::Result<Vec<ExternCallbackParam>> {
     let label = callback_wrapper_label(escape);
     let Type::Tuple(tuple) = ty else {
         return Err(syn::Error::new_spanned(
@@ -1439,13 +1327,16 @@ fn callback_wrapper_params(ty: &Type, escape: CallbackEscape) -> syn::Result<Vec
         .map(|arg| {
             let (ty, flow) = classify_type(arg, Position::WrapperElement)?;
             reject_wrapper_element(arg, &ty, flow)?;
-            if !callback_param_supported(&ty) {
+            if !ty.callback_wrapper_param_supported() {
                 return Err(syn::Error::new_spanned(
                     arg,
                     format!("unsupported {label} parameter type"),
                 ));
             }
-            Ok(ty)
+            Ok(ExternCallbackParam {
+                ty,
+                escape: CallbackEscape::NonEscaping,
+            })
         })
         .collect()
 }
@@ -1464,181 +1355,12 @@ fn callback_wrapper_label(escape: CallbackEscape) -> &'static str {
     }
 }
 
-fn callback_param_supported(ty: &BoundaryType) -> bool {
-    extern_type_expr(ty).callback_wrapper_param_supported()
-}
-
-fn callback_return_supported(ty: &BoundaryType) -> bool {
-    extern_type_expr(ty).callback_wrapper_return_supported()
-}
-
-fn extern_callback_signature(callback: &BoundaryCallback) -> ExternCallbackSignature {
-    ExternCallbackSignature {
-        params: callback
-            .params
-            .iter()
-            .map(|ty| ExternCallbackParam {
-                ty: extern_type_expr(ty),
-                escape: CallbackEscape::NonEscaping,
-            })
-            .collect(),
-        ret: Box::new(extern_type_expr(&callback.ret)),
-        policy: CallbackPolicy {
-            escape: callback.escape,
-            thread: CallbackThread::SameThread,
-        },
-    }
-}
-
 fn named_type_expr(name: &str) -> ExternTypeExpr {
     ExternTypeExpr::Named {
         module: None,
         name: name.to_string(),
         args: vec![],
     }
-}
-
-fn extern_type_expr(ty: &BoundaryType) -> ExternTypeExpr {
-    match ty {
-        BoundaryType::Void => ExternTypeExpr::Void,
-        BoundaryType::Unit => ExternTypeExpr::Unit,
-        BoundaryType::Bool => ExternTypeExpr::Bool,
-        BoundaryType::Int => ExternTypeExpr::Int,
-        BoundaryType::Float => ExternTypeExpr::Float,
-        BoundaryType::String => ExternTypeExpr::String,
-        BoundaryType::Char => ExternTypeExpr::Char,
-        BoundaryType::Named(name) => named_type_expr(name),
-        BoundaryType::Callback(callback) => {
-            ExternTypeExpr::Callback(extern_callback_signature(callback))
-        }
-        BoundaryType::Option(inner) => ExternTypeExpr::Option(Box::new(extern_type_expr(inner))),
-        BoundaryType::Result(ok, err) => ExternTypeExpr::Result(
-            Box::new(extern_type_expr(ok)),
-            Box::new(extern_type_expr(err)),
-        ),
-        BoundaryType::Tuple(fields) => {
-            ExternTypeExpr::Tuple(fields.iter().map(extern_type_expr).collect())
-        }
-        BoundaryType::Array { elem, len } => ExternTypeExpr::Array {
-            elem: Box::new(extern_type_expr(elem)),
-            len: *len,
-        },
-        BoundaryType::List(inner) => ExternTypeExpr::List(Box::new(extern_type_expr(inner))),
-        BoundaryType::Map(key, value) => ExternTypeExpr::Map(
-            Box::new(extern_type_expr(key)),
-            Box::new(extern_type_expr(value)),
-        ),
-        BoundaryType::Slice(inner) => ExternTypeExpr::Slice(Box::new(extern_type_expr(inner))),
-    }
-}
-
-pub fn parse_descriptor_type_expr(
-    input: ParseStream,
-    allow_callback: bool,
-) -> syn::Result<BoundaryType> {
-    let mut ty = if input.peek(Token![fn]) {
-        if !allow_callback {
-            return Err(syn::Error::new(
-                input.span(),
-                "callbacks are only supported in top-level parameter position",
-            ));
-        }
-        parse_descriptor_callback(input)?
-    } else if input.peek(syn::token::Bracket) {
-        let content;
-        bracketed!(content in input);
-        let inner = parse_descriptor_type_expr(&content, false)?;
-        if !content.is_empty() {
-            return Err(syn::Error::new(
-                content.span(),
-                "unsupported descriptor type",
-            ));
-        }
-        BoundaryType::List(Box::new(inner))
-    } else if input.peek(syn::token::Paren) {
-        let content;
-        syn::parenthesized!(content in input);
-        if !content.is_empty() {
-            return Err(syn::Error::new(
-                content.span(),
-                "unsupported descriptor type",
-            ));
-        }
-        BoundaryType::Unit
-    } else {
-        let ident: Ident = input.parse()?;
-        match ident.to_string().as_str() {
-            "void" => BoundaryType::Void,
-            "bool" => BoundaryType::Bool,
-            "int" => BoundaryType::Int,
-            "float" => BoundaryType::Float,
-            "string" => BoundaryType::String,
-            "char" => BoundaryType::Char,
-            _ => {
-                return Err(syn::Error::new_spanned(
-                    ident,
-                    "unsupported descriptor type",
-                ));
-            }
-        }
-    };
-    if input.peek(Token![?]) {
-        input.parse::<Token![?]>()?;
-        if matches!(ty, BoundaryType::Callback(_)) {
-            return Err(syn::Error::new(
-                input.span(),
-                "callbacks cannot be optional",
-            ));
-        }
-        ty = BoundaryType::Option(Box::new(ty));
-    }
-    Ok(ty)
-}
-
-fn parse_descriptor_callback(input: ParseStream) -> syn::Result<BoundaryType> {
-    input.parse::<Token![fn]>()?;
-    let content;
-    syn::parenthesized!(content in input);
-    let mut params = vec![];
-    while !content.is_empty() {
-        let ty = parse_descriptor_type_expr(&content, false)?;
-        if !callback_param_supported(&ty) {
-            return Err(syn::Error::new(
-                content.span(),
-                "unsupported callback parameter type",
-            ));
-        }
-        params.push(ty);
-        if content.is_empty() {
-            break;
-        }
-        content.parse::<Token![,]>()?;
-    }
-    if params.len() > CALLBACK_WRAPPER_MAX_ARITY {
-        return Err(callback_arity_error(input.span(), "callback"));
-    }
-    let ret = if input.peek(Token![->]) {
-        input.parse::<Token![->]>()?;
-        parse_descriptor_type_expr(input, false)?
-    } else {
-        BoundaryType::Void
-    };
-    let ret = if ret == BoundaryType::Unit {
-        BoundaryType::Void
-    } else {
-        ret
-    };
-    if !callback_return_supported(&ret) {
-        return Err(syn::Error::new(
-            input.span(),
-            "unsupported callback return type",
-        ));
-    }
-    Ok(BoundaryType::Callback(BoundaryCallback {
-        params,
-        ret: Box::new(ret),
-        escape: CallbackEscape::NonEscaping,
-    }))
 }
 
 fn anv_ref_type_arg_for_owner(
@@ -1929,7 +1651,7 @@ fn runtime_cx_type_args<'a>(
     .map(Some)
 }
 
-pub fn parse_type_expr(text: &str) -> syn::Result<BoundaryType> {
+pub fn parse_type_expr(text: &str) -> syn::Result<ExternTypeExpr> {
     let text = text.trim();
     if text.starts_with("fn") {
         return parse_descriptor_type_text(text, true);
@@ -1941,12 +1663,12 @@ pub fn parse_type_expr(text: &str) -> syn::Result<BoundaryType> {
         .strip_prefix("Option<")
         .and_then(|rest| rest.strip_suffix('>'))
     {
-        return Ok(BoundaryType::Option(Box::new(parse_wrapper_override(
+        return Ok(ExternTypeExpr::Option(Box::new(parse_wrapper_override(
             inner,
         )?)));
     }
     if let Some(inner) = text.strip_suffix('?') {
-        return Ok(BoundaryType::Option(Box::new(parse_wrapper_override(
+        return Ok(ExternTypeExpr::Option(Box::new(parse_wrapper_override(
             inner,
         )?)));
     }
@@ -1954,12 +1676,14 @@ pub fn parse_type_expr(text: &str) -> syn::Result<BoundaryType> {
         .strip_prefix('[')
         .and_then(|rest| rest.strip_suffix(']'))
     {
-        return Ok(BoundaryType::List(Box::new(parse_wrapper_override(inner)?)));
+        return Ok(ExternTypeExpr::List(Box::new(parse_wrapper_override(
+            inner,
+        )?)));
     }
     if let Ok(ident) = syn::parse_str::<Ident>(text)
         && !reserved_named_boundary_type(&ident)
     {
-        return Ok(BoundaryType::Named(ident.to_string()));
+        return Ok(named_type_expr(&ident.to_string()));
     }
     Err(syn::Error::new(
         proc_macro2::Span::call_site(),
@@ -1967,9 +1691,9 @@ pub fn parse_type_expr(text: &str) -> syn::Result<BoundaryType> {
     ))
 }
 
-fn parse_wrapper_override(text: &str) -> syn::Result<BoundaryType> {
+fn parse_wrapper_override(text: &str) -> syn::Result<ExternTypeExpr> {
     let ty = parse_type_expr(text)?;
-    if matches!(ty, BoundaryType::Callback(_)) {
+    if matches!(ty, ExternTypeExpr::Callback(_)) {
         return Err(syn::Error::new(
             proc_macro2::Span::call_site(),
             "callbacks are only supported in top-level parameter position",
@@ -1978,7 +1702,7 @@ fn parse_wrapper_override(text: &str) -> syn::Result<BoundaryType> {
     Ok(ty)
 }
 
-fn parse_descriptor_type_text(text: &str, allow_callback: bool) -> syn::Result<BoundaryType> {
+fn parse_descriptor_type_text(text: &str, allow_callback: bool) -> syn::Result<ExternTypeExpr> {
     (|input: ParseStream| {
         let ty = parse_descriptor_type_expr(input, allow_callback)?;
         if !input.is_empty() {
@@ -1990,6 +1714,121 @@ fn parse_descriptor_type_text(text: &str, allow_callback: bool) -> syn::Result<B
         Ok(ty)
     })
     .parse_str(text)
+}
+
+fn parse_descriptor_type_expr(
+    input: ParseStream,
+    allow_callback: bool,
+) -> syn::Result<ExternTypeExpr> {
+    let mut ty = if input.peek(Token![fn]) {
+        if !allow_callback {
+            return Err(syn::Error::new(
+                input.span(),
+                "callbacks are only supported in top-level parameter position",
+            ));
+        }
+        parse_descriptor_callback(input)?
+    } else if input.peek(syn::token::Bracket) {
+        let content;
+        bracketed!(content in input);
+        let inner = parse_descriptor_type_expr(&content, false)?;
+        if !content.is_empty() {
+            return Err(syn::Error::new(
+                content.span(),
+                "unsupported descriptor type",
+            ));
+        }
+        ExternTypeExpr::List(Box::new(inner))
+    } else if input.peek(syn::token::Paren) {
+        let content;
+        syn::parenthesized!(content in input);
+        if !content.is_empty() {
+            return Err(syn::Error::new(
+                content.span(),
+                "unsupported descriptor type",
+            ));
+        }
+        ExternTypeExpr::Unit
+    } else {
+        let ident: Ident = input.parse()?;
+        match ident.to_string().as_str() {
+            "void" => ExternTypeExpr::Void,
+            "bool" => ExternTypeExpr::Bool,
+            "int" => ExternTypeExpr::Int,
+            "float" => ExternTypeExpr::Float,
+            "string" => ExternTypeExpr::String,
+            "char" => ExternTypeExpr::Char,
+            _ => {
+                return Err(syn::Error::new_spanned(
+                    ident,
+                    "unsupported descriptor type",
+                ));
+            }
+        }
+    };
+    if input.peek(Token![?]) {
+        input.parse::<Token![?]>()?;
+        if matches!(ty, ExternTypeExpr::Callback(_)) {
+            return Err(syn::Error::new(
+                input.span(),
+                "callbacks cannot be optional",
+            ));
+        }
+        ty = ExternTypeExpr::Option(Box::new(ty));
+    }
+    Ok(ty)
+}
+
+fn parse_descriptor_callback(input: ParseStream) -> syn::Result<ExternTypeExpr> {
+    input.parse::<Token![fn]>()?;
+    let content;
+    syn::parenthesized!(content in input);
+    let mut params = vec![];
+    while !content.is_empty() {
+        let ty = parse_descriptor_type_expr(&content, false)?;
+        if !ty.callback_wrapper_param_supported() {
+            return Err(syn::Error::new(
+                content.span(),
+                "unsupported callback parameter type",
+            ));
+        }
+        params.push(ExternCallbackParam {
+            ty,
+            escape: CallbackEscape::NonEscaping,
+        });
+        if content.is_empty() {
+            break;
+        }
+        content.parse::<Token![,]>()?;
+    }
+    if params.len() > CALLBACK_WRAPPER_MAX_ARITY {
+        return Err(callback_arity_error(input.span(), "callback"));
+    }
+    let ret = if input.peek(Token![->]) {
+        input.parse::<Token![->]>()?;
+        parse_descriptor_type_expr(input, false)?
+    } else {
+        ExternTypeExpr::Void
+    };
+    let ret = if ret == ExternTypeExpr::Unit {
+        ExternTypeExpr::Void
+    } else {
+        ret
+    };
+    if !ret.callback_wrapper_return_supported() {
+        return Err(syn::Error::new(
+            input.span(),
+            "unsupported callback return type",
+        ));
+    }
+    Ok(ExternTypeExpr::Callback(ExternCallbackSignature {
+        params,
+        ret: Box::new(ret),
+        policy: CallbackPolicy {
+            escape: CallbackEscape::NonEscaping,
+            thread: CallbackThread::SameThread,
+        },
+    }))
 }
 
 pub(crate) fn is_runtime_error(ty: &Type) -> bool {

@@ -24,6 +24,7 @@ use std::{
     fmt,
 };
 
+use anvyx_externs::ProviderCatalog;
 use anvyx_frontend::{
     air::{
         self, AggregateCtor, CallArg, Callee, ConstId, ConstValue, ExternId, FieldId, FunctionId,
@@ -35,7 +36,6 @@ use anvyx_frontend::{
     diagnostic::Diagnostic,
     span::SourceSpan,
 };
-use anvyx_runtime::RustProviderSupport;
 
 use self::{
     place_access::{
@@ -99,14 +99,12 @@ impl RustSource {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RustPlanConfig {
     pub symbol_prefix: String,
-    pub native_providers: Vec<RustProviderSupport>,
 }
 
 impl Default for RustPlanConfig {
     fn default() -> Self {
         Self {
             symbol_prefix: "anv".into(),
-            native_providers: vec![],
         }
     }
 }
@@ -118,13 +116,18 @@ struct RirPlan {
 pub fn generate(
     program: &VerifiedProgram<'_>,
     config: RustPlanConfig,
+    catalog: &ProviderCatalog,
 ) -> Result<RustSource, RustPlanError> {
-    let plan = plan(program, config)?;
+    let plan = plan(program, config, catalog)?;
     Ok(emit::emit(&plan))
 }
 
-fn plan(program: &VerifiedProgram<'_>, config: RustPlanConfig) -> Result<RirPlan, RustPlanError> {
-    let mut cx = PlanCx::new(program.program(), config);
+fn plan(
+    program: &VerifiedProgram<'_>,
+    config: RustPlanConfig,
+    catalog: &ProviderCatalog,
+) -> Result<RirPlan, RustPlanError> {
+    let mut cx = PlanCx::new(program.program(), config, catalog);
     let mut rir = cx
         .plan()
         .map_err(|gaps| RustPlanError::TargetGaps(RustTargetGaps(gaps)))?;
@@ -138,6 +141,20 @@ fn plan(program: &VerifiedProgram<'_>, config: RustPlanConfig) -> Result<RirPlan
 pub fn rust_generation_failure_summary(count: usize) -> String {
     let noun = if count == 1 { "error" } else { "errors" };
     format!("Rust generation failed with {count} {noun}")
+}
+
+fn native_type_gap(error: &anvyx_externs::ProviderCatalogError) -> RustTargetGapKind {
+    match error {
+        anvyx_externs::ProviderCatalogError::MissingProvider
+        | anvyx_externs::ProviderCatalogError::DescriptorOnly => {
+            RustTargetGapKind::MissingExternSupport
+        }
+        anvyx_externs::ProviderCatalogError::MissingType => {
+            RustTargetGapKind::UnsupportedExternType
+        }
+        anvyx_externs::ProviderCatalogError::MissingBinding => unreachable!(),
+        _ => unreachable!("catalog construction errors cannot escape lookup"),
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -360,6 +377,7 @@ impl Error for RustTargetGap {}
 
 struct PlanCx<'a> {
     air: &'a air::Program,
+    catalog: &'a ProviderCatalog,
     classes: TypePassClasses,
     config: RustPlanConfig,
     type_map: HashMap<TypeId, RirTypeId>,
@@ -387,7 +405,7 @@ struct PlanCx<'a> {
     enum_map: HashMap<air::EnumId, RirEnumId>,
     flag_map: HashMap<air::FlagId, RirFlagId>,
     tuple_map: HashMap<Vec<RirTypeId>, RirTupleId>,
-    materializers: RustMaterializerGraph,
+    materializers: RustMaterializerGraph<'a>,
     dynamic_layout: Option<RustDynamicLayoutPlan>,
     dynamic_types: Vec<(TypeId, air::ContractSurfaceId, RirEnumId)>,
     dyn_surface_map: HashMap<air::ContractSurfaceId, RirDynCarrierId>,
@@ -573,10 +591,11 @@ impl PlannedCallArg {
 }
 
 impl<'a> PlanCx<'a> {
-    fn new(air: &'a air::Program, config: RustPlanConfig) -> Self {
-        let materializers = RustMaterializerGraph::with_native_support(&config.native_providers);
+    fn new(air: &'a air::Program, config: RustPlanConfig, catalog: &'a ProviderCatalog) -> Self {
+        let materializers = RustMaterializerGraph::with_provider_catalog(catalog);
         Self {
             air,
+            catalog,
             classes: TypePassClasses::analyze(air),
             config,
             type_map: HashMap::new(),
@@ -1178,7 +1197,7 @@ impl<'a> PlanCx<'a> {
                 sanitize(decl.name.as_str())
             )),
             display: RirSymbol::new(decl.name.as_str()),
-            native: Some(native.clone()),
+            native: Some(native),
             native_layout: decl.layout.map(|layout| rir::RirDynLayout {
                 size: layout.size,
                 align: layout.align,
@@ -1240,7 +1259,7 @@ impl<'a> PlanCx<'a> {
         program.enums.push(RirEnum {
             id,
             role: RirEnumRole::Extern,
-            native: Some(native.clone()),
+            native: Some(native),
             native_layout: decl.layout.map(|layout| rir::RirDynLayout {
                 size: layout.size,
                 align: layout.align,
@@ -2179,8 +2198,9 @@ impl<'a> PlanCx<'a> {
                     continue;
                 }
             };
+            let (binding, _) = binding;
             let decl = self.air.extern_decl(air_id);
-            let params = self.extern_params(decl, &binding.abi.params, retained_callbacks);
+            let params = self.extern_params(program, decl, &binding.abi.params, retained_callbacks);
             if self.unsupported_lambda_extern_boundary(decl, &params) {
                 gaps.push(Self::gap(
                     RustTargetGapSite::Extern(self.extern_gap_site(air_id, decl)),
@@ -2206,7 +2226,7 @@ impl<'a> PlanCx<'a> {
                 ret_plan,
                 callback_receiver,
                 ctx: binding.abi.ctx,
-                fallible: binding.abi.fallible,
+                fallible: decl.effects.fallible,
                 suspends_runtime_entry: retained_callbacks,
             });
             extern_map.insert(air_id, id);
@@ -2221,28 +2241,32 @@ impl<'a> PlanCx<'a> {
 
     fn extern_params(
         &self,
+        program: &RirProgram,
         decl: &air::ExternDecl,
-        abi: &[anvyx_runtime::RustParamAbi],
+        abi: &[anvyx_externs::RustParamAdapter],
         suspends_runtime_entry: bool,
     ) -> Vec<RirExternParam> {
         decl.call_params()
             .zip(abi)
             .map(|(param, abi)| {
-                let (mode, escape) = native_call::classify_param(abi);
+                let plan = native_call::plan_param(program, self.type_map[&param.ty], abi);
+                let (mode, escape) = native_call::classify_param(&plan);
                 let air_ty = self.air.type_arena.data(param.ty);
                 let native_ref = matches!(air_ty, TypeData::Extern(ext)
                     if self.air.extern_type(*ext).rep == air::ExternRep::Shared);
+                let action = native_call::classify_arg_action(
+                    &plan,
+                    mode,
+                    native_ref,
+                    suspends_runtime_entry,
+                    &program.types[self.type_map[&param.ty].index()],
+                );
                 RirExternParam {
                     ty: self.type_map[&param.ty],
                     mode,
                     escape,
-                    abi: abi.clone(),
-                    action: native_call::classify_arg_action(
-                        abi,
-                        mode,
-                        native_ref,
-                        suspends_runtime_entry,
-                    ),
+                    plan,
+                    action,
                 }
             })
             .collect()
@@ -2302,42 +2326,64 @@ impl<'a> PlanCx<'a> {
         &self,
         type_id: TypeId,
         decl: &air::ExternTypeDecl,
-    ) -> Result<&anvyx_runtime::RustTypeBinding, RustTargetGap> {
+    ) -> Result<rir::RirNativeType, RustTargetGap> {
+        let site = RustTargetGapSite::Type(type_id);
         let Some(binding) = &decl.binding else {
-            return Err(Self::gap(
-                RustTargetGapSite::Type(type_id),
-                RustTargetGapKind::UnsupportedExternType,
-            ));
+            return Err(Self::gap(site, RustTargetGapKind::UnsupportedExternType));
         };
-        self.materializers.native_type(binding).ok_or_else(|| {
-            Self::gap(
-                RustTargetGapSite::Type(type_id),
-                RustTargetGapKind::UnsupportedExternType,
-            )
-        })
+        let (native, catalog_module, catalog_decl) = self
+            .catalog
+            .native_type_parts(&binding.package, &binding.provider, &binding.key)
+            .map_err(|error| Self::gap(site.clone(), native_type_gap(&error)))?;
+        if native::attests_air_type(self.air, decl, catalog_module, catalog_decl) {
+            Ok(rir::RirNativeType {
+                key: native.key.clone(),
+                path: native.path.clone(),
+                materializer: native.materializer.clone(),
+            })
+        } else {
+            Err(Self::gap(site, RustTargetGapKind::UnsupportedExternType))
+        }
     }
 
     fn native_extern(
         &self,
         id: ExternId,
         decl: &air::ExternDecl,
-    ) -> Result<(&anvyx_runtime::RustExternBinding, Option<usize>), RustTargetGap> {
-        native::resolve_extern(&self.config.native_providers, self.air, decl).map_err(|error| {
-            let kind = match error {
-                native::ResolveExternError::MissingBinding => {
-                    RustTargetGapKind::MissingExternBinding
-                }
-                native::ResolveExternError::MissingConfiguredSupport => {
-                    RustTargetGapKind::MissingExternSupport
-                }
-                native::ResolveExternError::MissingExport => RustTargetGapKind::MissingExternExport,
-                native::ResolveExternError::UnsupportedAbi => RustTargetGapKind::UnsupportedRustAbi,
-            };
-            Self::gap(
-                RustTargetGapSite::Extern(self.extern_gap_site(id, decl)),
-                kind,
-            )
-        })
+    ) -> Result<
+        (
+            (
+                &anvyx_externs::RustExternBinding,
+                &anvyx_externs::ExternModuleDescriptor,
+            ),
+            Option<usize>,
+        ),
+        RustTargetGap,
+    > {
+        let site = RustTargetGapSite::Extern(self.extern_gap_site(id, decl));
+        let Some(binding) = &decl.binding else {
+            return Err(Self::gap(site, RustTargetGapKind::MissingExternBinding));
+        };
+        let binding = self
+            .catalog
+            .binding(&binding.package, &binding.provider, &binding.key)
+            .map_err(|error| {
+                let kind = match error {
+                    anvyx_externs::ProviderCatalogError::MissingProvider
+                    | anvyx_externs::ProviderCatalogError::DescriptorOnly => {
+                        RustTargetGapKind::MissingExternSupport
+                    }
+                    anvyx_externs::ProviderCatalogError::MissingBinding => {
+                        RustTargetGapKind::MissingExternExport
+                    }
+                    anvyx_externs::ProviderCatalogError::MissingType => unreachable!(),
+                    _ => unreachable!("catalog construction errors cannot escape lookup"),
+                };
+                Self::gap(site.clone(), kind)
+            })?;
+        let callback_receiver = native::attests_air(self.air, decl, binding.0, binding.1)
+            .map_err(|()| Self::gap(site, RustTargetGapKind::UnsupportedRustAbi))?;
+        Ok((binding, callback_receiver))
     }
 
     fn unsupported_lambda_extern_boundary(
@@ -6063,15 +6109,16 @@ impl<'a> PlanCx<'a> {
         position: RustRecipePosition,
         locals: &mut Vec<RirLocal>,
     ) -> Result<PlannedOwnedValue, RustTargetGap> {
-        let source = match owned.source {
-            air::ValueSource::Reusable => {
+        let source = match (&owned.source, &owned.value) {
+            (air::ValueSource::Reusable, Operand::Const(_)) => RirOwnedSource::Direct,
+            (air::ValueSource::Reusable, _) => {
                 let ty = self
                     .air
                     .operand_ty(&owned.value)
                     .expect("verified owned operand has type");
                 RirOwnedSource::Reuse(self.reusable_materializer(function, ty, position)?)
             }
-            air::ValueSource::TransferTemp { local } => RirOwnedSource::Transfer {
+            (air::ValueSource::TransferTemp { local }, _) => RirOwnedSource::Transfer {
                 local: RirLocalId::from_index(local.index()),
             },
         };

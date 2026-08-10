@@ -4158,7 +4158,14 @@ pub(crate) fn check_semantic_with_modules(
     config: TypecheckConfig,
 ) -> Result<SemanticCheckOutput, TypecheckFailure> {
     let source_index = SourceAstIndex::new(program, resolved);
-    check_semantic_with_source_index(program, resolved, &source_index, externs, config)
+    check_semantic_with_source_index(
+        program,
+        resolved,
+        &source_index,
+        externs,
+        &anvyx_externs::ProviderCatalog::default(),
+        config,
+    )
 }
 
 pub(crate) fn check_semantic_with_source_index(
@@ -4166,22 +4173,25 @@ pub(crate) fn check_semantic_with_source_index(
     resolved: &ResolveResult,
     source_index: &SourceAstIndex,
     externs: RawExterns,
+    providers: &anvyx_externs::ProviderCatalog,
     config: TypecheckConfig,
 ) -> Result<SemanticCheckOutput, TypecheckFailure> {
-    typechecker_for_modules(program, resolved, externs, config)?.into_semantic_result(source_index)
+    typechecker_for_modules(program, resolved, externs, providers, config)?
+        .into_semantic_result(source_index)
 }
 
 fn typechecker_for_modules(
     program: &Program,
     resolved: &ResolveResult,
     externs: RawExterns,
+    providers: &anvyx_externs::ProviderCatalog,
     config: TypecheckConfig,
 ) -> Result<TypeChecker, TypecheckFailure> {
-    let mut decls = DeclarationIndex::from_root_and_modules(program, resolved, &externs);
+    let mut decls = DeclarationIndex::from_root_and_modules(program, resolved, &externs, providers);
     if decls.has_errors() {
         return Err(TypecheckFailure::errors(decl_errors(decls.errors())));
     }
-    let catalog = match crate::externs::catalog::build_catalog(externs, &mut decls) {
+    let catalog = match crate::externs::catalog::build_catalog(externs, providers, &mut decls) {
         Ok(catalog) => catalog,
         Err(errors) => {
             let diagnostic_context = TypeDiagnosticContext::from_decls(&decls);

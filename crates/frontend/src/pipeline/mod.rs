@@ -15,8 +15,7 @@ use crate::{
     ast::Program,
     conditional,
     config::{CompilationContext, LintConfig},
-    externs::{self, ExternInputs},
-    lexer,
+    externs, lexer,
     lint::{LintEvent, apply_lints},
     parser,
     resolve::{
@@ -94,7 +93,6 @@ pub struct PackageProgramInput<'a, L: PackageSourceLoader> {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct FrontendConfig {
-    pub externs: ExternInputs,
     pub lint: LintConfig,
     pub context: CompilationContext,
 }
@@ -211,8 +209,9 @@ pub enum AirBuildError<E> {
 pub fn check_packages<L: PackageSourceLoader>(
     input: PackageProgramInput<'_, L>,
     config: FrontendConfig,
+    catalog: &anvyx_externs::ProviderCatalog,
 ) -> Result<CheckOutput, L::FatalError> {
-    let prepared = match prepare_pipeline(input, config) {
+    let prepared = match prepare_pipeline(input, config, catalog) {
         Ok(prepared) => prepared,
         Err(stop) => return stop.into_check_result(),
     };
@@ -227,9 +226,10 @@ pub fn check_packages<L: PackageSourceLoader>(
 pub fn build_air_packages<L: PackageSourceLoader>(
     input: PackageProgramInput<'_, L>,
     config: FrontendConfig,
+    catalog: &anvyx_externs::ProviderCatalog,
     roots: &AirRootConfig,
 ) -> Result<AirBuildOutput, AirBuildError<L::FatalError>> {
-    let prepared = prepare_pipeline(input, config).map_err(air_build_stop)?;
+    let prepared = prepare_pipeline(input, config, catalog).map_err(air_build_stop)?;
     let facts = prepared.semantic.validated_public_facts();
     let report =
         typecheck_success_report_ref(&prepared.sources, &prepared.lint, &prepared.semantic);
@@ -275,20 +275,15 @@ struct PreparedPipeline {
 fn prepare_pipeline<L: PackageSourceLoader>(
     input: PackageProgramInput<'_, L>,
     config: FrontendConfig,
+    catalog: &anvyx_externs::ProviderCatalog,
 ) -> Result<PreparedPipeline, PipelineStop<L::FatalError>> {
-    let FrontendConfig {
-        externs: extern_inputs,
-        lint,
-        context,
-    } = config;
+    let FrontendConfig { lint, context } = config;
     let mut sources = SourceTable::default();
     let root = parse_package_module(&mut sources, input.main, SourceKind::Root, &context)?;
     let packages = parse_package_inputs(&mut sources, input.packages, &context)?;
     let preloaded_modules = parse_package_modules(&mut sources, input.preloaded_modules, &context)?;
 
-    let raw_externs = externs::ingest_providers(extern_inputs)
-        .map_err(|errors| PipelineStop::Diagnostic(extern_failure(&sources, errors)))?;
-    let external_modules = externs::raw_extern_module_ids(&raw_externs);
+    let external_modules = externs::provider_module_ids(catalog);
 
     let resolved = {
         let mut loader = InputModuleLoader::new(input.source_loader, &mut sources, context.clone());
@@ -327,7 +322,7 @@ fn prepare_pipeline<L: PackageSourceLoader>(
         }
     };
 
-    let raw_externs = externs::prepare_raw_externs(raw_externs, &root.program, &resolved)
+    let raw_externs = externs::prepare_raw_externs(&root.program, &resolved)
         .map_err(|errors| PipelineStop::Diagnostic(extern_failure(&sources, errors)))?;
 
     let source_index = crate::source_ast::SourceAstIndex::new(&root.program, &resolved);
@@ -336,6 +331,7 @@ fn prepare_pipeline<L: PackageSourceLoader>(
         &resolved,
         &source_index,
         raw_externs,
+        catalog,
         typecheck::TypecheckConfig { context },
     )
     .map_err(|failure| {

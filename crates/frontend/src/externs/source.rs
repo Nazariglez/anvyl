@@ -1,8 +1,12 @@
+use std::collections::{HashMap, hash_map::Entry};
+
 use anvyx_externs::{
     CallbackEscape, CallbackPolicy, CallbackThread, ExternCallbackParam, ExternCallbackSignature,
-    ExternEffects, ExternFieldDescriptor, ExternFunctionDescriptor, ExternInitDescriptor,
-    ExternMethodDescriptor, ExternOperator, ExternOperatorDescriptor, ExternParam, ExternRep,
-    ExternSignature, ExternStaticDescriptor, ExternTypeExpr, ModulePath, ParamFlow, ReceiverMode,
+    ExternDescriptorError, ExternEffects, ExternFieldDescriptor, ExternFunctionDescriptor,
+    ExternInitDescriptor, ExternMemberSelector, ExternMethodDescriptor, ExternModuleDescriptor,
+    ExternOperator, ExternOperatorDescriptor, ExternParam, ExternRep, ExternSignature,
+    ExternStaticDescriptor, ExternTypeDescriptor, ExternTypeExpr, ModulePath, ParamFlow,
+    ReceiverMode, validate_module_contents,
 };
 
 use super::raw::*;
@@ -24,46 +28,194 @@ pub(crate) fn collect_source_externs(
     root: &Program,
     resolved: &ResolveResult,
 ) -> Result<RawExterns, Vec<ExternInputError>> {
-    let mut groups = vec![];
-    let mut errors = vec![];
+    let mut collector = SourceExternCollector::default();
     collect_source_program(
-        RawExternScope::Module(resolved.root.clone()),
+        resolved.root.clone(),
         resolved.root_source,
         root,
-        &mut groups,
-        &mut errors,
+        &mut collector,
     );
 
     for module in resolved.module_groups.iter().flatten() {
-        if module.key == resolved.root {
-            continue;
+        if module.key != resolved.root {
+            collect_source_program(
+                module.key.clone(),
+                module.source,
+                &module.program,
+                &mut collector,
+            );
         }
-        collect_source_program(
-            source_scope(&module.key),
-            module.source,
-            &module.program,
-            &mut groups,
-            &mut errors,
+    }
+
+    if collector.errors.is_empty() {
+        Ok(RawExterns {
+            modules: collector.modules,
+        })
+    } else {
+        Err(collector.errors)
+    }
+}
+
+#[derive(Default)]
+struct SourceExternCollector {
+    modules: Vec<RawExternModule>,
+    identities: HashMap<(ModuleId, RawExternIdentityKey), RawExternDecl>,
+    errors: Vec<ExternInputError>,
+}
+
+impl SourceExternCollector {
+    fn validate(&mut self, module: RawExternModule) {
+        self.validate_shape(&module);
+        self.validate_identities(&module);
+        self.modules.push(module);
+    }
+
+    fn validate_shape(&mut self, module: &RawExternModule) {
+        let descriptor = ExternModuleDescriptor {
+            path: ModulePath {
+                segments: module
+                    .scope
+                    .module_path()
+                    .map_or_else(Vec::new, |path| path.segments().to_vec()),
+            },
+            types: module.types.iter().map(|ty| ty.decl.clone()).collect(),
+            functions: module
+                .functions
+                .iter()
+                .map(|function| function.decl.clone())
+                .collect(),
+        };
+        let Err(errors) = validate_module_contents(&descriptor) else {
+            return;
+        };
+        let decl = RawExternDecl {
+            scope: module.scope.clone(),
+            site: module_site(module),
+        };
+        self.errors.extend(
+            errors
+                .into_iter()
+                .filter(|error| !is_duplicate_error(error))
+                .map(|error| ExternInputError::InvalidRawDescriptor {
+                    decl: decl.clone(),
+                    error,
+                }),
         );
     }
 
-    if errors.is_empty() {
-        Ok(RawExterns { groups })
-    } else {
-        Err(errors)
+    fn validate_identities(&mut self, module: &RawExternModule) {
+        for function in &module.functions {
+            self.insert_identity(
+                module.scope.clone(),
+                RawExternIdentityKey::Function(function.decl.name.clone()),
+                RawExternDecl {
+                    scope: module.scope.clone(),
+                    site: function.site,
+                },
+            );
+        }
+        for ty in &module.types {
+            let owner = ty.decl.name.clone();
+            let decl = RawExternDecl {
+                scope: module.scope.clone(),
+                site: ty.site,
+            };
+            self.insert_identity(
+                module.scope.clone(),
+                RawExternIdentityKey::Type(owner.clone()),
+                decl.clone(),
+            );
+            for field in &ty.decl.fields {
+                self.insert_member(
+                    &owner,
+                    ExternMemberSelector::Field(field.name.clone()),
+                    decl.clone(),
+                );
+            }
+            if ty.decl.init.is_some() {
+                self.insert_member(&owner, ExternMemberSelector::Init, decl.clone());
+            }
+            for method in &ty.decl.methods {
+                self.insert_member(
+                    &owner,
+                    ExternMemberSelector::Method(method.name.clone()),
+                    decl.clone(),
+                );
+            }
+            for method in &ty.decl.statics {
+                self.insert_member(
+                    &owner,
+                    ExternMemberSelector::Static(method.name.clone()),
+                    decl.clone(),
+                );
+            }
+            for operator in &ty.decl.operators {
+                self.insert_member(
+                    &owner,
+                    ExternMemberSelector::Operator(operator.op),
+                    decl.clone(),
+                );
+            }
+        }
+    }
+
+    fn insert_member(&mut self, owner: &str, selector: ExternMemberSelector, decl: RawExternDecl) {
+        self.insert_identity(
+            decl.scope.clone(),
+            RawExternIdentityKey::Member {
+                owner: owner.to_string(),
+                selector,
+            },
+            decl,
+        );
+    }
+
+    fn insert_identity(
+        &mut self,
+        scope: ModuleId,
+        key: RawExternIdentityKey,
+        duplicate: RawExternDecl,
+    ) {
+        match self.identities.entry((scope, key.clone())) {
+            Entry::Vacant(entry) => {
+                entry.insert(duplicate);
+            }
+            Entry::Occupied(entry) => self.errors.push(ExternInputError::DuplicateRawIdentity {
+                key,
+                first: entry.get().clone(),
+                duplicate,
+            }),
+        }
     }
 }
 
-fn source_scope(module: &ModuleId) -> RawExternScope {
-    RawExternScope::Module(module.clone())
+fn module_site(module: &RawExternModule) -> RawExternSite {
+    module
+        .functions
+        .first()
+        .map(|function| function.site)
+        .or_else(|| module.types.first().map(|ty| ty.site))
+        .unwrap_or_default()
+}
+
+fn is_duplicate_error(error: &ExternDescriptorError) -> bool {
+    matches!(
+        error,
+        ExternDescriptorError::DuplicateModule(_)
+            | ExternDescriptorError::DuplicateType { .. }
+            | ExternDescriptorError::DuplicateFunction { .. }
+            | ExternDescriptorError::DuplicateField { .. }
+            | ExternDescriptorError::DuplicateMethod { .. }
+            | ExternDescriptorError::DuplicateStatic { .. }
+            | ExternDescriptorError::DuplicateOperator { .. }
+    )
 }
 
 fn collect_source_program(
-    scope: RawExternScope,
+    scope: ModuleId,
     source: SourceId,
     program: &Program,
-    groups: &mut Vec<RawExternGroup>,
-    errors: &mut Vec<ExternInputError>,
+    collector: &mut SourceExternCollector,
 ) {
     let mut types = vec![];
     let mut functions = vec![];
@@ -72,11 +224,11 @@ fn collect_source_program(
         match &stmt.node {
             Stmt::ExternFunc(func) => match normalize_function(source, func) {
                 Ok(func) => functions.push(func),
-                Err(error) => errors.push(*error),
+                Err(error) => collector.errors.push(*error),
             },
             Stmt::ExternType(ty) => match normalize_type(source, ty) {
                 Ok(ty) => types.push(ty),
-                Err(type_errors) => errors.extend(type_errors),
+                Err(type_errors) => collector.errors.extend(type_errors),
             },
             _ => {}
         }
@@ -86,15 +238,10 @@ fn collect_source_program(
         return;
     }
 
-    groups.push(RawExternGroup {
-        provenance: ExternProvenance::Source {
-            module: scope.clone(),
-        },
-        modules: vec![RawExternModule {
-            scope,
-            types,
-            functions,
-        }],
+    collector.validate(RawExternModule {
+        scope,
+        types,
+        functions,
     });
 }
 
@@ -145,15 +292,12 @@ fn normalize_type(
                 Err(error) => errors.push(*error),
             }
         }
-        RawExternInit {
-            decl: ExternInitDescriptor {
-                params,
-                field_init,
-                presence_init: vec![],
-                ret: ExternTypeExpr::Void,
-                effects: ExternEffects::default(),
-            },
-            site: site(source, span),
+        ExternInitDescriptor {
+            params,
+            field_init,
+            presence_init: vec![],
+            ret: ExternTypeExpr::Void,
+            effects: ExternEffects::default(),
         }
     });
 
@@ -162,31 +306,33 @@ fn normalize_type(
     }
 
     Ok(RawExternType {
-        name: ty.node.name.to_string(),
-        doc: ty.node.doc.clone(),
-        exported: matches!(ty.node.visibility, Visibility::Public),
-        rep: match ty.node.rep {
-            ExternTypeRep::Shared => ExternRep::Shared,
-            ExternTypeRep::Inline => ExternRep::Inline,
+        decl: ExternTypeDescriptor {
+            name: ty.node.name.to_string(),
+            doc: ty.node.doc.clone(),
+            rep: match ty.node.rep {
+                ExternTypeRep::Shared => ExternRep::Shared,
+                ExternTypeRep::Inline => ExternRep::Inline,
+            },
+            layout: None,
+            materialization: None,
+            owns_heap_edges: None,
+            fields,
+            variants: vec![],
+            init,
+            methods,
+            statics,
+            operators,
         },
-        layout: None,
-        materialization: None,
-        owns_heap_edges: None,
-        fields,
-        variants: vec![],
-        init,
-        methods,
-        statics,
-        operators,
+        exported: matches!(ty.node.visibility, Visibility::Public),
         site: site(source, span),
     })
 }
 
 enum RawSourceMember {
-    Field(RawExternField),
-    Method(RawExternMethod),
-    Static(RawExternStatic),
-    Operator(RawExternOperator),
+    Field(ExternFieldDescriptor),
+    Method(ExternMethodDescriptor),
+    Static(ExternStaticDescriptor),
+    Operator(ExternOperatorDescriptor),
 }
 
 fn normalize_member(
@@ -200,18 +346,15 @@ fn normalize_member(
             name,
             ty,
             computed,
-        } => Ok(RawSourceMember::Field(RawExternField {
-            decl: ExternFieldDescriptor {
-                name: name.to_string(),
-                ty: type_expr(source, ty, span, SourceTypePosition::Field)?,
-                computed: *computed,
-                readable: true,
-                writable: true,
-                get_receiver: ReceiverMode::Shared,
-                set_receiver: ReceiverMode::Mutable,
-                doc: doc.clone(),
-            },
-            site: site(source, span),
+        } => Ok(RawSourceMember::Field(ExternFieldDescriptor {
+            name: name.to_string(),
+            ty: type_expr(source, ty, span, SourceTypePosition::Field)?,
+            computed: *computed,
+            readable: true,
+            writable: true,
+            get_receiver: ReceiverMode::Shared,
+            set_receiver: ReceiverMode::Mutable,
+            doc: doc.clone(),
         })),
         ExternTypeMember::Method {
             doc,
@@ -219,71 +362,59 @@ fn normalize_member(
             receiver,
             params,
             ret,
-        } => Ok(RawSourceMember::Method(RawExternMethod {
-            decl: ExternMethodDescriptor {
-                name: name.to_string(),
-                doc: doc.clone(),
-                receiver: match receiver {
-                    ExternReceiverMode::Value => ReceiverMode::Value,
-                    ExternReceiverMode::Shared => ReceiverMode::Shared,
-                    ExternReceiverMode::Mutable => ReceiverMode::Mutable,
-                },
-                signature: signature(source, params, ret, span)?,
-                effects: ExternEffects::default(),
+        } => Ok(RawSourceMember::Method(ExternMethodDescriptor {
+            name: name.to_string(),
+            doc: doc.clone(),
+            receiver: match receiver {
+                ExternReceiverMode::Value => ReceiverMode::Value,
+                ExternReceiverMode::Shared => ReceiverMode::Shared,
+                ExternReceiverMode::Mutable => ReceiverMode::Mutable,
             },
-            site: site(source, span),
+            signature: signature(source, params, ret, span)?,
+            effects: ExternEffects::default(),
         })),
         ExternTypeMember::StaticMethod {
             doc,
             name,
             params,
             ret,
-        } => Ok(RawSourceMember::Static(RawExternStatic {
-            decl: ExternStaticDescriptor {
-                name: name.to_string(),
-                doc: doc.clone(),
-                signature: signature(source, params, ret, span)?,
-                effects: ExternEffects::default(),
-            },
-            site: site(source, span),
+        } => Ok(RawSourceMember::Static(ExternStaticDescriptor {
+            name: name.to_string(),
+            doc: doc.clone(),
+            signature: signature(source, params, ret, span)?,
+            effects: ExternEffects::default(),
         })),
         ExternTypeMember::Operator {
             op,
             other_ty,
             ret,
             self_on_right,
-        } => Ok(RawSourceMember::Operator(RawExternOperator {
-            decl: ExternOperatorDescriptor {
-                op: ExternOperator::Binary {
-                    op: binary_op(source, *op, span)?,
-                    self_on_right: *self_on_right,
-                },
+        } => Ok(RawSourceMember::Operator(ExternOperatorDescriptor {
+            op: ExternOperator::Binary {
+                op: binary_op(source, *op, span)?,
+                self_on_right: *self_on_right,
+            },
+            receiver: ReceiverMode::Shared,
+            signature: ExternSignature {
+                params: vec![ExternParam {
+                    name: None,
+                    ty: type_expr(source, other_ty, span, SourceTypePosition::Param)?,
+                    flow: ParamFlow::Value,
+                    escape: CallbackEscape::NonEscaping,
+                }],
+                ret: type_expr(source, ret, span, SourceTypePosition::Return)?,
+            },
+            effects: ExternEffects::default(),
+        })),
+        ExternTypeMember::UnaryOperator { op, ret } => {
+            Ok(RawSourceMember::Operator(ExternOperatorDescriptor {
+                op: ExternOperator::Unary(unary_op(source, *op, span)?),
                 receiver: ReceiverMode::Shared,
                 signature: ExternSignature {
-                    params: vec![ExternParam {
-                        name: None,
-                        ty: type_expr(source, other_ty, span, SourceTypePosition::Param)?,
-                        flow: ParamFlow::Value,
-                        escape: CallbackEscape::NonEscaping,
-                    }],
+                    params: vec![],
                     ret: type_expr(source, ret, span, SourceTypePosition::Return)?,
                 },
                 effects: ExternEffects::default(),
-            },
-            site: site(source, span),
-        })),
-        ExternTypeMember::UnaryOperator { op, ret } => {
-            Ok(RawSourceMember::Operator(RawExternOperator {
-                decl: ExternOperatorDescriptor {
-                    op: ExternOperator::Unary(unary_op(source, *op, span)?),
-                    receiver: ReceiverMode::Shared,
-                    signature: ExternSignature {
-                        params: vec![],
-                        ret: type_expr(source, ret, span, SourceTypePosition::Return)?,
-                    },
-                    effects: ExternEffects::default(),
-                },
-                site: site(source, span),
             }))
         }
     }

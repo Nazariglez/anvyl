@@ -1,0 +1,10 @@
+// @mode: run
+// @expect: error
+// @contains: UnsupportedExternType
+
+import pkg:host.host { config_width, make_config, WindowConfig };
+
+fn main() {
+    let config: WindowConfig = make_config(1280);
+    println(config_width(config));
+}

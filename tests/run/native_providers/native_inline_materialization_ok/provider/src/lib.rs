@@ -81,7 +81,6 @@ pub fn collect_now<'cx>(ctx: &mut Ctx<'cx, '_>) -> RuntimeResult<()> {
 
 anvyx_runtime::builtin_module! {
     name: "host",
-    source: "",
     exports: [
         HostValue,
         collect_now,

@@ -710,14 +710,14 @@ pub(super) fn callable_share_from_ref(value: &str) -> String {
     format!("({value}).clone()")
 }
 
-pub(super) fn rust_path(path: &anvyx_runtime::RustPath) -> String {
-    std::iter::once(path.crate_name.as_str())
+pub(super) fn rust_path(path: &anvyx_externs::RustPath) -> String {
+    std::iter::once(path.crate_name.as_ref())
         .chain(path.segments.iter().map(String::as_str))
         .collect::<Vec<_>>()
         .join("::")
 }
 
-pub(super) fn provider_materialize(path: &anvyx_runtime::RustPath, value: &str) -> String {
+pub(super) fn provider_materialize(path: &anvyx_externs::RustPath, value: &str) -> String {
     format!("{}({value})", rust_path(path))
 }
 

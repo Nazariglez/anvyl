@@ -9,15 +9,16 @@ use super::{
     rir::{
         RirCallArg, RirCallTarget, RirCellDecl, RirCellLifetime, RirCellRef, RirCellStorage,
         RirChild, RirCollectionAccess, RirCollectionFor, RirCollectionLoanScope,
-        RirCollectionStorageKind, RirConstValue, RirDataRefPlace, RirDataRefPlaceId, RirDynCarrier,
-        RirDynCarrierId, RirDynDispatchArm, RirDynReceiver, RirDynStorage, RirDynVariantId,
-        RirEnum, RirEnumId, RirEnumRepr, RirExtern, RirFlagStaticOp, RirFunction, RirIf,
-        RirIterCountCheck, RirLambdaCapture, RirLambdaCaptureArg, RirLambdaCaptureKind,
-        RirLambdaEnvFieldKind, RirLambdaEnvId, RirLambdaEnvLayout, RirLambdaId, RirLambdaSig,
-        RirLambdaSigId, RirLambdaStorage, RirLocalBinding, RirLocalId, RirLoop, RirLoopId,
-        RirMapEntryMatch, RirMaterializerId, RirMutPlaceAccess, RirMutPlaceArg, RirMutPlaceHandle,
-        RirNativeReturn, RirOperand, RirOptionMatch, RirOptionPayloadBinding, RirOptionSubject,
-        RirOrdinalAdapter, RirOrdinalPlan, RirPassMode, RirPatternAlternative, RirPatternBinding,
+        RirCollectionStorageKind, RirConstValue, RirCoreEnumKind, RirDataRefPlace,
+        RirDataRefPlaceId, RirDynCarrier, RirDynCarrierId, RirDynDispatchArm, RirDynReceiver,
+        RirDynStorage, RirDynVariantId, RirEnum, RirEnumId, RirEnumRepr, RirExtern,
+        RirFlagStaticOp, RirFunction, RirIf, RirIterCountCheck, RirLambdaCapture,
+        RirLambdaCaptureArg, RirLambdaCaptureKind, RirLambdaEnvFieldKind, RirLambdaEnvId,
+        RirLambdaEnvLayout, RirLambdaId, RirLambdaSig, RirLambdaSigId, RirLambdaStorage,
+        RirLocalBinding, RirLocalId, RirLoop, RirLoopId, RirMapEntryMatch, RirMaterializerId,
+        RirMutPlaceAccess, RirMutPlaceArg, RirMutPlaceHandle, RirNativeParam, RirNativeReturn,
+        RirOperand, RirOptionMatch, RirOptionPayloadBinding, RirOptionSubject, RirOrdinalAdapter,
+        RirOrdinalPlan, RirPassMode, RirPatternAlternative, RirPatternBinding,
         RirPatternBindingMode, RirPatternMatch, RirPatternPath, RirPatternPathStep, RirPatternTest,
         RirPlace, RirPlaceRoot, RirPlaceStep, RirPlaceStepKind, RirProgram, RirRValue, RirRangeFor,
         RirRawEnumValue, RirResolvedCallTarget, RirScopedPlaceCellDecl, RirScopedPlaceCellId,
@@ -6114,7 +6115,7 @@ impl EmitCx<'_> {
                 resource_borrows.push((expr, arg.clone(), mutable));
                 expr = arg;
             } else {
-                expr = self.native_arg_expr(&param.abi, param.ty, expr);
+                expr = self.native_arg_expr(&param.plan, param.ty, expr);
             }
             rendered.push(expr);
             1
@@ -6164,7 +6165,7 @@ impl EmitCx<'_> {
             } else {
                 prelude.extend(stmts);
             }
-            if let anvyx_runtime::RustParamAbi::InitField(inner) = &param.abi {
+            if let RirNativeParam::InitField(inner) = &param.plan {
                 expr = match arg {
                     RirCallArg::InitFieldProvided(_) => {
                         let value = self.native_arg_expr(inner, param.ty, expr);
@@ -6178,7 +6179,7 @@ impl EmitCx<'_> {
                 resource_borrows.push((expr, arg.clone(), mutable));
                 expr = arg;
             } else {
-                expr = self.native_arg_expr(&param.abi, param.ty, expr);
+                expr = self.native_arg_expr(&param.plan, param.ty, expr);
             }
             rendered.push(expr);
         }
@@ -6193,18 +6194,12 @@ impl EmitCx<'_> {
         }
     }
 
-    fn native_arg_expr(
-        &self,
-        abi: &anvyx_runtime::RustParamAbi,
-        ty: RirTypeId,
-        expr: String,
-    ) -> String {
-        match abi {
-            anvyx_runtime::RustParamAbi::Value(native_ty)
-            | anvyx_runtime::RustParamAbi::OwnedNamed(native_ty) => {
-                self.native_value_arg_expr(native_ty, ty, expr)
+    fn native_arg_expr(&self, plan: &RirNativeParam, ty: RirTypeId, expr: String) -> String {
+        match plan {
+            RirNativeParam::Value | RirNativeParam::OwnedNamed => {
+                self.native_value_arg_expr(ty, expr)
             }
-            anvyx_runtime::RustParamAbi::Option(inner) => {
+            RirNativeParam::Option(inner) => {
                 let RirType::Option(inner_ty) = self.program.types[ty.index()] else {
                     unreachable!("verified native option param type")
                 };
@@ -6213,79 +6208,61 @@ impl EmitCx<'_> {
                     &self.native_arg_expr(inner, inner_ty, "value".to_string()),
                 )
             }
-            anvyx_runtime::RustParamAbi::Result(ok, err) => {
-                self.native_result_arg_expr(ty, ok, err, &expr)
-            }
-            anvyx_runtime::RustParamAbi::InitField(inner) => self.native_arg_expr(inner, ty, expr),
-            anvyx_runtime::RustParamAbi::Slice(_)
-            | anvyx_runtime::RustParamAbi::Borrow(_)
-            | anvyx_runtime::RustParamAbi::MutBorrow(_)
-            | anvyx_runtime::RustParamAbi::MutPlace(_)
-            | anvyx_runtime::RustParamAbi::ScopedLambda(_)
-            | anvyx_runtime::RustParamAbi::EscapingLambda(_)
-            | anvyx_runtime::RustParamAbi::AnvCallback(_) => expr,
-        }
-    }
-
-    fn native_value_arg_expr(
-        &self,
-        abi: &anvyx_runtime::ExternTypeExpr,
-        ty: RirTypeId,
-        expr: String,
-    ) -> String {
-        match abi {
-            anvyx_runtime::ExternTypeExpr::Unit => target::rust_unit(),
-            anvyx_runtime::ExternTypeExpr::Option(inner) => {
-                let RirType::Option(inner_ty) = self.program.types[ty.index()] else {
-                    unreachable!("verified native option param type")
-                };
-                target::rust_option_map(
-                    &expr,
-                    &self.native_value_arg_expr(inner, inner_ty, "value".to_string()),
-                )
-            }
-            anvyx_runtime::ExternTypeExpr::Result(ok, err) => {
-                self.native_result_value_arg_expr(ty, ok, err, &expr)
-            }
-            anvyx_runtime::ExternTypeExpr::Tuple(fields) => {
-                self.native_tuple_arg_expr(ty, fields, &expr)
-            }
-            anvyx_runtime::ExternTypeExpr::Array { elem, .. } => {
-                let RirType::Array { elem: elem_ty, .. } = self.program.types[ty.index()] else {
+            RirNativeParam::Result(ok, err) => self.native_result_arg_expr(ty, ok, err, &expr),
+            RirNativeParam::Array(inner) => {
+                let RirType::Array { elem, .. } = self.program.types[ty.index()] else {
                     unreachable!("verified native array param type")
                 };
                 Self::native_array_map_expr(
                     &expr,
-                    &self.native_value_arg_expr(elem, elem_ty, "value".to_string()),
+                    &self.native_arg_expr(inner, elem, "value".to_string()),
                 )
             }
+            RirNativeParam::InitField(inner) => self.native_arg_expr(inner, ty, expr),
+            RirNativeParam::SharedNamed
+            | RirNativeParam::Slice(_)
+            | RirNativeParam::Borrow
+            | RirNativeParam::MutBorrow
+            | RirNativeParam::MutPlace
+            | RirNativeParam::ScopedLambda
+            | RirNativeParam::EscapingLambda
+            | RirNativeParam::AnvCallback => expr,
+        }
+    }
+
+    fn native_value_arg_expr(&self, ty: RirTypeId, expr: String) -> String {
+        match self.program.types[ty.index()] {
+            RirType::Void => target::rust_unit(),
+            RirType::Option(inner) => target::rust_option_map(
+                &expr,
+                &self.native_value_arg_expr(inner, "value".to_string()),
+            ),
+            RirType::Enum(enum_id)
+                if self.program.enums[enum_id.index()].core == Some(RirCoreEnumKind::Result) =>
+            {
+                self.native_result_value_arg_expr(ty, &expr)
+            }
+            RirType::Tuple(_) => self.native_tuple_arg_expr(ty, &expr),
+            RirType::Array { elem, .. } => Self::native_array_map_expr(
+                &expr,
+                &self.native_value_arg_expr(elem, "value".to_string()),
+            ),
             _ => expr,
         }
     }
 
-    fn native_tuple_arg_expr(
-        &self,
-        ty: RirTypeId,
-        fields: &[anvyx_runtime::ExternTypeExpr],
-        expr: &str,
-    ) -> String {
+    fn native_tuple_arg_expr(&self, ty: RirTypeId, expr: &str) -> String {
         let RirType::Tuple(tuple_id) = self.program.types[ty.index()] else {
             unreachable!("verified native tuple param type")
         };
         let tuple = &self.program.tuples[tuple_id.index()];
-        let fields = tuple.fields.iter().zip(fields).map(|(field, abi)| {
-            self.native_value_arg_expr(abi, field.ty, format!("{expr}.{}", field.symbol.as_str()))
+        let fields = tuple.fields.iter().map(|field| {
+            self.native_value_arg_expr(field.ty, format!("{expr}.{}", field.symbol.as_str()))
         });
         target::rust_tuple(fields)
     }
 
-    fn native_result_value_arg_expr(
-        &self,
-        ty: RirTypeId,
-        ok: &anvyx_runtime::ExternTypeExpr,
-        err: &anvyx_runtime::ExternTypeExpr,
-        expr: &str,
-    ) -> String {
+    fn native_result_value_arg_expr(&self, ty: RirTypeId, expr: &str) -> String {
         let (enm, ok_variant, err_variant) = self.result_enum(ty);
         let ok_path = variant_path(enm.symbol.as_str(), ok_variant.symbol.as_str());
         let err_path = variant_path(enm.symbol.as_str(), err_variant.symbol.as_str());
@@ -6293,19 +6270,15 @@ impl EmitCx<'_> {
             expr,
             &format!(
                 "{ok_path}(value) => {}",
-                target::rust_ok(&self.native_value_arg_expr(
-                    ok,
-                    ok_variant.fields[0].ty,
-                    "value".to_string()
-                ))
+                target::rust_ok(
+                    &self.native_value_arg_expr(ok_variant.fields[0].ty, "value".to_string())
+                )
             ),
             &format!(
                 "{err_path}(value) => {}",
-                target::rust_err(&self.native_value_arg_expr(
-                    err,
-                    err_variant.fields[0].ty,
-                    "value".to_string()
-                ))
+                target::rust_err(
+                    &self.native_value_arg_expr(err_variant.fields[0].ty, "value".to_string())
+                )
             ),
         )
     }
@@ -6313,8 +6286,8 @@ impl EmitCx<'_> {
     fn native_result_arg_expr(
         &self,
         ty: RirTypeId,
-        ok: &anvyx_runtime::RustParamAbi,
-        err: &anvyx_runtime::RustParamAbi,
+        ok: &RirNativeParam,
+        err: &RirNativeParam,
         expr: &str,
     ) -> String {
         let (enm, ok_variant, err_variant) = self.result_enum(ty);
@@ -7204,26 +7177,20 @@ impl EmitCx<'_> {
         target::native_ref_adopt(&target::rust_path(&native.path), expr)
     }
 
-    fn native_owned_named_return_expr(
-        &self,
-        ret: RirTypeId,
-        ty: &anvyx_runtime::ExternTypeExpr,
-        adopt: bool,
-        expr: &str,
-    ) -> String {
+    fn native_owned_named_return_expr(&self, ret: RirTypeId, adopt: bool, expr: &str) -> String {
         if adopt {
             self.native_ref_adopt_return(ret, expr)
         } else {
-            self.native_value_return_expr(ret, ty, expr)
+            self.native_value_return_expr(ret, expr)
         }
     }
 
     fn native_return_expr(&self, ret: RirTypeId, plan: &RirNativeReturn, expr: &str) -> String {
         match plan {
-            RirNativeReturn::Void => expr.to_string(),
-            RirNativeReturn::Value(ty) => self.native_value_return_expr(ret, ty, expr),
-            RirNativeReturn::OwnedNamed { ty, adopt } => {
-                self.native_owned_named_return_expr(ret, ty, *adopt, expr)
+            RirNativeReturn::Void | RirNativeReturn::SharedNamed => expr.to_string(),
+            RirNativeReturn::Value => self.native_value_return_expr(ret, expr),
+            RirNativeReturn::OwnedNamed { adopt } => {
+                self.native_owned_named_return_expr(ret, *adopt, expr)
             }
             RirNativeReturn::Option {
                 payload_ty,
@@ -7253,74 +7220,46 @@ impl EmitCx<'_> {
                     ),
                 )
             }
+            RirNativeReturn::Array { elem_ty, elem } => {
+                Self::native_array_map_expr(expr, &self.native_return_expr(*elem_ty, elem, "value"))
+            }
         }
     }
 
-    fn native_value_return_expr(
-        &self,
-        ret: RirTypeId,
-        abi: &anvyx_runtime::ExternTypeExpr,
-        expr: &str,
-    ) -> String {
-        match abi {
-            anvyx_runtime::ExternTypeExpr::Unit => self.native_empty_tuple_return_expr(ret, expr),
-            anvyx_runtime::ExternTypeExpr::Option(inner) => {
-                let RirType::Option(inner_ty) = self.program.types[ret.index()] else {
-                    unreachable!("verified native option return type")
-                };
-                target::rust_option_map(
-                    expr,
-                    &self.native_value_return_expr(inner_ty, inner, "value"),
-                )
+    fn native_value_return_expr(&self, ret: RirTypeId, expr: &str) -> String {
+        match self.program.types[ret.index()] {
+            RirType::Void => self.native_empty_tuple_return_expr(ret, expr),
+            RirType::Option(inner) => {
+                target::rust_option_map(expr, &self.native_value_return_expr(inner, "value"))
             }
-            anvyx_runtime::ExternTypeExpr::Result(ok, err) => {
-                self.native_value_result_return_expr(ret, ok, err, expr)
+            RirType::Enum(enum_id)
+                if self.program.enums[enum_id.index()].core == Some(RirCoreEnumKind::Result) =>
+            {
+                self.native_value_result_return_expr(ret, expr)
             }
-            anvyx_runtime::ExternTypeExpr::Tuple(fields) => {
-                self.native_tuple_return_expr(ret, fields, expr)
-            }
-            anvyx_runtime::ExternTypeExpr::Array { elem, .. } => {
-                let RirType::Array { elem: elem_ty, .. } = self.program.types[ret.index()] else {
-                    unreachable!("verified native array return type")
-                };
-                Self::native_array_map_expr(
-                    expr,
-                    &self.native_value_return_expr(elem_ty, elem, "value"),
-                )
+            RirType::Tuple(_) => self.native_tuple_return_expr(ret, expr),
+            RirType::Array { elem, .. } => {
+                Self::native_array_map_expr(expr, &self.native_value_return_expr(elem, "value"))
             }
             _ => expr.to_string(),
         }
     }
 
-    fn native_tuple_return_expr(
-        &self,
-        ret: RirTypeId,
-        fields: &[anvyx_runtime::ExternTypeExpr],
-        expr: &str,
-    ) -> String {
-        if fields.is_empty() {
-            return self.native_empty_tuple_return_expr(ret, expr);
-        }
+    fn native_tuple_return_expr(&self, ret: RirTypeId, expr: &str) -> String {
         let RirType::Tuple(tuple_id) = self.program.types[ret.index()] else {
             unreachable!("verified native tuple return type")
         };
         let tuple = &self.program.tuples[tuple_id.index()];
+        if tuple.fields.is_empty() {
+            return self.native_empty_tuple_return_expr(ret, expr);
+        }
         let tmp = "__anv_native_ret";
-        let fields = tuple
-            .fields
-            .iter()
-            .zip(fields)
-            .enumerate()
-            .map(|(index, (field, abi))| {
-                field_init(
-                    field.symbol.as_str(),
-                    self.native_value_return_expr(
-                        field.ty,
-                        abi,
-                        &target::rust_tuple_field(tmp, index),
-                    ),
-                )
-            });
+        let fields = tuple.fields.iter().enumerate().map(|(index, field)| {
+            field_init(
+                field.symbol.as_str(),
+                self.native_value_return_expr(field.ty, &target::rust_tuple_field(tmp, index)),
+            )
+        });
         format!(
             "{{ let {tmp} = {expr}; {} }}",
             struct_lit(tuple.symbol.as_str(), fields)
@@ -7338,13 +7277,7 @@ impl EmitCx<'_> {
         )
     }
 
-    fn native_value_result_return_expr(
-        &self,
-        ret: RirTypeId,
-        ok: &anvyx_runtime::ExternTypeExpr,
-        err: &anvyx_runtime::ExternTypeExpr,
-        expr: &str,
-    ) -> String {
+    fn native_value_result_return_expr(&self, ret: RirTypeId, expr: &str) -> String {
         let (enm, ok_variant, err_variant) = self.result_enum(ret);
         let ok_path = variant_path(enm.symbol.as_str(), ok_variant.symbol.as_str());
         let err_path = variant_path(enm.symbol.as_str(), err_variant.symbol.as_str());
@@ -7352,11 +7285,11 @@ impl EmitCx<'_> {
             expr,
             &format!(
                 "Ok(value) => {ok_path}({})",
-                self.native_value_return_expr(ok_variant.fields[0].ty, ok, "value")
+                self.native_value_return_expr(ok_variant.fields[0].ty, "value")
             ),
             &format!(
                 "Err(value) => {err_path}({})",
-                self.native_value_return_expr(err_variant.fields[0].ty, err, "value")
+                self.native_value_return_expr(err_variant.fields[0].ty, "value")
             ),
         )
     }
@@ -7381,8 +7314,8 @@ impl EmitCx<'_> {
     ) -> String {
         let ext = &self.program.externs[id.index()];
         let rendered = match ext.ctx {
-            anvyx_runtime::RustWrapperCtx::HiddenRuntime => target::native_call_args([]),
-            anvyx_runtime::RustWrapperCtx::None => vec![],
+            anvyx_externs::RustCallContext::HiddenRuntime => target::native_call_args([]),
+            anvyx_externs::RustCallContext::None => vec![],
         };
         let symbol = target::rust_path(&ext.path);
         let call =

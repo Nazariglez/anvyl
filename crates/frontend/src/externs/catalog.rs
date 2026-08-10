@@ -3,22 +3,19 @@ use std::collections::HashMap;
 use anvyx_externs::{
     AbiPosition, AbiTypeError, BinaryOp, CallbackEscape, CallbackPolicy, CallbackThread,
     ExternBindingKey, ExternBindingOp, ExternBindingTarget, ExternCallbackParam,
-    ExternCallbackSignature, ExternEffects, ExternFunctionKey, ExternMemberKey,
-    ExternMemberSelector, ExternOperator, ExternParam, ExternRep, ExternSignature, ExternTypeExpr,
-    ExternTypeKey, OperatorReturn, ParamFlow, ProviderId, ReceiverMode, UnaryOp,
+    ExternCallbackSignature, ExternEffects, ExternMemberKey, ExternMemberSelector, ExternOperator,
+    ExternParam, ExternRep, ExternSignature, ExternTypeExpr, ExternTypeKey, OperatorReturn,
+    ParamFlow, ProviderCatalog, ProviderId, ProviderPackageKey, ReceiverMode, UnaryOp,
 };
 
 use crate::{
     ast::{ArrayLen, EscapeMode, FuncParam, GenericArg, Ident, ReturnSpec, Type, TypeVisitor},
     externs::{
-        extern_module_path, extern_module_scope,
-        raw::{
-            ExternProvenance, RawExternFunction, RawExternInit, RawExternModule, RawExternOperator,
-            RawExternSite, RawExternStatic, RawExternType, RawExterns,
-        },
+        extern_module_path, provider_module_scope,
+        raw::{RawExternModule, RawExternSite, RawExterns},
         raw_module_scope,
     },
-    resolve::{ModuleId, ModulePath, PackageId},
+    resolve::ModulePath,
     semantic_id::NominalId,
     span::SourceSpan,
     typecheck::{
@@ -26,9 +23,6 @@ use crate::{
         TypeRefResolver, nominal_type, type_closure_facts,
     },
 };
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) struct ExternModuleId(usize);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct ExternTypeId(usize);
@@ -156,30 +150,36 @@ impl Default for ResolvedExternTy {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum ExternLoweringInfo {
-    Provider(ProviderExternLoweringInfo),
-    Source { effects: ExternEffects },
+pub(crate) enum ExternOrigin {
+    Provider {
+        package: ProviderPackageKey,
+        provider: ProviderId,
+    },
+    Source,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ProviderExternLoweringInfo {
-    pub(crate) package: PackageId,
-    pub(crate) provider: ProviderId,
-    pub(crate) module: anvyx_externs::ModulePath,
-    pub(crate) key: ExternBindingKey,
-    pub(crate) effects: ExternEffects,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ProviderExternTypeLoweringInfo {
-    pub(crate) package: PackageId,
+pub(crate) struct ProviderExternTypeBinding {
+    pub(crate) package: ProviderPackageKey,
     pub(crate) provider: ProviderId,
     pub(crate) key: ExternTypeKey,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ExternLoweringInfo {
+    pub(crate) binding: Option<ProviderExternLoweringInfo>,
+    pub(crate) effects: ExternEffects,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ProviderExternLoweringInfo {
+    pub(crate) package: ProviderPackageKey,
+    pub(crate) provider: ProviderId,
+    pub(crate) key: ExternBindingKey,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct ExternCatalog {
-    modules: Vec<ExternModule>,
     types: Vec<ExternType>,
     functions: Vec<ExternFunction>,
     functions_by_key: HashMap<FunctionKey, ExternFunctionId>,
@@ -231,7 +231,7 @@ impl ExternCatalog {
         for function in &self.functions {
             visit_extern_signature_with_context(
                 ExternCatalogContext::function(
-                    &function.provenance,
+                    &function.origin,
                     function.key.module.clone(),
                     function.key.name,
                 ),
@@ -299,162 +299,16 @@ impl ExternCatalog {
         }
     }
 
-    pub(crate) fn module(&self, id: ExternModuleId) -> &ExternModule {
-        &self.modules[id.0]
-    }
-
     pub(crate) fn function(&self, id: ExternFunctionId) -> &ExternFunction {
         &self.functions[id.0]
-    }
-
-    pub(crate) fn function_lowering_info(&self, id: ExternFunctionId) -> ExternLoweringInfo {
-        let function = self.function(id);
-        match &function.provenance {
-            ExternProvenance::Provider { package, provider } => {
-                let module = provider_module_path(&function.key.module);
-                ExternLoweringInfo::Provider(ProviderExternLoweringInfo {
-                    package: package.clone(),
-                    provider: provider.clone(),
-                    module: module.clone(),
-                    key: ExternBindingKey {
-                        target: ExternBindingTarget::Function(ExternFunctionKey {
-                            module,
-                            name: function.key.name.to_string(),
-                        }),
-                        operation: ExternBindingOp::Call,
-                    },
-                    effects: function.effects,
-                })
-            }
-            ExternProvenance::Source { .. } => ExternLoweringInfo::Source {
-                effects: function.effects,
-            },
-        }
     }
 
     pub(crate) fn ty(&self, id: ExternTypeId) -> &ExternType {
         &self.types[id.0]
     }
 
-    pub(crate) fn type_lowering_info(
-        &self,
-        id: ExternTypeId,
-    ) -> Option<ProviderExternTypeLoweringInfo> {
-        let ty = self.ty(id);
-        match &ty.context.provenance {
-            ExternProvenance::Provider { package, provider } => {
-                Some(ProviderExternTypeLoweringInfo {
-                    package: package.clone(),
-                    provider: provider.clone(),
-                    key: ExternTypeKey {
-                        module: provider_module_path(&ty.key.module),
-                        name: ty.key.name.to_string(),
-                    },
-                })
-            }
-            ExternProvenance::Source { .. } => None,
-        }
-    }
-
-    pub(crate) fn field_lowering_info(
-        &self,
-        field_ref: ExternFieldRef,
-        operation: ExternBindingOp,
-    ) -> ExternLoweringInfo {
-        let ty = self.ty(field_ref.owner);
-        let field = &ty.fields[field_ref.id.0];
-        Self::member_lowering_info(
-            ty,
-            ExternMemberSelector::Field(field.name.to_string()),
-            operation,
-            ExternEffects::default(),
-        )
-    }
-
-    pub(crate) fn method_lowering_info(&self, method_ref: ExternMethodRef) -> ExternLoweringInfo {
-        let ty = self.ty(method_ref.owner);
-        let method = &ty.methods[method_ref.id.0];
-        Self::member_lowering_info(
-            ty,
-            ExternMemberSelector::Method(method.name.to_string()),
-            ExternBindingOp::Call,
-            method.effects,
-        )
-    }
-
-    pub(crate) fn static_lowering_info(&self, static_ref: ExternStaticRef) -> ExternLoweringInfo {
-        let ty = self.ty(static_ref.owner);
-        let static_method = &ty.statics[static_ref.id.0];
-        Self::member_lowering_info(
-            ty,
-            ExternMemberSelector::Static(static_method.name.to_string()),
-            ExternBindingOp::Call,
-            static_method.effects,
-        )
-    }
-
-    pub(crate) fn init_lowering_info(&self, owner: ExternTypeId) -> ExternLoweringInfo {
-        let ty = self.ty(owner);
-        Self::member_lowering_info(
-            ty,
-            ExternMemberSelector::Init,
-            ExternBindingOp::Call,
-            ty.init
-                .as_ref()
-                .map_or_else(ExternEffects::default, |init| init.effects),
-        )
-    }
-
-    pub(crate) fn operator_lowering_info(
-        &self,
-        operator_ref: ExternOperatorRef,
-    ) -> ExternLoweringInfo {
-        let ty = self.ty(operator_ref.owner);
-        let operator = &ty.operators[operator_ref.id.0];
-        Self::member_lowering_info(
-            ty,
-            ExternMemberSelector::Operator(operator.op),
-            ExternBindingOp::Call,
-            operator.effects,
-        )
-    }
-
-    fn member_lowering_info(
-        ty: &ExternType,
-        selector: ExternMemberSelector,
-        operation: ExternBindingOp,
-        effects: ExternEffects,
-    ) -> ExternLoweringInfo {
-        match &ty.context.provenance {
-            ExternProvenance::Provider { package, provider } => {
-                let module = provider_module_path(&ty.key.module);
-                ExternLoweringInfo::Provider(ProviderExternLoweringInfo {
-                    package: package.clone(),
-                    provider: provider.clone(),
-                    module: module.clone(),
-                    key: ExternBindingKey {
-                        target: ExternBindingTarget::Member(ExternMemberKey {
-                            owner: ExternTypeKey {
-                                module,
-                                name: ty.key.name.to_string(),
-                            },
-                            selector,
-                        }),
-                        operation,
-                    },
-                    effects,
-                })
-            }
-            ExternProvenance::Source { .. } => ExternLoweringInfo::Source { effects },
-        }
-    }
-
     pub(crate) fn function_by_key(&self, key: &FunctionKey) -> Option<ExternFunctionId> {
         self.functions_by_key.get(key).copied()
-    }
-
-    pub(crate) fn type_by_key(&self, key: &TypeKey) -> Option<ExternTypeId> {
-        self.types_by_key.get(key).copied()
     }
 
     pub(crate) fn type_by_nominal(&self, key: &NominalKey) -> Option<ExternTypeId> {
@@ -542,85 +396,24 @@ impl ExternCatalog {
     }
 }
 
-fn debug_assert_consistent(catalog: &ExternCatalog) {
-    for module in &catalog.modules {
-        debug_assert_eq!(catalog.module(module.id).id, module.id);
-        for id in &module.functions {
-            let function = catalog.function(*id);
-            debug_assert_eq!(catalog.function_by_key(&function.key), Some(*id));
-        }
-        for id in &module.types {
-            let ty = catalog.ty(*id);
-            debug_assert_eq!(catalog.type_by_key(&ty.key), Some(*id));
-            debug_assert_eq!(catalog.type_by_nominal(&ty.nominal), Some(*id));
-            for field in &ty.fields {
-                debug_assert_eq!(
-                    catalog
-                        .field(*id, field.name)
-                        .map(|(field_ref, _)| field_ref.id),
-                    Some(field.id)
-                );
-            }
-            for method in &ty.methods {
-                debug_assert_eq!(
-                    catalog
-                        .method(*id, method.name)
-                        .map(|(method_ref, _)| method_ref.id),
-                    Some(method.id)
-                );
-            }
-            for static_method in &ty.statics {
-                debug_assert_eq!(
-                    catalog
-                        .static_method(*id, static_method.name)
-                        .map(|(static_ref, _)| static_ref.id),
-                    Some(static_method.id)
-                );
-            }
-            for operator in &ty.operators {
-                let resolved = match operator.op {
-                    ExternOperator::Unary(op) => catalog.unary_operator(*id, op),
-                    ExternOperator::Binary { op, self_on_right } => {
-                        catalog.binary_operator(*id, op, self_on_right)
-                    }
-                };
-                debug_assert_eq!(
-                    resolved.map(|(operator_ref, _)| operator_ref.id),
-                    Some(operator.id)
-                );
-            }
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ExternModule {
-    pub(crate) id: ExternModuleId,
-    pub(crate) scope: ModuleScope,
-    pub(crate) functions: Vec<ExternFunctionId>,
-    pub(crate) types: Vec<ExternTypeId>,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ExternFunction {
     pub(crate) id: ExternFunctionId,
     pub(crate) key: FunctionKey,
-    pub(crate) provenance: ExternProvenance,
+    pub(crate) origin: ExternOrigin,
+    pub(crate) lowering: ExternLoweringInfo,
     pub(crate) site: RawExternSite,
-    pub(crate) doc: Option<String>,
     pub(crate) signature: ResolvedExternSignature,
     pub(crate) effects: ExternEffects,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ExternType {
-    pub(crate) id: ExternTypeId,
     pub(crate) key: TypeKey,
     pub(crate) nominal: NominalKey,
     pub(crate) context: ExternCatalogContext,
-    pub(crate) exported: bool,
+    pub(crate) binding: Option<ProviderExternTypeBinding>,
     pub(crate) site: RawExternSite,
-    pub(crate) doc: Option<String>,
     pub(crate) rep: ExternRep,
     pub(crate) layout: Option<anvyx_externs::ExternLayout>,
     pub(crate) materialization: Option<anvyx_externs::ExternMaterialization>,
@@ -641,7 +434,7 @@ pub(crate) struct ExternType {
 pub(crate) struct ExternInit {
     pub(crate) fields: ExternInitFields,
     pub(crate) signature: ResolvedExternSignature,
-    pub(crate) effects: ExternEffects,
+    pub(crate) lowering: ExternLoweringInfo,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -660,7 +453,6 @@ pub(crate) struct ExternInitField {
 pub(crate) struct ExternEnumVariant {
     pub(crate) name: Ident,
     pub(crate) fields: Vec<ExternEnumVariantField>,
-    pub(crate) doc: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -671,7 +463,6 @@ pub(crate) struct ExternEnumVariantField {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ExternField {
-    pub(crate) id: ExternFieldId,
     pub(crate) name: Ident,
     pub(crate) ty: ResolvedExternTy,
     pub(crate) computed: bool,
@@ -679,8 +470,9 @@ pub(crate) struct ExternField {
     pub(crate) writable: bool,
     pub(crate) get_receiver: ReceiverMode,
     pub(crate) set_receiver: ReceiverMode,
+    pub(crate) get_lowering: ExternLoweringInfo,
+    pub(crate) set_lowering: ExternLoweringInfo,
     pub(crate) site: RawExternSite,
-    pub(crate) doc: Option<String>,
 }
 
 impl ExternType {
@@ -707,17 +499,11 @@ impl ExternType {
             })
         })
     }
-
-    pub(crate) fn constructor_fields(
-        &self,
-    ) -> Option<impl Iterator<Item = (ExternInitField, &ExternField)> + '_> {
-        self.required_init_fields()
-    }
 }
 
 impl ExternInit {
     fn backs_literal(&self, owner: &NominalKey) -> bool {
-        init_backs_literal(&self.signature, self.effects, owner)
+        init_backs_literal(&self.signature, self.lowering.effects, owner)
     }
 }
 
@@ -736,38 +522,33 @@ fn init_backs_literal(
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ExternMethod {
-    pub(crate) id: ExternMethodId,
     pub(crate) name: Ident,
     pub(crate) receiver: ReceiverMode,
     pub(crate) signature: ResolvedExternSignature,
-    pub(crate) effects: ExternEffects,
+    pub(crate) lowering: ExternLoweringInfo,
     pub(crate) site: RawExternSite,
-    pub(crate) doc: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ExternStatic {
-    pub(crate) id: ExternStaticId,
     pub(crate) name: Ident,
     pub(crate) signature: ResolvedExternSignature,
-    pub(crate) effects: ExternEffects,
+    pub(crate) lowering: ExternLoweringInfo,
     pub(crate) site: RawExternSite,
-    pub(crate) doc: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ExternOperatorDecl {
-    pub(crate) id: ExternOperatorId,
     pub(crate) op: ExternOperator,
     pub(crate) receiver: ReceiverMode,
     pub(crate) signature: ResolvedExternSignature,
-    pub(crate) effects: ExternEffects,
+    pub(crate) lowering: ExternLoweringInfo,
     pub(crate) site: RawExternSite,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ExternCatalogContext {
-    pub(crate) provenance: ExternProvenance,
+    pub(crate) origin: ExternOrigin,
     pub(crate) module: ModuleScope,
     pub(crate) item: ExternContextItem,
 }
@@ -784,17 +565,17 @@ pub(crate) enum ExternContextItem {
 }
 
 impl ExternCatalogContext {
-    fn function(provenance: &ExternProvenance, module: ModuleScope, name: Ident) -> Self {
+    fn function(origin: &ExternOrigin, module: ModuleScope, name: Ident) -> Self {
         Self {
-            provenance: provenance.clone(),
+            origin: origin.clone(),
             module,
             item: ExternContextItem::Function { name },
         }
     }
 
-    fn ty(provenance: &ExternProvenance, module: ModuleScope, name: Ident) -> Self {
+    fn ty(origin: &ExternOrigin, module: ModuleScope, name: Ident) -> Self {
         Self {
-            provenance: provenance.clone(),
+            origin: origin.clone(),
             module,
             item: ExternContextItem::Type { name },
         }
@@ -834,7 +615,7 @@ impl ExternCatalogContext {
 
     fn with_item(&self, item: ExternContextItem) -> Self {
         Self {
-            provenance: self.provenance.clone(),
+            origin: self.origin.clone(),
             module: self.module.clone(),
             item,
         }
@@ -978,11 +759,31 @@ fn abi_param_position(flow: ParamFlow) -> AbiPosition {
     }
 }
 
+fn function_lowering(
+    origin: &ExternOrigin,
+    key: Option<&ExternBindingKey>,
+    effects: ExternEffects,
+) -> ExternLoweringInfo {
+    let binding = match (origin, key) {
+        (ExternOrigin::Provider { package, provider }, Some(key)) => {
+            Some(ProviderExternLoweringInfo {
+                package: package.clone(),
+                provider: provider.clone(),
+                key: key.clone(),
+            })
+        }
+        (ExternOrigin::Source, None) => None,
+        _ => unreachable!("extern function origin and binding disagree"),
+    };
+    ExternLoweringInfo { binding, effects }
+}
+
 pub(crate) fn build_catalog(
     raw: RawExterns,
+    providers: &ProviderCatalog,
     decls: &mut DeclarationIndex,
 ) -> Result<ExternCatalog, Vec<ExternCatalogError>> {
-    CatalogBuilder::new(decls).build(raw)
+    CatalogBuilder::new(decls).build(raw, providers)
 }
 
 struct CatalogBuilder<'a> {
@@ -1024,16 +825,32 @@ impl<'a> CatalogBuilder<'a> {
         }
     }
 
-    fn build(mut self, raw: RawExterns) -> Result<ExternCatalog, Vec<ExternCatalogError>> {
-        let groups = raw.groups;
-        for group in &groups {
-            for module in &group.modules {
-                self.allocate_module(module, &group.provenance);
-            }
+    fn build(
+        mut self,
+        raw: RawExterns,
+        providers: &ProviderCatalog,
+    ) -> Result<ExternCatalog, Vec<ExternCatalogError>> {
+        let modules = raw.modules;
+        for module in &modules {
+            self.allocate_module(module, &ExternOrigin::Source);
         }
-        for group in &groups {
-            for module in &group.modules {
-                self.resolve_module(module, &group.provenance);
+        for (package, provider, module) in providers.modules() {
+            self.allocate_provider_module(package, provider, module);
+        }
+        for module in &modules {
+            self.resolve_module(module, &ExternOrigin::Source);
+        }
+        for (package, provider, module) in providers.modules() {
+            let scope = provider_module_scope(package, &module.path);
+            let origin = ExternOrigin::Provider {
+                package: package.clone(),
+                provider: provider.clone(),
+            };
+            for function in &module.functions {
+                self.resolve_function(&scope, &origin, function, RawExternSite::default());
+            }
+            for ty in &module.types {
+                self.resolve_type(&scope, ty, RawExternSite::default(), Some(&module.path));
             }
         }
 
@@ -1042,125 +859,171 @@ impl<'a> CatalogBuilder<'a> {
         }
 
         validate_catalog(&self.catalog, self.decls)?;
-        debug_assert_consistent(&self.catalog);
         Ok(self.catalog)
     }
 
-    fn allocate_module(&mut self, raw: &RawExternModule, provenance: &ExternProvenance) {
+    fn allocate_module(&mut self, raw: &RawExternModule, origin: &ExternOrigin) {
         let scope = raw_module_scope(&raw.scope);
-        let module_id = self.module_id(scope.clone());
-
-        for raw_ty in &raw.types {
-            let name = Ident::new(&raw_ty.name);
-            let id = ExternTypeId(self.catalog.types.len());
-            let key = TypeKey {
-                module: scope.clone(),
-                name,
-            };
-            let nominal = self
-                .decls
-                .local_nominal_type(&scope, name)
-                .expect("catalog extern type missing nominal metadata");
-            self.catalog.modules[module_id.0].types.push(id);
-            self.catalog.types_by_key.insert(key.clone(), id);
-            self.catalog.types_by_nominal.insert(nominal.id.clone(), id);
-            self.catalog.types.push(ExternType {
-                id,
-                key,
-                nominal,
-                context: ExternCatalogContext::ty(provenance, scope.clone(), name),
-                exported: raw_ty.exported,
-                site: raw_ty.site,
-                doc: raw_ty.doc.clone(),
-                rep: raw_ty.rep,
-                layout: raw_ty.layout,
-                materialization: raw_ty.materialization,
-                owns_heap_edges: raw_ty.owns_heap_edges,
-                fields: vec![],
-                variants: vec![],
-                init: None,
-                methods: vec![],
-                statics: vec![],
-                operators: vec![],
-                fields_by_name: HashMap::new(),
-                methods_by_name: HashMap::new(),
-                statics_by_name: HashMap::new(),
-                operators_by_op: HashMap::new(),
-            });
+        for ty in &raw.types {
+            self.allocate_type(&scope, origin, &ty.decl, None, ty.site);
         }
-
-        for raw_func in &raw.functions {
-            let name = Ident::new(&raw_func.decl.name);
-            let id = ExternFunctionId(self.catalog.functions.len());
-            let key = FunctionKey {
-                module: scope.clone(),
-                name,
-            };
-            self.catalog.modules[module_id.0].functions.push(id);
-            self.catalog.functions_by_key.insert(key.clone(), id);
-            self.catalog.functions.push(ExternFunction {
-                id,
-                key,
-                provenance: provenance.clone(),
-                site: raw_func.site,
-                doc: raw_func.decl.doc.clone(),
-                signature: ResolvedExternSignature::default(),
-                effects: raw_func.decl.effects,
-            });
+        for function in &raw.functions {
+            self.allocate_function(&scope, origin, &function.decl, None, function.site);
         }
     }
 
-    fn module_id(&mut self, scope: ModuleScope) -> ExternModuleId {
-        if let Some(module) = self
-            .catalog
-            .modules
-            .iter()
-            .find(|module| module.scope == scope)
-        {
-            return module.id;
+    fn allocate_provider_module(
+        &mut self,
+        package: &ProviderPackageKey,
+        provider: &ProviderId,
+        module: &anvyx_externs::ExternModuleDescriptor,
+    ) {
+        let scope = provider_module_scope(package, &module.path);
+        let origin = ExternOrigin::Provider {
+            package: package.clone(),
+            provider: provider.clone(),
+        };
+        for ty in &module.types {
+            let key = ExternTypeKey {
+                module: module.path.clone(),
+                name: ty.name.clone(),
+            };
+            self.allocate_type(
+                &scope,
+                &origin,
+                ty,
+                Some(ProviderExternTypeBinding {
+                    package: package.clone(),
+                    provider: provider.clone(),
+                    key,
+                }),
+                RawExternSite::default(),
+            );
         }
-        let id = ExternModuleId(self.catalog.modules.len());
-        self.catalog.modules.push(ExternModule {
-            id,
-            scope,
-            functions: vec![],
-            types: vec![],
+        for function in &module.functions {
+            let key = ExternBindingKey {
+                target: ExternBindingTarget::Function(anvyx_externs::ExternFunctionKey {
+                    module: module.path.clone(),
+                    name: function.name.clone(),
+                }),
+                operation: ExternBindingOp::Call,
+            };
+            self.allocate_function(
+                &scope,
+                &origin,
+                function,
+                Some(&key),
+                RawExternSite::default(),
+            );
+        }
+    }
+
+    fn allocate_type(
+        &mut self,
+        scope: &ModuleScope,
+        origin: &ExternOrigin,
+        ty: &anvyx_externs::ExternTypeDescriptor,
+        binding: Option<ProviderExternTypeBinding>,
+        site: RawExternSite,
+    ) {
+        let name = Ident::new(&ty.name);
+        let id = ExternTypeId(self.catalog.types.len());
+        let key = TypeKey {
+            module: scope.clone(),
+            name,
+        };
+        let nominal = self
+            .decls
+            .local_nominal_type(scope, name)
+            .expect("catalog extern type missing nominal metadata");
+        self.catalog.types_by_key.insert(key.clone(), id);
+        self.catalog.types_by_nominal.insert(nominal.id.clone(), id);
+        self.catalog.types.push(ExternType {
+            key,
+            nominal,
+            context: ExternCatalogContext::ty(origin, scope.clone(), name),
+            binding,
+            site,
+            rep: ty.rep,
+            layout: ty.layout,
+            materialization: ty.materialization,
+            owns_heap_edges: ty.owns_heap_edges,
+            fields: vec![],
+            variants: vec![],
+            init: None,
+            methods: vec![],
+            statics: vec![],
+            operators: vec![],
+            fields_by_name: HashMap::new(),
+            methods_by_name: HashMap::new(),
+            statics_by_name: HashMap::new(),
+            operators_by_op: HashMap::new(),
         });
-        id
     }
 
-    fn resolve_module(&mut self, raw: &RawExternModule, provenance: &ExternProvenance) {
+    fn allocate_function(
+        &mut self,
+        scope: &ModuleScope,
+        origin: &ExternOrigin,
+        function: &anvyx_externs::ExternFunctionDescriptor,
+        binding: Option<&ExternBindingKey>,
+        site: RawExternSite,
+    ) {
+        let name = Ident::new(&function.name);
+        let id = ExternFunctionId(self.catalog.functions.len());
+        let key = FunctionKey {
+            module: scope.clone(),
+            name,
+        };
+        self.catalog.functions_by_key.insert(key.clone(), id);
+        self.catalog.functions.push(ExternFunction {
+            id,
+            key,
+            origin: origin.clone(),
+            lowering: function_lowering(origin, binding, function.effects),
+            site,
+            signature: ResolvedExternSignature::default(),
+            effects: function.effects,
+        });
+    }
+
+    fn resolve_module(&mut self, raw: &RawExternModule, origin: &ExternOrigin) {
         let scope = raw_module_scope(&raw.scope);
         for raw_func in &raw.functions {
-            self.resolve_function(&scope, provenance, raw_func);
+            self.resolve_function(&scope, origin, &raw_func.decl, raw_func.site);
         }
         for raw_ty in &raw.types {
-            self.resolve_type(&scope, raw_ty);
+            self.resolve_type(&scope, &raw_ty.decl, raw_ty.site, None);
         }
     }
 
     fn resolve_function(
         &mut self,
         scope: &ModuleScope,
-        provenance: &ExternProvenance,
-        raw: &RawExternFunction,
+        origin: &ExternOrigin,
+        raw: &anvyx_externs::ExternFunctionDescriptor,
+        site: RawExternSite,
     ) {
         let key = FunctionKey {
             module: scope.clone(),
-            name: Ident::new(&raw.decl.name),
+            name: Ident::new(&raw.name),
         };
         let Some(id) = self.catalog.functions_by_key.get(&key).copied() else {
             return;
         };
-        let context = ExternCatalogContext::function(provenance, scope.clone(), key.name);
-        let signature = self.resolve_signature(
-            ResolveCtx::new(scope, &context, None, raw.site),
-            &raw.decl.signature,
-        );
+        let context = ExternCatalogContext::function(origin, scope.clone(), key.name);
+        let signature =
+            self.resolve_signature(ResolveCtx::new(scope, &context, None, site), &raw.signature);
         self.catalog.functions[id.0].signature = signature;
     }
 
-    fn resolve_type(&mut self, scope: &ModuleScope, raw: &RawExternType) {
+    fn resolve_type(
+        &mut self,
+        scope: &ModuleScope,
+        raw: &anvyx_externs::ExternTypeDescriptor,
+        site: RawExternSite,
+        module: Option<&anvyx_externs::ModulePath>,
+    ) {
         let key = TypeKey {
             module: scope.clone(),
             name: Ident::new(&raw.name),
@@ -1169,28 +1032,61 @@ impl<'a> CatalogBuilder<'a> {
             return;
         };
         let owner = self.catalog.types[type_id.0].nominal.clone();
+        let binding = self.catalog.types[type_id.0].binding.clone();
+        let lowering = |key: Option<ExternBindingKey>, effects| ExternLoweringInfo {
+            binding: binding.as_ref().map(|binding| ProviderExternLoweringInfo {
+                package: binding.package.clone(),
+                provider: binding.provider.clone(),
+                key: key.expect("provider extern member has lowering key"),
+            }),
+            effects,
+        };
+        let member_key = |selector, operation| {
+            module.map(|module| ExternBindingKey {
+                target: ExternBindingTarget::Member(ExternMemberKey {
+                    owner: ExternTypeKey {
+                        module: module.clone(),
+                        name: raw.name.clone(),
+                    },
+                    selector,
+                }),
+                operation,
+            })
+        };
 
         for raw_field in &raw.fields {
             let id = ExternFieldId(self.catalog.types[type_id.0].fields.len());
-            let name = Ident::new(&raw_field.decl.name);
+            let name = Ident::new(&raw_field.name);
             let context = self.catalog.types[type_id.0].context.field(name);
             let ty = self.resolve_ty(
-                ResolveCtx::new(scope, &context, Some(&owner), raw_field.site),
-                &raw_field.decl.ty,
+                ResolveCtx::new(scope, &context, Some(&owner), site),
+                &raw_field.ty,
             );
             let ty_decl = &mut self.catalog.types[type_id.0];
             ty_decl.fields_by_name.insert(name, id);
             ty_decl.fields.push(ExternField {
-                id,
                 name,
                 ty,
-                computed: raw_field.decl.computed,
-                readable: raw_field.decl.readable,
-                writable: raw_field.decl.writable,
-                get_receiver: raw_field.decl.get_receiver,
-                set_receiver: raw_field.decl.set_receiver,
-                site: raw_field.site,
-                doc: raw_field.decl.doc.clone(),
+                computed: raw_field.computed,
+                readable: raw_field.readable,
+                writable: raw_field.writable,
+                get_receiver: raw_field.get_receiver,
+                set_receiver: raw_field.set_receiver,
+                get_lowering: lowering(
+                    member_key(
+                        ExternMemberSelector::Field(raw_field.name.clone()),
+                        ExternBindingOp::Get,
+                    ),
+                    ExternEffects::default(),
+                ),
+                set_lowering: lowering(
+                    member_key(
+                        ExternMemberSelector::Field(raw_field.name.clone()),
+                        ExternBindingOp::Set,
+                    ),
+                    ExternEffects::default(),
+                ),
+                site,
             });
         }
 
@@ -1206,12 +1102,11 @@ impl<'a> CatalogBuilder<'a> {
                     .map(|field| ExternEnumVariantField {
                         name: field.name.as_deref().map(Ident::new),
                         ty: self.resolve_ty(
-                            ResolveCtx::new(scope, &variant_context, Some(&owner), raw.site),
+                            ResolveCtx::new(scope, &variant_context, Some(&owner), site),
                             &field.ty,
                         ),
                     })
                     .collect(),
-                doc: variant.doc.clone(),
             })
             .collect();
         self.catalog.types[type_id.0].variants = variants;
@@ -1219,68 +1114,117 @@ impl<'a> CatalogBuilder<'a> {
         if let Some(raw_init) = &raw.init {
             let context = self.catalog.types[type_id.0].context.init();
             let signature = self.resolve_init_signature(
-                ResolveCtx::new(scope, &context, Some(&owner), raw_init.site),
+                ResolveCtx::new(scope, &context, Some(&owner), site),
                 raw_init,
                 &owner,
             );
-            let backs_literal = init_backs_literal(&signature, raw_init.decl.effects, &owner);
+            let backs_literal = init_backs_literal(&signature, raw_init.effects, &owner);
             let fields = if backs_literal {
-                self.resolve_init_fields(type_id, raw_init, &signature, &context)
+                self.resolve_init_fields(type_id, raw_init, site, &signature, &context)
             } else {
                 ExternInitFields::default()
             };
             self.catalog.types[type_id.0].init = Some(ExternInit {
                 fields,
                 signature,
-                effects: raw_init.decl.effects,
+                lowering: lowering(
+                    member_key(ExternMemberSelector::Init, ExternBindingOp::Call),
+                    raw_init.effects,
+                ),
             });
         }
 
         for raw_method in &raw.methods {
             let id = ExternMethodId(self.catalog.types[type_id.0].methods.len());
-            let name = Ident::new(&raw_method.decl.name);
+            let name = Ident::new(&raw_method.name);
             let context = self.catalog.types[type_id.0].context.method(name);
             let signature = self.resolve_signature(
-                ResolveCtx::new(scope, &context, Some(&owner), raw_method.site),
-                &raw_method.decl.signature,
+                ResolveCtx::new(scope, &context, Some(&owner), site),
+                &raw_method.signature,
             );
             let ty_decl = &mut self.catalog.types[type_id.0];
             ty_decl.methods_by_name.insert(name, id);
             ty_decl.methods.push(ExternMethod {
-                id,
                 name,
-                receiver: raw_method.decl.receiver,
+                receiver: raw_method.receiver,
                 signature,
-                effects: raw_method.decl.effects,
-                site: raw_method.site,
-                doc: raw_method.decl.doc.clone(),
+                lowering: lowering(
+                    member_key(
+                        ExternMemberSelector::Method(raw_method.name.clone()),
+                        ExternBindingOp::Call,
+                    ),
+                    raw_method.effects,
+                ),
+                site,
             });
         }
 
         for raw_static in &raw.statics {
-            self.resolve_static(type_id, scope, &owner, raw_static);
+            let id = ExternStaticId(self.catalog.types[type_id.0].statics.len());
+            let name = Ident::new(&raw_static.name);
+            let context = self.catalog.types[type_id.0].context.static_method(name);
+            let signature = self.resolve_signature(
+                ResolveCtx::new(scope, &context, Some(&owner), site),
+                &raw_static.signature,
+            );
+            let ty = &mut self.catalog.types[type_id.0];
+            ty.statics_by_name.insert(name, id);
+            ty.statics.push(ExternStatic {
+                name,
+                signature,
+                lowering: lowering(
+                    member_key(
+                        ExternMemberSelector::Static(raw_static.name.clone()),
+                        ExternBindingOp::Call,
+                    ),
+                    raw_static.effects,
+                ),
+                site,
+            });
         }
         for raw_operator in &raw.operators {
-            self.resolve_operator(type_id, scope, &owner, raw_operator);
+            let id = ExternOperatorId(self.catalog.types[type_id.0].operators.len());
+            let context = self.catalog.types[type_id.0]
+                .context
+                .operator(raw_operator.op);
+            let signature = self.resolve_signature(
+                ResolveCtx::new(scope, &context, Some(&owner), site),
+                &raw_operator.signature,
+            );
+            let ty = &mut self.catalog.types[type_id.0];
+            ty.operators_by_op.insert(raw_operator.op, id);
+            ty.operators.push(ExternOperatorDecl {
+                op: raw_operator.op,
+                receiver: raw_operator.receiver,
+                signature,
+                lowering: lowering(
+                    member_key(
+                        ExternMemberSelector::Operator(raw_operator.op),
+                        ExternBindingOp::Call,
+                    ),
+                    raw_operator.effects,
+                ),
+                site,
+            });
         }
     }
 
     fn resolve_init_signature(
         &mut self,
         ctx: ResolveCtx<'_>,
-        raw_init: &RawExternInit,
+        raw_init: &anvyx_externs::ExternInitDescriptor,
         owner: &NominalKey,
     ) -> ResolvedExternSignature {
-        let ret = if raw_init.decl.ret == ExternTypeExpr::Void {
+        let ret = if raw_init.ret == ExternTypeExpr::Void {
             ResolvedExternTy {
                 ty: nominal_type(owner),
                 abi: ExternTypeExpr::named(None, owner.name.to_string()),
             }
         } else {
-            self.resolve_ty(ctx, &raw_init.decl.ret)
+            self.resolve_ty(ctx, &raw_init.ret)
         };
         ResolvedExternSignature {
-            params: self.resolve_params(ctx, &raw_init.decl.params),
+            params: self.resolve_params(ctx, &raw_init.params),
             ret,
         }
     }
@@ -1288,23 +1232,19 @@ impl<'a> CatalogBuilder<'a> {
     fn resolve_init_fields(
         &mut self,
         type_id: ExternTypeId,
-        raw_init: &RawExternInit,
+        raw_init: &anvyx_externs::ExternInitDescriptor,
+        site: RawExternSite,
         signature: &ResolvedExternSignature,
         context: &ExternCatalogContext,
     ) -> ExternInitFields {
-        let required = self.resolve_init_field_group(
-            type_id,
-            raw_init,
-            signature,
-            context,
-            &raw_init.decl.field_init,
-        );
+        let required =
+            self.resolve_init_field_group(type_id, site, signature, context, &raw_init.field_init);
         let presence = self.resolve_init_field_group(
             type_id,
-            raw_init,
+            site,
             signature,
             context,
-            &raw_init.decl.presence_init,
+            &raw_init.presence_init,
         );
         ExternInitFields { required, presence }
     }
@@ -1312,7 +1252,7 @@ impl<'a> CatalogBuilder<'a> {
     fn resolve_init_field_group(
         &mut self,
         type_id: ExternTypeId,
-        raw_init: &RawExternInit,
+        site: RawExternSite,
         signature: &ResolvedExternSignature,
         context: &ExternCatalogContext,
         names: &[String],
@@ -1331,7 +1271,7 @@ impl<'a> CatalogBuilder<'a> {
                 self.errors.push(ExternCatalogError::UnknownInitField {
                     context: context.clone(),
                     field: name,
-                    site: raw_init.site,
+                    site,
                 });
                 continue;
             };
@@ -1346,7 +1286,7 @@ impl<'a> CatalogBuilder<'a> {
                     field: name,
                     expected: field_ty.clone(),
                     found: param.ty.ty.clone(),
-                    site: raw_init.site,
+                    site,
                 });
             }
             fields.push(ExternInitField {
@@ -1355,57 +1295,6 @@ impl<'a> CatalogBuilder<'a> {
             });
         }
         fields
-    }
-
-    fn resolve_static(
-        &mut self,
-        type_id: ExternTypeId,
-        scope: &ModuleScope,
-        owner: &NominalKey,
-        raw: &RawExternStatic,
-    ) {
-        let id = ExternStaticId(self.catalog.types[type_id.0].statics.len());
-        let name = Ident::new(&raw.decl.name);
-        let context = self.catalog.types[type_id.0].context.static_method(name);
-        let signature = self.resolve_signature(
-            ResolveCtx::new(scope, &context, Some(owner), raw.site),
-            &raw.decl.signature,
-        );
-        let ty = &mut self.catalog.types[type_id.0];
-        ty.statics_by_name.insert(name, id);
-        ty.statics.push(ExternStatic {
-            id,
-            name,
-            signature,
-            effects: raw.decl.effects,
-            site: raw.site,
-            doc: raw.decl.doc.clone(),
-        });
-    }
-
-    fn resolve_operator(
-        &mut self,
-        type_id: ExternTypeId,
-        scope: &ModuleScope,
-        owner: &NominalKey,
-        raw: &RawExternOperator,
-    ) {
-        let id = ExternOperatorId(self.catalog.types[type_id.0].operators.len());
-        let context = self.catalog.types[type_id.0].context.operator(raw.decl.op);
-        let signature = self.resolve_signature(
-            ResolveCtx::new(scope, &context, Some(owner), raw.site),
-            &raw.decl.signature,
-        );
-        let ty = &mut self.catalog.types[type_id.0];
-        ty.operators_by_op.insert(raw.decl.op, id);
-        ty.operators.push(ExternOperatorDecl {
-            id,
-            op: raw.decl.op,
-            receiver: raw.decl.receiver,
-            signature,
-            effects: raw.decl.effects,
-            site: raw.site,
-        });
     }
 
     fn resolve_signature(
@@ -1443,7 +1332,7 @@ impl<'a> CatalogBuilder<'a> {
 
     fn resolve_ty(&mut self, ctx: ResolveCtx<'_>, ty: &ExternTypeExpr) -> ResolvedExternTy {
         let resolved = self.resolve_ty_inner(ctx, ty);
-        let abi = if matches!(ctx.context.provenance, ExternProvenance::Source { .. }) {
+        let abi = if matches!(ctx.context.origin, ExternOrigin::Source) {
             self.abi_from_resolved_ty(&resolved)
                 .unwrap_or_else(|| ty.clone())
         } else {
@@ -1631,14 +1520,14 @@ impl<'a> CatalogBuilder<'a> {
         args: &[ExternTypeExpr],
     ) -> Type {
         let name = Ident::new(name);
-        if matches!(ctx.context.provenance, ExternProvenance::Source { .. }) {
+        if matches!(ctx.context.origin, ExternOrigin::Source) {
             return self.resolve_source_type_ref(ctx, module, name, args);
         }
 
-        let Some(key) = self.resolve_provider_named(ctx.scope, module, name) else {
+        let Some(key) = self.resolve_provider_named(ctx.context, ctx.scope, module, name) else {
             self.errors.push(ExternCatalogError::UnknownType {
                 context: ctx.context.clone(),
-                module: module.map(|module| missing_type_module(ctx.scope, ctx.context, module)),
+                module: module.map(|module| missing_type_module(ctx.context, module)),
                 name,
                 site: ctx.site,
             });
@@ -1671,7 +1560,7 @@ impl<'a> CatalogBuilder<'a> {
             Some(module) => {
                 self.errors.push(ExternCatalogError::UnknownType {
                     context: ctx.context.clone(),
-                    module: Some(missing_type_module(ctx.scope, ctx.context, module)),
+                    module: Some(missing_type_module(ctx.context, module)),
                     name,
                     site: ctx.site,
                 });
@@ -1713,14 +1602,18 @@ impl<'a> CatalogBuilder<'a> {
 
     fn resolve_provider_named(
         &self,
+        context: &ExternCatalogContext,
         scope: &ModuleScope,
         module: Option<&anvyx_externs::ModulePath>,
         name: Ident,
     ) -> Option<NominalKey> {
         match module {
-            Some(module) => self
-                .decls
-                .exported_nominal_type(&provider_module_scope(scope, module), name),
+            Some(module) => match &context.origin {
+                ExternOrigin::Provider { package, .. } => self
+                    .decls
+                    .exported_nominal_type(&provider_module_scope(package, module), name),
+                ExternOrigin::Source => None,
+            },
             None => self.decls.local_nominal_type(scope, name),
         }
     }
@@ -1834,36 +1727,12 @@ impl<'a> CatalogBuilder<'a> {
 }
 
 fn missing_type_module(
-    scope: &ModuleScope,
     context: &ExternCatalogContext,
     module: &anvyx_externs::ModulePath,
 ) -> ModuleScope {
-    match context.provenance {
-        ExternProvenance::Provider { .. } => provider_module_scope(scope, module),
-        ExternProvenance::Source { .. } => extern_module_scope(module),
-    }
-}
-
-fn provider_module_path(scope: &ModuleScope) -> anvyx_externs::ModulePath {
-    let segments = match scope {
-        ModuleScope::Package(current) => current
-            .provider_path()
-            .expect("provider extern scope has provider path")
-            .segments()
-            .to_vec(),
-        ModuleScope::Named(path) => path.segments().to_vec(),
-        ModuleScope::Root => vec![],
-    };
-    anvyx_externs::ModulePath { segments }
-}
-
-fn provider_module_scope(scope: &ModuleScope, module: &anvyx_externs::ModulePath) -> ModuleScope {
-    let path = extern_module_path(module);
-    match scope {
-        ModuleScope::Package(current) => {
-            ModuleScope::from_module_id(&ModuleId::provider(current.package().clone(), path))
-        }
-        ModuleScope::Root | ModuleScope::Named(_) => ModuleScope::Named(path),
+    match &context.origin {
+        ExternOrigin::Provider { package, .. } => provider_module_scope(package, module),
+        ExternOrigin::Source => ModuleScope::Named(extern_module_path(module)),
     }
 }
 
@@ -1923,7 +1792,9 @@ fn validate_ty(
 ) {
     validate_type_facts(context, &ty.ty, site, errors);
     validate_source_schema_flags(context, &ty.ty, site, decls, errors);
-    validate_abi_type(context, &ty.abi, position, site, errors);
+    if matches!(context.origin, ExternOrigin::Source) {
+        validate_abi_type(context, &ty.abi, position, site, errors);
+    }
     validate_map_keys(context, &ty.ty, site, decls, errors);
 }
 
@@ -1936,12 +1807,12 @@ fn validate_abi_type(
 ) {
     if let Err(violations) = ty.classify_abi(position) {
         errors.extend(violations.into_iter().filter_map(|violation| {
-            let source_generic = matches!(context.provenance, ExternProvenance::Source { .. })
-                && violation.reason == AbiTypeError::GenericNamedArgsUnsupported;
+            let source_generic = matches!(context.origin, ExternOrigin::Source)
+                && violation.1 == AbiTypeError::GenericNamedArgsUnsupported;
             (!source_generic).then(|| ExternCatalogError::InvalidAbiType {
                 context: context.clone(),
-                position: violation.position,
-                reason: violation.reason,
+                position: violation.0,
+                reason: violation.1,
                 site,
             })
         }));
@@ -1966,7 +1837,7 @@ fn validate_source_schema_flags(
     errors: &mut Vec<ExternCatalogError>,
 ) {
     let mut flags = FlagTypeVisitor { decls };
-    if matches!(context.provenance, ExternProvenance::Source { .. }) && flags.visit_type(ty) {
+    if matches!(context.origin, ExternOrigin::Source) && flags.visit_type(ty) {
         errors.push(invalid_type(
             context,
             ty,

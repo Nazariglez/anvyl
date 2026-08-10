@@ -9,10 +9,9 @@ use syn::{
 };
 
 use crate::boundary::{
-    BoundaryConversion, callback_wrapper_requires_ctxless, classify_param,
-    classify_provider_return, conversion_tokens, flow_tokens, param_abi_for_override,
-    param_abi_tokens, param_escape_tokens, return_abi_for_override, return_abi_tokens,
-    signature_conversion, type_expr_tokens, type_with_override, validate_callable_signature,
+    callback_wrapper_requires_ctxless, classify_param, classify_provider_return, flow_tokens,
+    param_abi_for_override, param_abi_tokens, param_escape_tokens, return_abi_for_override,
+    return_abi_tokens, type_expr_tokens, type_with_override, validate_callable_signature,
     validate_callback_wrapper_precheck, validate_ctx_param, validate_mut_place_ctx,
 };
 
@@ -191,18 +190,10 @@ fn expand_inner(attr: TokenStream, item: TokenStream) -> syn::Result<TokenStream
         .map(|(param, ty)| param_abi_tokens(&param_abi_for_override(&param.abi, ty, param.flow)))
         .collect::<Vec<_>>();
     let ret_abi = return_abi_tokens(&return_abi_for_override(&ret.abi, &ret_ty));
-    let conversion = signature_conversion(&params, &ret);
-    if conversion == BoundaryConversion::Unsupported {
-        return Err(syn::Error::new_spanned(
-            &func.sig,
-            "unsupported native ABI conversion",
-        ));
-    }
-    let support = conversion_tokens(conversion);
     let wrapper_ctx = if callback_wrapper && ctxless_callback_wrapper {
-        quote! { anvyx_runtime::RustWrapperCtx::None }
+        quote! { anvyx_runtime::RustCallContext::None }
     } else {
-        quote! { anvyx_runtime::RustWrapperCtx::HiddenRuntime }
+        quote! { anvyx_runtime::RustCallContext::HiddenRuntime }
     };
     let fallible = ret.fallible;
     let native_ctx = if args.ctx {
@@ -232,9 +223,9 @@ fn expand_inner(attr: TokenStream, item: TokenStream) -> syn::Result<TokenStream
         #func
 
         #[doc(hidden)]
-        pub fn #companion() -> anvyx_runtime::FunctionExport {
-            anvyx_runtime::FunctionExport {
-                descriptor: anvyx_runtime::ExternFunctionDescriptor {
+        pub fn #companion() -> anvyx_runtime::ModuleExport {
+            anvyx_runtime::ModuleExport::function(
+                anvyx_runtime::ExternFunctionDescriptor {
                     name: #export_name.to_string(),
                     doc: #doc,
                     signature: anvyx_runtime::ExternSignature {
@@ -243,17 +234,13 @@ fn expand_inner(attr: TokenStream, item: TokenStream) -> syn::Result<TokenStream
                     },
                     effects: anvyx_runtime::ExternEffects { fallible: #fallible },
                 },
-                rust: anvyx_runtime::RustLocalBinding {
-                    symbol: stringify!(#wrapper).to_string(),
-                    abi: anvyx_runtime::RustExternAbi {
-                        params: vec![#(#param_abis),*],
-                        ret: #ret_abi,
-                        fallible: #fallible,
-                        support: #support,
-                        ctx: #wrapper_ctx,
-                    },
+                stringify!(#wrapper).to_string(),
+                anvyx_runtime::RustExternAbi {
+                    params: vec![#(#param_abis),*],
+                    ret: #ret_abi,
+                    ctx: #wrapper_ctx,
                 },
-            }
+            )
         }
 
         #[doc(hidden)]

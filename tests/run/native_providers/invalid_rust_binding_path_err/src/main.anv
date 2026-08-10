@@ -1,0 +1,10 @@
+// @mode: run
+// @expect: error
+// @contains: has invalid binding Rust path
+// @contains: segment `bad-segment` is not a Rust identifier
+
+import pkg:host.host { ping };
+
+fn main() {
+    ping();
+}

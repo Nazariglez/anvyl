@@ -1,0 +1,14 @@
+// @mode: run
+// @expect: success
+// @match-begin
+// 1
+// 2
+// @match-end
+
+import pkg:left.shared { left_value };
+import pkg:right.shared { right_value };
+
+fn main() {
+    println(left_value());
+    println(right_value());
+}

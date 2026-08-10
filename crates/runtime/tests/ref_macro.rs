@@ -2,10 +2,13 @@
 
 use std::{cell::Cell, rc::Rc};
 
+mod support;
+
 use anvyx_runtime::{
     AnvRef, AnvRefType, AnvyxRef, AnvyxRefExport, ErasedHandle, ExternRep, ExternTypeExpr, Heap,
     Trace, TraceDriver, Visitor,
 };
+use support::provider_package::TestCatalog;
 
 #[derive(AnvyxRef)]
 #[anvyx(name = "Counter")]
@@ -60,14 +63,15 @@ fn assert_ref<T: AnvyxRefExport>() {}
 fn ref_descriptor_contains_exported_fields_and_name() {
     assert_ref::<HostCounter>();
 
-    let export = __anvyx_export_hostcounter();
+    let package = TestCatalog::from_export(__anvyx_export_hostcounter());
+    let (native, export) = package.ty("Counter");
 
-    assert_eq!(export.descriptor.name, "Counter");
-    assert_eq!(export.descriptor.rep, ExternRep::Shared);
-    assert_eq!(export.descriptor.fields.len(), 1);
-    assert_eq!(export.descriptor.fields[0].name, "count");
-    assert_eq!(export.descriptor.fields[0].ty, ExternTypeExpr::Int);
-    assert!(export.bindings.is_empty());
+    assert_eq!(export.name, "Counter");
+    assert_eq!(export.rep, ExternRep::Shared);
+    assert_eq!(export.fields.len(), 1);
+    assert_eq!(export.fields[0].name, "count");
+    assert_eq!(export.fields[0].ty, ExternTypeExpr::Int);
+    assert!(native.materializer.is_none());
 }
 
 #[test]

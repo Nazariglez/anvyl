@@ -167,7 +167,6 @@ pub fn describe_unit_result(value: Result<(), AnvString>) -> i64 {
 
 anvyx_runtime::builtin_module! {
     name: "host",
-    source: "",
     exports: [
         HostError,
         make_host_error,

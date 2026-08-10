@@ -1,7 +1,8 @@
-use anvyx_runtime::{RustParamAbi, RustReturnAbi};
+use anvyx_externs::{RustParamAdapter, RustReturnAdapter};
 
 use super::rir::{
-    RirCoreEnumKind, RirNativeReturn, RirParamEscape, RirPassMode, RirProgram, RirType, RirTypeId,
+    RirCoreEnumKind, RirNativeParam, RirNativeReturn, RirParamEscape, RirPassMode, RirProgram,
+    RirType, RirTypeId,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -28,28 +29,125 @@ enum NativeReentryPolicy {
     UnsupportedLiveBoundary,
 }
 
-pub(super) fn classify_param(abi: &RustParamAbi) -> (RirPassMode, RirParamEscape) {
-    match abi {
-        RustParamAbi::Value(_)
-        | RustParamAbi::OwnedNamed(_)
-        | RustParamAbi::InitField(_)
-        | RustParamAbi::Option(_)
-        | RustParamAbi::Result(_, _)
-        | RustParamAbi::Slice(_) => (RirPassMode::Value, RirParamEscape::NonEscaping),
-        RustParamAbi::Borrow(_) => (RirPassMode::SharedBorrow, RirParamEscape::NonEscaping),
-        RustParamAbi::MutBorrow(_) => (RirPassMode::MutBorrow, RirParamEscape::NonEscaping),
-        RustParamAbi::MutPlace(_) => (RirPassMode::MutPlace, RirParamEscape::NonEscaping),
-        RustParamAbi::ScopedLambda(_) => (RirPassMode::ScopedLambda, RirParamEscape::NonEscaping),
-        RustParamAbi::EscapingLambda(_) => (RirPassMode::EscapingLambda, RirParamEscape::Escaping),
-        RustParamAbi::AnvCallback(_) => (RirPassMode::AnvCallback, RirParamEscape::Escaping),
+pub(super) fn plan_param(
+    program: &RirProgram,
+    ty: RirTypeId,
+    adapter: &RustParamAdapter,
+) -> RirNativeParam {
+    match adapter {
+        RustParamAdapter::Value => plan_value_param(program, ty),
+        RustParamAdapter::OwnedNamed => RirNativeParam::OwnedNamed,
+        RustParamAdapter::Borrow => RirNativeParam::Borrow,
+        RustParamAdapter::MutBorrow => RirNativeParam::MutBorrow,
+        RustParamAdapter::MutPlace => RirNativeParam::MutPlace,
+        RustParamAdapter::ScopedLambda => RirNativeParam::ScopedLambda,
+        RustParamAdapter::EscapingLambda => RirNativeParam::EscapingLambda,
+        RustParamAdapter::AnvCallback => RirNativeParam::AnvCallback,
+        RustParamAdapter::InitField(inner) => {
+            RirNativeParam::InitField(Box::new(plan_param(program, ty, inner)))
+        }
+        RustParamAdapter::Option(inner) => {
+            let payload_ty =
+                option_payload_ty(program, ty).expect("attested native option parameter");
+            RirNativeParam::Option(Box::new(plan_param(program, payload_ty, inner)))
+        }
+        RustParamAdapter::Result(ok, err) => {
+            let (ok_ty, err_ty) =
+                result_payload_tys(program, ty).expect("attested native result parameter");
+            RirNativeParam::Result(
+                Box::new(plan_param(program, ok_ty, ok)),
+                Box::new(plan_param(program, err_ty, err)),
+            )
+        }
+        RustParamAdapter::Slice(inner) => {
+            let elem_ty = slice_elem_ty(program, ty).expect("attested native slice parameter");
+            RirNativeParam::Slice(Box::new(plan_param(program, elem_ty, inner)))
+        }
+    }
+}
+
+fn plan_value_param(program: &RirProgram, ty: RirTypeId) -> RirNativeParam {
+    if native_ref_ty(program, ty) {
+        return RirNativeParam::SharedNamed;
+    }
+    match program.types.get(ty.index()) {
+        Some(RirType::Option(inner)) => {
+            RirNativeParam::Option(Box::new(plan_value_param(program, *inner)))
+        }
+        Some(RirType::Array { elem, .. }) => {
+            RirNativeParam::Array(Box::new(plan_value_param(program, *elem)))
+        }
+        _ => match result_payload_tys(program, ty) {
+            Some((ok, err)) => RirNativeParam::Result(
+                Box::new(plan_value_param(program, ok)),
+                Box::new(plan_value_param(program, err)),
+            ),
+            None => RirNativeParam::Value,
+        },
+    }
+}
+
+fn option_payload_ty(program: &RirProgram, ty: RirTypeId) -> Option<RirTypeId> {
+    let RirType::Option(payload) = program.types.get(ty.index())? else {
+        return None;
+    };
+    Some(*payload)
+}
+
+fn slice_elem_ty(program: &RirProgram, ty: RirTypeId) -> Option<RirTypeId> {
+    let RirType::Slice(elem) = program.types.get(ty.index())? else {
+        return None;
+    };
+    Some(*elem)
+}
+
+fn result_payload_tys(program: &RirProgram, ty: RirTypeId) -> Option<(RirTypeId, RirTypeId)> {
+    let RirType::Enum(id) = program.types.get(ty.index())? else {
+        return None;
+    };
+    let enm = program.enums.get(id.index())?;
+    let [ok, err] = enm.variants.as_slice() else {
+        return None;
+    };
+    let [ok_field] = ok.fields.as_slice() else {
+        return None;
+    };
+    let [err_field] = err.fields.as_slice() else {
+        return None;
+    };
+    (enm.core == Some(RirCoreEnumKind::Result)).then_some((ok_field.ty, err_field.ty))
+}
+
+fn native_ref_ty(program: &RirProgram, ty: RirTypeId) -> bool {
+    matches!(program.types.get(ty.index()), Some(RirType::Struct(id))
+        if program.structs.get(id.index()).is_some_and(|strukt| strukt.native_ref))
+}
+
+pub(super) fn classify_param(plan: &RirNativeParam) -> (RirPassMode, RirParamEscape) {
+    match plan {
+        RirNativeParam::Value
+        | RirNativeParam::SharedNamed
+        | RirNativeParam::OwnedNamed
+        | RirNativeParam::InitField(_)
+        | RirNativeParam::Option(_)
+        | RirNativeParam::Result(_, _)
+        | RirNativeParam::Array(_)
+        | RirNativeParam::Slice(_) => (RirPassMode::Value, RirParamEscape::NonEscaping),
+        RirNativeParam::Borrow => (RirPassMode::SharedBorrow, RirParamEscape::NonEscaping),
+        RirNativeParam::MutBorrow => (RirPassMode::MutBorrow, RirParamEscape::NonEscaping),
+        RirNativeParam::MutPlace => (RirPassMode::MutPlace, RirParamEscape::NonEscaping),
+        RirNativeParam::ScopedLambda => (RirPassMode::ScopedLambda, RirParamEscape::NonEscaping),
+        RirNativeParam::EscapingLambda => (RirPassMode::EscapingLambda, RirParamEscape::Escaping),
+        RirNativeParam::AnvCallback => (RirPassMode::AnvCallback, RirParamEscape::Escaping),
     }
 }
 
 pub(super) fn classify_arg_action(
-    abi: &RustParamAbi,
+    plan: &RirNativeParam,
     mode: RirPassMode,
     native_ref: bool,
     suspends_runtime_entry: bool,
+    ty: &RirType,
 ) -> NativeArgAction {
     match mode {
         RirPassMode::SharedBorrow if native_ref => {
@@ -63,7 +161,7 @@ pub(super) fn classify_arg_action(
     if !suspends_runtime_entry {
         return NativeArgAction::Direct;
     }
-    match reentry_policy(abi) {
+    match reentry_policy(plan, ty) {
         NativeReentryPolicy::Safe => NativeArgAction::Direct,
         NativeReentryPolicy::SnapshotStringBorrow => NativeArgAction::SnapshotString,
         NativeReentryPolicy::UnsupportedLiveBoundary => NativeArgAction::RejectLiveBoundary,
@@ -73,18 +171,17 @@ pub(super) fn classify_arg_action(
 pub(super) fn classify_return(
     program: &RirProgram,
     ty: RirTypeId,
-    abi: &RustReturnAbi,
+    adapter: &RustReturnAdapter,
 ) -> Option<RirNativeReturn> {
-    match abi {
-        RustReturnAbi::Void => matches!(program.types.get(ty.index()), Some(RirType::Void))
+    match adapter {
+        RustReturnAdapter::Void => matches!(program.types.get(ty.index()), Some(RirType::Void))
             .then_some(RirNativeReturn::Void),
-        RustReturnAbi::Value(value) => Some(RirNativeReturn::Value(value.clone())),
-        RustReturnAbi::OwnedNamed(value) => Some(RirNativeReturn::OwnedNamed {
-            ty: value.clone(),
+        RustReturnAdapter::Value => Some(plan_value_return(program, ty)),
+        RustReturnAdapter::OwnedNamed => Some(RirNativeReturn::OwnedNamed {
             adopt: matches!(program.types.get(ty.index()), Some(RirType::Struct(id))
                 if program.structs[id.index()].native_ref),
         }),
-        RustReturnAbi::Option(inner) => {
+        RustReturnAdapter::Option(inner) => {
             let Some(RirType::Option(payload_ty)) = program.types.get(ty.index()) else {
                 return None;
             };
@@ -93,67 +190,68 @@ pub(super) fn classify_return(
                 payload: Box::new(classify_return(program, *payload_ty, inner)?),
             })
         }
-        RustReturnAbi::Result(ok, err) => {
-            let Some(RirType::Enum(id)) = program.types.get(ty.index()) else {
-                return None;
-            };
-            let enm = &program.enums[id.index()];
-            let [ok_variant, err_variant] = enm.variants.as_slice() else {
-                return None;
-            };
-            let ([ok_field], [err_field]) =
-                (ok_variant.fields.as_slice(), err_variant.fields.as_slice())
-            else {
-                return None;
-            };
-            if enm.core != Some(RirCoreEnumKind::Result) {
-                return None;
-            }
+        RustReturnAdapter::Result(ok, err) => {
+            let (ok_ty, err_ty) = result_payload_tys(program, ty)?;
             Some(RirNativeReturn::Result {
-                ok_ty: ok_field.ty,
-                ok: Box::new(classify_return(program, ok_field.ty, ok)?),
-                err_ty: err_field.ty,
-                err: Box::new(classify_return(program, err_field.ty, err)?),
+                ok_ty,
+                ok: Box::new(classify_return(program, ok_ty, ok)?),
+                err_ty,
+                err: Box::new(classify_return(program, err_ty, err)?),
             })
         }
     }
 }
 
-fn reentry_policy(abi: &RustParamAbi) -> NativeReentryPolicy {
-    match abi {
-        RustParamAbi::Borrow(anvyx_runtime::ExternTypeExpr::String) => {
-            NativeReentryPolicy::SnapshotStringBorrow
-        }
-        RustParamAbi::Borrow(_) | RustParamAbi::MutBorrow(_) | RustParamAbi::Slice(_) => {
-            NativeReentryPolicy::UnsupportedLiveBoundary
-        }
-        RustParamAbi::InitField(inner) | RustParamAbi::Option(inner) => {
-            nested_value_reentry_policy(inner)
-        }
-        RustParamAbi::Result(ok, err) => match (reentry_policy(ok), reentry_policy(err)) {
-            (
-                NativeReentryPolicy::UnsupportedLiveBoundary
-                | NativeReentryPolicy::SnapshotStringBorrow,
-                _,
-            )
-            | (
-                _,
-                NativeReentryPolicy::UnsupportedLiveBoundary
-                | NativeReentryPolicy::SnapshotStringBorrow,
-            ) => NativeReentryPolicy::UnsupportedLiveBoundary,
-            (NativeReentryPolicy::Safe, NativeReentryPolicy::Safe) => NativeReentryPolicy::Safe,
+fn plan_value_return(program: &RirProgram, ty: RirTypeId) -> RirNativeReturn {
+    if native_ref_ty(program, ty) {
+        return RirNativeReturn::SharedNamed;
+    }
+    match program.types.get(ty.index()) {
+        Some(RirType::Option(inner)) => RirNativeReturn::Option {
+            payload_ty: *inner,
+            payload: Box::new(plan_value_return(program, *inner)),
         },
-        RustParamAbi::Value(_)
-        | RustParamAbi::OwnedNamed(_)
-        | RustParamAbi::MutPlace(_)
-        | RustParamAbi::ScopedLambda(_)
-        | RustParamAbi::EscapingLambda(_)
-        | RustParamAbi::AnvCallback(_) => NativeReentryPolicy::Safe,
+        Some(RirType::Array { elem, .. }) => RirNativeReturn::Array {
+            elem_ty: *elem,
+            elem: Box::new(plan_value_return(program, *elem)),
+        },
+        _ => match result_payload_tys(program, ty) {
+            Some((ok_ty, err_ty)) => RirNativeReturn::Result {
+                ok_ty,
+                ok: Box::new(plan_value_return(program, ok_ty)),
+                err_ty,
+                err: Box::new(plan_value_return(program, err_ty)),
+            },
+            None => RirNativeReturn::Value,
+        },
     }
 }
 
-fn nested_value_reentry_policy(abi: &RustParamAbi) -> NativeReentryPolicy {
-    match reentry_policy(abi) {
+fn reentry_policy(plan: &RirNativeParam, ty: &RirType) -> NativeReentryPolicy {
+    match plan {
+        RirNativeParam::Borrow if matches!(ty, RirType::String) => {
+            NativeReentryPolicy::SnapshotStringBorrow
+        }
+        RirNativeParam::Borrow | RirNativeParam::MutBorrow | RirNativeParam::Slice(_) => {
+            NativeReentryPolicy::UnsupportedLiveBoundary
+        }
+        RirNativeParam::InitField(inner) | RirNativeParam::Option(inner) => {
+            nested_value_reentry_policy(inner, ty)
+        }
+        RirNativeParam::Result(_, _) => NativeReentryPolicy::UnsupportedLiveBoundary,
+        RirNativeParam::Value
+        | RirNativeParam::SharedNamed
+        | RirNativeParam::OwnedNamed
+        | RirNativeParam::Array(_)
+        | RirNativeParam::MutPlace
+        | RirNativeParam::ScopedLambda
+        | RirNativeParam::EscapingLambda
+        | RirNativeParam::AnvCallback => NativeReentryPolicy::Safe,
+    }
+}
+
+fn nested_value_reentry_policy(plan: &RirNativeParam, ty: &RirType) -> NativeReentryPolicy {
+    match reentry_policy(plan, ty) {
         NativeReentryPolicy::Safe => NativeReentryPolicy::Safe,
         NativeReentryPolicy::SnapshotStringBorrow
         | NativeReentryPolicy::UnsupportedLiveBoundary => {

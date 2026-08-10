@@ -19,7 +19,6 @@ pub fn char_to_string(c: char) -> AnvString {
 }
 
 anvyx_runtime::builtin_module! {
-    name: "core_char",
-    source: include_str!("core_char.anv"),
-    exports: [char_codepoint, char_from_codepoint_ext, char_to_string],
-}
+name: "core_char",
+root: false,
+exports: [char_codepoint, char_from_codepoint_ext, char_to_string],}

@@ -1,0 +1,7 @@
+[project]
+name = "unused_broken_provider"
+entry = "src/main.anv"
+
+[dependencies]
+host = { path = "host" }
+broken = { path = "broken" }

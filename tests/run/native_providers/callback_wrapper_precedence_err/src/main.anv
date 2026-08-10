@@ -1,0 +1,5 @@
+// @mode: run
+// @expect: error
+// @contains: callback wrapper ABI method receiver must be borrowed
+
+fn main() {}

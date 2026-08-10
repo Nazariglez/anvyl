@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, HashMap},
     fs,
     path::{Path, PathBuf},
     time::Duration,
@@ -13,18 +13,16 @@ use anvyx_backend::rust::{
         RustCargoOutput, RustCargoPackageMetadata, RustCargoPackageName, RustCargoProfile,
     },
 };
+use anvyx_externs::{ProviderCatalog, ProviderPackageKey, RawProviderPackage};
 use anvyx_lang::LintConfig;
-use anvyx_runtime::{
-    ModulePath, ProviderDescriptor, RustModuleSupport, RustProviderCargo, RustProviderSupport,
-    validate_rust_provider_support,
-};
 use serde::Deserialize;
 
 use crate::{cache, rust_deps};
 
 const PROVIDER_PROBE_TIMEOUT_ENV: &str = "ANVYX_PROVIDER_PROBE_TIMEOUT_SECS";
 const DEFAULT_PROVIDER_PROBE_TIMEOUT_SECS: u64 = 600;
-const PROVIDER_PROBE_PROFILE: &str = "provider-probe-v2";
+const PROVIDER_PROBE_PROFILE: &str = "provider-probe-v4";
+const PROVIDER_PROBE_SCHEMA: u32 = 4;
 
 fn provider_probe_timeout() -> Result<Duration, String> {
     parse_provider_probe_timeout(std::env::var(PROVIDER_PROBE_TIMEOUT_ENV).ok().as_deref())
@@ -55,12 +53,6 @@ pub struct Manifest {
     pub dependencies: HashMap<String, DependencyEntry>,
     #[serde(default)]
     pub lint: ManifestLint,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct LoadedNativeProvider {
-    descriptor: ProviderDescriptor,
-    support: RustProviderSupport,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -95,9 +87,9 @@ struct ProviderCargoPackage {
 }
 
 #[derive(Debug, Deserialize)]
-struct ProviderProbeOutput {
-    descriptors: Vec<ProviderDescriptor>,
-    supports: Vec<RustModuleSupport>,
+struct ProviderProbeEnvelope {
+    schema: u32,
+    package: RawProviderPackage,
 }
 
 fn parse_provider_cargo(path: &Path, label: &str) -> Result<ProviderCargoManifest, String> {
@@ -115,141 +107,35 @@ fn parse_provider_cargo(path: &Path, label: &str) -> Result<ProviderCargoManifes
     })
 }
 
-fn load_native_package_providers(
-    package: PackageId,
-    native: &NativePackageInfo,
+fn load_native_package_provider(
+    probe: NativeProviderProbeInput,
     cache_root: &Path,
-) -> Result<Vec<LoadedNativeProvider>, String> {
-    let probe = native_provider_probe_input(package, native)?;
-    let output = run_provider_probe(&probe, cache_root)?;
-    native_providers_from_probe(&probe, output)
-}
-
-fn native_providers_from_probe(
-    probe: &NativeProviderProbeInput,
-    output: ProviderProbeOutput,
-) -> Result<Vec<LoadedNativeProvider>, String> {
-    let ProviderProbeOutput {
-        descriptors,
-        supports,
-    } = output;
-    if descriptors.is_empty() {
+) -> Result<ProviderPackageLoad, String> {
+    let envelope = run_provider_probe(&probe, cache_root)?;
+    if envelope.schema != PROVIDER_PROBE_SCHEMA {
         return Err(format!(
-            "native provider package `{}` exposed no provider descriptors",
-            probe.package
+            "native provider package `{}` probe has unsupported schema {}; expected {PROVIDER_PROBE_SCHEMA}",
+            probe.package, envelope.schema
         ));
     }
-
-    for descriptor in &descriptors {
-        anvyx_externs::validate(descriptor).map_err(|errors| {
-            format!(
-                "native provider package `{}` has invalid provider descriptor `{}`: {errors:?}",
-                probe.package, descriptor.provider.name
-            )
-        })?;
-    }
-
-    let owners = provider_module_owners(probe, &descriptors)?;
-    let mut grouped = vec![vec![]; descriptors.len()];
-    for support in supports {
-        let owner = owners.get(&support.module).ok_or_else(|| {
-            format!(
-                "native provider package `{}` has native support for unknown module `{}`",
-                probe.package, support.module
-            )
-        })?;
-        grouped[*owner].push(support);
-    }
-
-    let mut provider_supports = descriptors
-        .iter()
-        .zip(grouped)
-        .map(|(descriptor, modules)| {
-            rust_provider_support(probe, descriptor.provider.clone(), modules)
-        })
-        .collect::<Vec<_>>();
-    for support in &mut provider_supports {
-        retarget_rust_modules(&mut support.modules, &probe.cargo_alias);
-    }
-    validate_rust_provider_support(&descriptors, &provider_supports).map_err(|error| {
-        format!(
-            "native provider package `{}` has invalid native support: {error}",
-            probe.package
-        )
-    })?;
-
-    Ok(descriptors
-        .into_iter()
-        .zip(provider_supports)
-        .map(|(descriptor, support)| LoadedNativeProvider {
-            descriptor,
-            support,
-        })
-        .collect())
-}
-
-fn provider_module_owners(
-    probe: &NativeProviderProbeInput,
-    descriptors: &[ProviderDescriptor],
-) -> Result<HashMap<ModulePath, usize>, String> {
-    let mut providers = HashSet::new();
-    let mut owners = HashMap::new();
-    for (index, descriptor) in descriptors.iter().enumerate() {
-        if !providers.insert(&descriptor.provider) {
-            return Err(format!(
-                "native provider package `{}` has duplicate native provider `{}`",
-                probe.package, descriptor.provider.name
-            ));
-        }
-        for module in &descriptor.modules {
-            if let Some(first) = owners.insert(module.path.clone(), index) {
-                return Err(format!(
-                    "native provider package `{}` has duplicate native module `{}` in providers `{}` and `{}`",
-                    probe.package,
-                    module.path,
-                    descriptors[first].provider.name,
-                    descriptor.provider.name
-                ));
-            }
-        }
-    }
-    Ok(owners)
-}
-
-fn rust_provider_support(
-    probe: &NativeProviderProbeInput,
-    provider: anvyx_runtime::ProviderId,
-    modules: Vec<RustModuleSupport>,
-) -> RustProviderSupport {
-    RustProviderSupport {
-        package: package_lang_id(&probe.package),
-        provider,
-        cargo: RustProviderCargo {
-            manifest_key: probe.cargo_alias.clone(),
-            package: Some(probe.cargo_package.clone()),
-            path: Some(probe.crate_root.clone()),
-            features: vec![],
-            default_features: true,
+    Ok(ProviderPackageLoad {
+        cargo: ProviderCargoSidecar {
+            crate_alias: probe.cargo_alias.clone(),
+            cargo_package: probe.cargo_package,
+            crate_root: probe.crate_root,
         },
-        modules,
-    }
-}
-
-fn retarget_rust_modules(modules: &mut [RustModuleSupport], cargo_alias: &str) {
-    for module in modules {
-        for ty in &mut module.types {
-            ty.retarget_crate(cargo_alias);
-        }
-        for binding in &mut module.bindings {
-            binding.path.crate_name = cargo_alias.to_string();
-        }
-    }
+        input: (
+            ProviderPackageKey(probe.package.to_string()),
+            envelope.package,
+            Some(probe.cargo_alias),
+        ),
+    })
 }
 
 fn run_provider_probe(
     provider: &NativeProviderProbeInput,
     cache_root: &Path,
-) -> Result<ProviderProbeOutput, String> {
+) -> Result<ProviderProbeEnvelope, String> {
     let timeout = provider_probe_timeout()?;
     let job = provider_probe_job(provider, cache_root)?;
     let paths = job.paths();
@@ -551,12 +437,8 @@ impl std::fmt::Display for PackageId {
     }
 }
 
-pub fn package_lang_id(package: &PackageId) -> String {
-    package.manifest_path().display().to_string()
-}
-
 pub fn package_frontend_id(package: &PackageId) -> anvyx_lang::PackageId {
-    anvyx_lang::PackageId::new(package_lang_id(package))
+    anvyx_lang::PackageId::new(package.to_string())
 }
 
 #[derive(Debug, Clone)]
@@ -575,51 +457,63 @@ pub struct NativePackageInfo {
 pub struct PackageNode {
     pub id: PackageId,
     pub source: Option<PackageSourceInfo>,
-    pub native: Option<NativePackageInfo>,
-    providers: Vec<LoadedNativeProvider>,
     pub dependencies: HashMap<String, PackageId>,
 }
 
 #[derive(Debug, Clone)]
+pub(crate) struct ProviderCargoSidecar {
+    pub(crate) crate_alias: String,
+    pub(crate) cargo_package: String,
+    pub(crate) crate_root: PathBuf,
+}
+
+struct ProviderPackageLoad {
+    input: (ProviderPackageKey, RawProviderPackage, Option<String>),
+    cargo: ProviderCargoSidecar,
+}
+
+#[derive(Debug)]
+pub(crate) struct ProviderWorld {
+    pub(crate) catalog: ProviderCatalog,
+    pub(crate) cargo: HashMap<ProviderPackageKey, ProviderCargoSidecar>,
+}
+
+fn provider_world(loads: Vec<ProviderPackageLoad>) -> Result<ProviderWorld, String> {
+    let mut inputs = vec![];
+    let mut cargo = HashMap::new();
+    for ProviderPackageLoad {
+        input,
+        cargo: sidecar,
+    } in loads
+    {
+        cargo.insert(input.0.clone(), sidecar);
+        inputs.push(input);
+    }
+    let catalog = ProviderCatalog::try_new(inputs).map_err(|error| error.to_string())?;
+    Ok(ProviderWorld { catalog, cargo })
+}
+
+#[derive(Debug)]
 pub struct PackageGraph {
     root: PackageId,
     packages: Vec<PackageNode>,
+    providers: ProviderWorld,
 }
 
 impl PackageGraph {
     pub fn root(&self) -> &PackageNode {
-        self.package(&self.root).expect("root package is loaded")
+        self.packages
+            .iter()
+            .find(|package| package.id == self.root)
+            .expect("root package is loaded")
     }
 
     pub fn packages(&self) -> &[PackageNode] {
         &self.packages
     }
 
-    pub fn package(&self, id: &PackageId) -> Option<&PackageNode> {
-        self.packages.iter().find(|package| &package.id == id)
-    }
-
-    pub fn package_externs(&self) -> Vec<(anvyx_lang::PackageId, Vec<ProviderDescriptor>)> {
-        self.packages
-            .iter()
-            .filter(|package| !package.providers.is_empty())
-            .map(|package| {
-                let providers = package
-                    .providers
-                    .iter()
-                    .map(|provider| provider.descriptor.clone())
-                    .collect();
-                (package_frontend_id(&package.id), providers)
-            })
-            .collect()
-    }
-
-    pub fn rust_provider_supports(&self) -> Vec<RustProviderSupport> {
-        self.packages
-            .iter()
-            .flat_map(|package| package.providers.iter())
-            .map(|provider| provider.support.clone())
-            .collect()
+    pub(crate) fn provider_world(&self) -> &ProviderWorld {
+        &self.providers
     }
 }
 
@@ -700,6 +594,7 @@ struct PackageGraphLoader {
     states: HashMap<PackageId, VisitState>,
     stack: Vec<PackageId>,
     packages: Vec<PackageNode>,
+    provider_loads: Vec<ProviderPackageLoad>,
     cache_root: PathBuf,
 }
 
@@ -709,15 +604,18 @@ impl PackageGraphLoader {
             states: HashMap::new(),
             stack: vec![],
             packages: vec![],
+            provider_loads: vec![],
             cache_root,
         }
     }
 
     fn load(mut self, root: PackageId) -> Result<PackageGraph, String> {
         self.load_package(&root)?;
+        self.provider_loads.extend(system_provider_loads());
         Ok(PackageGraph {
             root,
             packages: self.packages,
+            providers: provider_world(self.provider_loads)?,
         })
     }
 
@@ -757,15 +655,14 @@ impl PackageGraphLoader {
                 "package {id} has no project.entry and no Cargo.toml native marker"
             ));
         }
-        let providers = match &native {
-            Some(native) => load_native_package_providers(id.clone(), native, &self.cache_root)?,
-            None => vec![],
-        };
+        if let Some(native) = &native {
+            let probe = native_provider_probe_input(id.clone(), native)?;
+            self.provider_loads
+                .push(load_native_package_provider(probe, &self.cache_root)?);
+        }
         self.packages.push(PackageNode {
             id: id.clone(),
             source,
-            native,
-            providers,
             dependencies,
         });
 
@@ -812,6 +709,50 @@ impl PackageGraphLoader {
             .collect::<Vec<_>>();
         cycle.push(id.to_string());
         format!("package dependency cycle: {}", cycle.join(" -> "))
+    }
+}
+
+pub(crate) fn system_provider_world() -> Result<ProviderWorld, String> {
+    provider_world(system_provider_loads())
+}
+
+fn system_provider_loads() -> Vec<ProviderPackageLoad> {
+    vec![
+        system_provider_load(
+            "<core>",
+            "anvyx_core",
+            "anvyx-core",
+            "core",
+            anvyx_core::rust_providers(),
+        ),
+        system_provider_load(
+            "<std>",
+            "anvyx_stdlib",
+            "anvyx-stdlib",
+            "stdlib",
+            anvyx_stdlib::rust_providers(),
+        ),
+    ]
+}
+
+fn system_provider_load(
+    key: &str,
+    alias: &str,
+    cargo_package: &str,
+    workspace_crate: &str,
+    package: RawProviderPackage,
+) -> ProviderPackageLoad {
+    ProviderPackageLoad {
+        input: (
+            ProviderPackageKey(key.to_string()),
+            package,
+            Some(alias.to_string()),
+        ),
+        cargo: ProviderCargoSidecar {
+            crate_alias: alias.to_string(),
+            cargo_package: cargo_package.to_string(),
+            crate_root: rust_deps::workspace_crate_path(workspace_crate),
+        },
     }
 }
 

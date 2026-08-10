@@ -121,12 +121,11 @@ pub fn float_to_degrees(x: f64) -> f64 {
 }
 
 anvyx_runtime::builtin_module! {
-    name: "core_float",
-    source: include_str!("core_float.anv"),
-    exports: [
-        float_sin, float_cos, float_tan, float_asin, float_acos, float_atan, float_atan2,
-        float_floor, float_ceil, float_round, float_trunc, float_sqrt, float_cbrt, float_pow,
-        float_exp, float_ln, float_abs, float_lerp,
-        float_to_radians, float_to_degrees
-    ],
-}
+name: "core_float",
+root: false,
+exports: [
+    float_sin, float_cos, float_tan, float_asin, float_acos, float_atan, float_atan2,
+    float_floor, float_ceil, float_round, float_trunc, float_sqrt, float_cbrt, float_pow,
+    float_exp, float_ln, float_abs, float_lerp,
+    float_to_radians, float_to_degrees
+],}

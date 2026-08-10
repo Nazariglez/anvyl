@@ -1,11 +1,14 @@
 #![allow(dead_code)]
 
+mod support;
+
 use anvyx_runtime::{
     AnvList, AnvRef, AnvRefType, AnvString, AnvyxInline, AnvyxRef, CallbackEscape, CallbackThread,
     Ctx, EscapingLambda, ExternCallbackParam, ExternCallbackSignature, ExternTypeExpr, Heap,
-    MutPlace, ParamFlow, RuntimeError, RuntimeResult, RustAbiSupport, RustParamAbi, RustWrapperCtx,
+    MutPlace, ParamFlow, RuntimeError, RuntimeResult, RustCallContext, RustParamAdapter,
     ScopedLambda, function,
 };
+use support::provider_package::TestCatalog;
 
 /// Adds numbers.
 #[function]
@@ -143,162 +146,164 @@ fn make_counter<'cx>(ctx: &mut Ctx<'cx, '_>) -> AnvRef<'cx, Counter> {
 
 #[test]
 fn descriptor_contains_params_return_effects_and_docs() {
-    let export = __anvyx_export_add();
+    let package = TestCatalog::from_export(__anvyx_export_add());
+    let (export, binding) = package.function("add");
 
-    assert_eq!(export.descriptor.name, "add");
-    assert_eq!(export.descriptor.doc.as_deref(), Some("Adds numbers."));
-    assert_eq!(export.descriptor.signature.params.len(), 2);
+    assert_eq!(export.name, "add");
+    assert_eq!(export.doc.as_deref(), Some("Adds numbers."));
+    assert_eq!(export.signature.params.len(), 2);
+    assert_eq!(export.signature.params[0].name.as_deref(), Some("a"));
+    assert_eq!(export.signature.params[0].ty, ExternTypeExpr::Int);
+    assert_eq!(export.signature.params[0].flow, ParamFlow::Value);
+    assert_eq!(export.signature.ret, ExternTypeExpr::Int);
+    assert!(!export.effects.fallible);
     assert_eq!(
-        export.descriptor.signature.params[0].name.as_deref(),
-        Some("a")
+        binding.path.segments.last().map(String::as_str),
+        Some("add")
     );
-    assert_eq!(
-        export.descriptor.signature.params[0].ty,
-        ExternTypeExpr::Int
-    );
-    assert_eq!(export.descriptor.signature.params[0].flow, ParamFlow::Value);
-    assert_eq!(export.descriptor.signature.ret, ExternTypeExpr::Int);
-    assert!(!export.descriptor.effects.fallible);
-    assert_eq!(export.rust.symbol, "add");
-    assert_eq!(export.rust.abi.support, RustAbiSupport::Direct);
 }
 
 #[test]
 fn name_override_and_borrowed_string_flow() {
-    let export = __anvyx_export_draw_line();
+    let package = TestCatalog::from_export(__anvyx_export_draw_line());
+    let (export, binding) = package.function("line");
 
-    assert_eq!(export.descriptor.name, "line");
-    assert_eq!(export.rust.symbol, "line");
-    assert_eq!(export.descriptor.signature.ret, ExternTypeExpr::Void);
+    assert_eq!(export.name, "line");
     assert_eq!(
-        export.descriptor.signature.params[0].ty,
-        ExternTypeExpr::String
+        binding.path.segments.last().map(String::as_str),
+        Some("line")
     );
-    assert_eq!(
-        export.descriptor.signature.params[0].flow,
-        ParamFlow::Borrow
-    );
+    assert_eq!(export.signature.ret, ExternTypeExpr::Void);
+    assert_eq!(export.signature.params[0].ty, ExternTypeExpr::String);
+    assert_eq!(export.signature.params[0].flow, ParamFlow::Borrow);
 }
 
 #[test]
 fn type_overrides_are_parsed_into_descriptors() {
-    let export = __anvyx_export_renamed_type();
+    let package = TestCatalog::from_export(__anvyx_export_renamed_type());
+    let (export, _) = package.function("renamed_type");
 
-    assert_eq!(
-        export.descriptor.signature.params[0].ty,
-        ExternTypeExpr::Int
-    );
-    assert_eq!(export.descriptor.signature.ret, ExternTypeExpr::Int);
+    assert_eq!(export.signature.params[0].ty, ExternTypeExpr::Int);
+    assert_eq!(export.signature.ret, ExternTypeExpr::Int);
 }
 
 #[test]
 fn named_type_override_updates_descriptor_and_rust_abi() {
-    let export = __anvyx_export_point_x();
+    let package = TestCatalog::from_export(__anvyx_export_point_x());
+    let (export, binding) = package.function("point_x");
     let point = ExternTypeExpr::Named {
         module: None,
         name: "Point".to_string(),
         args: vec![],
     };
 
-    assert_eq!(export.descriptor.signature.params[0].ty, point.clone());
-    assert_eq!(
-        export.rust.abi.params[0],
-        RustParamAbi::OwnedNamed(point.clone())
-    );
+    assert_eq!(export.signature.params[0].ty, point.clone());
+    assert_eq!(binding.abi.params[0], RustParamAdapter::OwnedNamed);
 
-    let export = __anvyx_export_make_point();
-    assert_eq!(export.descriptor.signature.ret, point.clone());
+    let package = TestCatalog::from_export(__anvyx_export_make_point());
+    let (export, binding) = package.function("make_point");
+    assert_eq!(export.signature.ret, point.clone());
     assert_eq!(
-        export.rust.abi.ret,
-        anvyx_runtime::RustReturnAbi::OwnedNamed(point)
+        binding.abi.ret,
+        anvyx_runtime::RustReturnAdapter::OwnedNamed
     );
 }
 
 #[test]
 fn option_result_and_list_support_metadata() {
-    let export = __anvyx_export_maybe();
+    let package = TestCatalog::from_export(__anvyx_export_maybe());
+    let (export, _) = package.function("maybe");
 
     assert_eq!(
-        export.descriptor.signature.params[0].ty,
+        export.signature.params[0].ty,
         ExternTypeExpr::Option(Box::new(ExternTypeExpr::Int))
     );
     assert_eq!(
-        export.descriptor.signature.ret,
+        export.signature.ret,
         ExternTypeExpr::Option(Box::new(ExternTypeExpr::Int))
     );
-    assert!(export.descriptor.effects.fallible);
-    assert!(export.rust.abi.fallible);
-    assert_eq!(export.rust.abi.support, RustAbiSupport::Direct);
+    assert!(export.effects.fallible);
 
-    let export = __anvyx_export_maybe_return();
-    assert_eq!(export.rust.abi.support, RustAbiSupport::Direct);
+    let package = TestCatalog::from_export(__anvyx_export_maybe_return());
+    let (export, binding) = package.function("maybe_return");
+    assert_eq!(
+        export.signature.ret,
+        ExternTypeExpr::Option(Box::new(ExternTypeExpr::Int))
+    );
+    assert_eq!(
+        binding.abi.ret,
+        anvyx_runtime::RustReturnAdapter::Option(Box::new(anvyx_runtime::RustReturnAdapter::Value))
+    );
 
-    let export = __anvyx_export_strings();
-    assert_eq!(export.rust.abi.support, RustAbiSupport::Direct);
+    let package = TestCatalog::from_export(__anvyx_export_strings());
+    let (export, binding) = package.function("strings");
+    let strings = ExternTypeExpr::List(Box::new(ExternTypeExpr::String));
+    assert_eq!(export.signature.params[0].ty, strings.clone());
+    assert_eq!(export.signature.ret, strings);
+    assert_eq!(binding.abi.params, vec![RustParamAdapter::Value]);
+    assert_eq!(binding.abi.ret, anvyx_runtime::RustReturnAdapter::Value);
 
-    let export = __anvyx_export_visible_result();
+    let package = TestCatalog::from_export(__anvyx_export_visible_result());
+    let (export, binding) = package.function("visible_result");
     let err = ExternTypeExpr::Named {
         module: None,
         name: "LoadError".to_string(),
         args: vec![],
     };
     assert_eq!(
-        export.descriptor.signature.ret,
+        export.signature.ret,
         ExternTypeExpr::Result(Box::new(ExternTypeExpr::Int), Box::new(err.clone()))
     );
-    assert!(!export.descriptor.effects.fallible);
+    assert!(!export.effects.fallible);
     assert_eq!(
-        export.rust.abi.ret,
-        anvyx_runtime::RustReturnAbi::Result(
-            Box::new(anvyx_runtime::RustReturnAbi::Value(ExternTypeExpr::Int)),
-            Box::new(anvyx_runtime::RustReturnAbi::OwnedNamed(err.clone())),
+        binding.abi.ret,
+        anvyx_runtime::RustReturnAdapter::Result(
+            Box::new(anvyx_runtime::RustReturnAdapter::Value),
+            Box::new(anvyx_runtime::RustReturnAdapter::OwnedNamed),
         )
     );
-    assert_eq!(export.rust.abi.support, RustAbiSupport::Direct);
 
-    let export = __anvyx_export_fallible_visible_result();
-    assert!(export.descriptor.effects.fallible);
+    let package = TestCatalog::from_export(__anvyx_export_fallible_visible_result());
+    let (export, _) = package.function("fallible_visible_result");
+    assert!(export.effects.fallible);
     assert_eq!(
-        export.descriptor.signature.ret,
+        export.signature.ret,
         ExternTypeExpr::Result(Box::new(ExternTypeExpr::Int), Box::new(err))
     );
 
-    let export = __anvyx_export_make_counter();
+    let package = TestCatalog::from_export(__anvyx_export_make_counter());
+    let (export, binding) = package.function("make_counter");
     let counter = ExternTypeExpr::Named {
         module: None,
         name: "Counter".to_string(),
         args: vec![],
     };
-    assert_eq!(export.descriptor.signature.ret, counter.clone());
-    assert_eq!(
-        export.rust.abi.ret,
-        anvyx_runtime::RustReturnAbi::Value(counter)
-    );
-    assert_eq!(export.rust.abi.support, RustAbiSupport::Direct);
+    assert_eq!(export.signature.ret, counter.clone());
+    assert_eq!(binding.abi.ret, anvyx_runtime::RustReturnAdapter::Value);
 }
 
 #[test]
 fn ctx_is_hidden_from_metadata_and_passed_to_authored_function() {
-    let export = __anvyx_export_with_ctx();
+    let package = TestCatalog::from_export(__anvyx_export_with_ctx());
+    let (export, binding) = package.function("with_ctx");
 
-    assert_eq!(export.descriptor.signature.params.len(), 1);
-    assert_eq!(export.rust.abi.params.len(), 1);
-    assert_eq!(
-        export.rust.abi.params[0],
-        RustParamAbi::Value(ExternTypeExpr::Int)
-    );
+    assert_eq!(export.signature.params.len(), 1);
+    assert_eq!(binding.abi.params.len(), 1);
+    assert_eq!(binding.abi.params[0], RustParamAdapter::Value);
     Heap::scope(|heap| {
         let mut ctx = Ctx::new(heap);
         assert_eq!(__anvyx_native_export_with_ctx::with_ctx(&mut ctx, 41), 42);
     });
 
-    let export = __anvyx_export_with_ctx_lifetime();
-    assert_eq!(export.descriptor.signature.params.len(), 1);
+    let package = TestCatalog::from_export(__anvyx_export_with_ctx_lifetime());
+    let (export, _) = package.function("with_ctx_lifetime");
+    assert_eq!(export.signature.params.len(), 1);
 }
 
 #[test]
 fn scoped_lambda_param_infers_callback_descriptor_and_abi() {
-    let export = __anvyx_export_each();
+    let package = TestCatalog::from_export(__anvyx_export_each());
+    let (export, binding) = package.function("each");
     let expected = ExternCallbackSignature {
         params: vec![ExternCallbackParam {
             ty: ExternTypeExpr::Int,
@@ -311,25 +316,19 @@ fn scoped_lambda_param_infers_callback_descriptor_and_abi() {
         },
     };
 
-    assert_eq!(export.descriptor.signature.params.len(), 1);
+    assert_eq!(export.signature.params.len(), 1);
     assert_eq!(
-        export.descriptor.signature.params[0].ty,
+        export.signature.params[0].ty,
         ExternTypeExpr::Callback(expected.clone())
     );
-    assert_eq!(
-        export.rust.abi.params[0],
-        RustParamAbi::ScopedLambda(expected)
-    );
-    assert_eq!(
-        export.rust.abi.support,
-        RustAbiSupport::NeedsWrapperConversion
-    );
-    assert_eq!(export.rust.abi.ctx, RustWrapperCtx::None);
+    assert_eq!(binding.abi.params[0], RustParamAdapter::ScopedLambda);
+    assert_eq!(binding.abi.ctx, RustCallContext::None);
 }
 
 #[test]
 fn escaping_lambda_param_infers_escaping_callback_descriptor_and_abi() {
-    let export = __anvyx_export_retain_callback();
+    let package = TestCatalog::from_export(__anvyx_export_retain_callback());
+    let (export, binding) = package.function("retain_callback");
     let expected = ExternCallbackSignature {
         params: vec![ExternCallbackParam {
             ty: ExternTypeExpr::Int,
@@ -342,30 +341,21 @@ fn escaping_lambda_param_infers_escaping_callback_descriptor_and_abi() {
         },
     };
 
+    assert_eq!(export.signature.params[0].escape, CallbackEscape::Escaping);
     assert_eq!(
-        export.descriptor.signature.params[0].escape,
-        CallbackEscape::Escaping
-    );
-    assert_eq!(
-        export.descriptor.signature.params[0].ty,
+        export.signature.params[0].ty,
         ExternTypeExpr::Callback(expected.clone())
     );
-    assert_eq!(
-        export.rust.abi.params[0],
-        RustParamAbi::EscapingLambda(expected)
-    );
-    assert_eq!(
-        export.rust.abi.support,
-        RustAbiSupport::NeedsWrapperConversion
-    );
-    assert_eq!(export.rust.abi.ctx, RustWrapperCtx::None);
+    assert_eq!(binding.abi.params[0], RustParamAdapter::EscapingLambda);
+    assert_eq!(binding.abi.ctx, RustCallContext::None);
 }
 
 #[test]
 fn scoped_lambda_override_must_match_rust_abi() {
-    let export = __anvyx_export_callback_override();
+    let package = TestCatalog::from_export(__anvyx_export_callback_override());
+    let (export, _) = package.function("callback_override");
 
-    let ExternTypeExpr::Callback(callback) = &export.descriptor.signature.params[0].ty else {
+    let ExternTypeExpr::Callback(callback) = &export.signature.params[0].ty else {
         panic!("expected callback descriptor");
     };
     assert_eq!(*callback.ret, ExternTypeExpr::Bool);
@@ -373,27 +363,16 @@ fn scoped_lambda_override_must_match_rust_abi() {
 
 #[test]
 fn mut_place_param_uses_place_aware_mutable_abi() {
-    let export = __anvyx_export_bump_place();
+    let package = TestCatalog::from_export(__anvyx_export_bump_place());
+    let (export, binding) = package.function("bump_place");
 
-    assert_eq!(export.descriptor.signature.params.len(), 1);
-    assert_eq!(
-        export.descriptor.signature.params[0].flow,
-        ParamFlow::MutBorrow
-    );
-    assert_eq!(
-        export.descriptor.signature.params[0].ty,
-        ExternTypeExpr::Int
-    );
-    assert_eq!(export.rust.abi.params.len(), 1);
-    assert_eq!(
-        export.rust.abi.params[0],
-        RustParamAbi::MutPlace(ExternTypeExpr::Int)
-    );
-    assert_eq!(export.rust.abi.support, RustAbiSupport::Direct);
+    assert_eq!(export.signature.params.len(), 1);
+    assert_eq!(export.signature.params[0].flow, ParamFlow::MutBorrow);
+    assert_eq!(export.signature.params[0].ty, ExternTypeExpr::Int);
+    assert_eq!(binding.abi.params.len(), 1);
+    assert_eq!(binding.abi.params[0], RustParamAdapter::MutPlace);
 
-    let export = __anvyx_export_maybe_place();
-    assert_eq!(
-        export.rust.abi.params[0],
-        RustParamAbi::MutPlace(ExternTypeExpr::Option(Box::new(ExternTypeExpr::Int)))
-    );
+    let package = TestCatalog::from_export(__anvyx_export_maybe_place());
+    let (_, binding) = package.function("maybe_place");
+    assert_eq!(binding.abi.params[0], RustParamAdapter::MutPlace);
 }

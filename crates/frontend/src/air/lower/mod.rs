@@ -636,12 +636,13 @@ impl TypeLowerer {
         if let Some(id) = self.cache.get(&cache_key).copied() {
             return Ok(id);
         }
-        let binding = externs
-            .type_lowering_info(source_id)
-            .map(|info| ExternTypeBindingDecl {
-                package: info.package,
-                provider: info.provider,
-                key: info.key,
+        let binding = source
+            .binding
+            .as_ref()
+            .map(|binding| ExternTypeBindingDecl {
+                package: binding.package.clone(),
+                provider: binding.provider.clone(),
+                key: binding.key.clone(),
             });
         let extern_id = program.alloc_extern_type(ExternTypeDecl {
             name: key.name,
@@ -656,7 +657,7 @@ impl TypeLowerer {
             layout: source.layout,
             materialization: source.materialization,
             owns_heap_edges: source.owns_heap_edges,
-            has_init: source.constructor_fields().is_some(),
+            has_init: source.required_init_fields().is_some(),
             init_args: vec![],
             fields: vec![],
             variants: vec![],
@@ -1618,17 +1619,12 @@ impl LowerCx<'_> {
         info: ExternLoweringInfo,
     ) -> ExternId {
         let module = self.ensure_module(scope);
-        let (binding, effects) = match info {
-            ExternLoweringInfo::Provider(info) => (
-                Some(ExternBindingDecl {
-                    package: info.package,
-                    provider: info.provider,
-                    key: info.key,
-                }),
-                info.effects,
-            ),
-            ExternLoweringInfo::Source { effects } => (None, effects),
-        };
+        let binding = info.binding.map(|info| ExternBindingDecl {
+            package: info.package,
+            provider: info.provider,
+            key: info.key,
+        });
+        let effects = info.effects;
         let id = self.program.alloc_extern(ExternDecl {
             name,
             span,
@@ -1717,7 +1713,7 @@ impl LowerCx<'_> {
                     params,
                     return_type,
                     extern_receiver_abi(&ty.key, field_decl.ty.abi.clone()),
-                    externs.field_lowering_info(field, anvyx_externs::ExternBindingOp::Get),
+                    field_decl.get_lowering.clone(),
                 ))
             }
             ExternUseTarget::FieldWrite(field) => {
@@ -1751,7 +1747,7 @@ impl LowerCx<'_> {
                             ret: anvyx_externs::ExternTypeExpr::Void,
                         },
                     ),
-                    externs.field_lowering_info(field, anvyx_externs::ExternBindingOp::Set),
+                    field_decl.set_lowering.clone(),
                 ))
             }
             ExternUseTarget::Method(method_ref) => {
@@ -1775,7 +1771,7 @@ impl LowerCx<'_> {
                     params,
                     return_type,
                     extern_receiver_signature_abi(&ty.key, extern_signature_abi(&method.signature)),
-                    externs.method_lowering_info(method_ref),
+                    method.lowering.clone(),
                 ))
             }
             ExternUseTarget::Static(static_ref) => {
@@ -1792,17 +1788,14 @@ impl LowerCx<'_> {
                     params,
                     return_type,
                     extern_signature_abi(&static_method.signature),
-                    externs.static_lowering_info(static_ref),
+                    static_method.lowering.clone(),
                 ))
             }
             ExternUseTarget::Init(owner_id) => {
                 let ty = externs.ty(owner_id);
                 let owner = self.lower_extern_owner(&ty.nominal)?;
-                let signature = ty
-                    .init
-                    .as_ref()
-                    .map(|init| &init.signature)
-                    .expect("extern init target has descriptor");
+                let init = ty.init.as_ref().expect("extern init target has descriptor");
+                let signature = &init.signature;
                 let params = self.lower_extern_signature_params(signature)?;
                 let return_type = self.lower_ty(&signature.ret.ty)?;
                 Ok(self.alloc_extern_in_module(
@@ -1814,7 +1807,7 @@ impl LowerCx<'_> {
                     params,
                     return_type,
                     extern_signature_abi(signature),
-                    externs.init_lowering_info(owner_id),
+                    init.lowering.clone(),
                 ))
             }
             ExternUseTarget::UnaryOperator(operator_ref) => {
@@ -1845,7 +1838,7 @@ impl LowerCx<'_> {
                         &ty.key,
                         extern_signature_abi(&operator.signature),
                     ),
-                    externs.operator_lowering_info(operator_ref),
+                    operator.lowering.clone(),
                 ))
             }
             ExternUseTarget::BinaryOperator(operator_ref) => {
@@ -1878,7 +1871,7 @@ impl LowerCx<'_> {
                         &ty.key,
                         extern_signature_abi(&operator.signature),
                     ),
-                    externs.operator_lowering_info(operator_ref),
+                    operator.lowering.clone(),
                 ))
             }
         }
@@ -1901,7 +1894,7 @@ impl LowerCx<'_> {
             params,
             return_type,
             extern_signature_abi(&function.signature),
-            externs.function_lowering_info(id),
+            function.lowering.clone(),
         ))
     }
 
@@ -6724,6 +6717,11 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
         expected: TypeId,
         site: &ExprNode,
     ) -> Result<Operand, LowerError> {
+        if matches!(self.cx.program.type_data(expected), TypeData::Slice(_)) {
+            return self
+                .lower_shared_slice_call_arg(expr, expected)
+                .map(Operand::Place);
+        }
         if let TypeData::Optional(inner) = self.cx.program.type_data(expected).clone()
             && matches!(
                 expr.node.kind,
@@ -13285,7 +13283,6 @@ mod tests {
     use super::*;
     use crate::{
         ast, externs,
-        externs::RawExterns,
         resolve::ResolveResult,
         test_support::{parse_program, resolved_modules_with_core_option},
         typecheck::{self, TypecheckConfig},
@@ -13342,8 +13339,7 @@ mod tests {
     ) -> (ast::Program, ResolveResult, typecheck::SemanticCheckOutput) {
         let root = parse_program(source);
         let resolved = resolved_modules_with_core_option(&root, modules);
-        let externs =
-            externs::prepare_raw_externs(RawExterns::default(), &root, &resolved).unwrap();
+        let externs = externs::prepare_raw_externs(&root, &resolved).unwrap();
         let semantic = typecheck::check_semantic_with_modules(
             &root,
             &resolved,

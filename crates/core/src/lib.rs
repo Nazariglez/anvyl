@@ -4,25 +4,6 @@ pub mod core_int;
 pub mod core_runtime;
 pub mod core_string;
 
-#[doc(hidden)]
-pub mod __anvyx_native {
-    pub mod core_char {
-        pub use crate::core_char::__anvyx_native::*;
-    }
-    pub mod core_float {
-        pub use crate::core_float::__anvyx_native::*;
-    }
-    pub mod core_int {
-        pub use crate::core_int::__anvyx_native::*;
-    }
-    pub mod core_runtime {
-        pub use crate::core_runtime::__anvyx_native::*;
-    }
-    pub mod core_string {
-        pub use crate::core_string::__anvyx_native::*;
-    }
-}
-
 pub struct SourceFile {
     pub path: &'static [&'static str],
     pub label: &'static str,
@@ -88,48 +69,6 @@ pub const MODULES: &[SourceFile] = &[
     },
 ];
 
-pub fn provider_descriptors() -> Vec<anvyx_externs::ProviderDescriptor> {
-    vec![
-        core_int::provider_descriptor(),
-        core_float::provider_descriptor(),
-        core_string::provider_descriptor(),
-        core_char::provider_descriptor(),
-        core_runtime::provider_descriptor(),
-    ]
-}
-
-pub fn rust_provider_supports() -> Vec<anvyx_runtime::RustProviderSupport> {
-    vec![
-        provider_support("core_int", core_int::rust_module_support()),
-        provider_support("core_float", core_float::rust_module_support()),
-        provider_support("core_string", core_string::rust_module_support()),
-        provider_support("core_char", core_char::rust_module_support()),
-        provider_support("core_runtime", core_runtime::rust_module_support()),
-    ]
-}
-
-fn provider_support(
-    provider: &str,
-    mut module: anvyx_runtime::RustModuleSupport,
-) -> anvyx_runtime::RustProviderSupport {
-    for ty in &mut module.types {
-        ty.retarget_crate("anvyx_core");
-    }
-    let native_prefix = [provider.to_string()];
-    for binding in &mut module.bindings {
-        binding.path.crate_name = "anvyx_core".to_string();
-        binding.path.prefix_native(&native_prefix);
-    }
-    anvyx_runtime::RustProviderSupport {
-        package: "<core>".to_string(),
-        provider: anvyx_runtime::ProviderId {
-            name: provider.to_string(),
-        },
-        cargo: anvyx_runtime::RustProviderCargo {
-            manifest_key: "anvyx_core".to_string(),
-            package: Some("anvyx-core".to_string()),
-            ..Default::default()
-        },
-        modules: vec![module],
-    }
+anvyx_runtime::provider_package! {
+    modules: [core_int, core_float, core_string, core_char, core_runtime]
 }

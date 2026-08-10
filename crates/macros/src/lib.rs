@@ -3,7 +3,6 @@ mod function_macro;
 mod methods_macro;
 mod module_macro;
 mod naming;
-mod provider_descriptor;
 mod type_derive;
 mod util;
 use proc_macro::TokenStream;
@@ -46,9 +45,4 @@ pub fn builtin_module(input: TokenStream) -> TokenStream {
 #[proc_macro]
 pub fn provider_package(input: TokenStream) -> TokenStream {
     module_macro::expand_provider_package(input.into()).into()
-}
-
-#[proc_macro]
-pub fn provider_descriptor(input: TokenStream) -> TokenStream {
-    provider_descriptor::expand(input.into()).into()
 }

@@ -13,7 +13,6 @@ pub fn _assert(condition: bool, message: &str) {
 }
 
 anvyx_runtime::builtin_module! {
-    name: "core_runtime",
-    source: include_str!("runtime.anv"),
-    exports: [_println, _assert],
-}
+name: "core_runtime",
+root: false,
+exports: [_println, _assert],}

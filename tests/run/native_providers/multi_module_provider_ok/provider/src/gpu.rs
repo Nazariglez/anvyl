@@ -7,6 +7,5 @@ pub fn create_device() -> i64 {
 
 anvyx_runtime::builtin_module! {
     name: "gpu",
-    source: "",
-    exports: [create_device],
-}
+    root: false,
+    exports: [create_device],}

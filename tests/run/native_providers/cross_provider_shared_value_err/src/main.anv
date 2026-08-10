@@ -1,0 +1,7 @@
+// @mode: run
+// @expect: error
+// @contains: shared resource parameters must use top-level, Option, or Result AnvRef
+
+import pkg:host.calls { consume };
+
+fn main() {}

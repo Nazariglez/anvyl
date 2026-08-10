@@ -74,6 +74,23 @@ pub fn counter_value<'cx>(ctx: &mut Ctx<'cx, '_>, counter: AnvRef<'cx, Counter>)
 }
 
 #[function(ctx)]
+pub fn maybe_counter<'cx>(
+    ctx: &mut Ctx<'cx, '_>,
+    present: bool,
+    value: i64,
+) -> Option<AnvRef<'cx, Counter>> {
+    present.then(|| AnvRefType::<Counter>::register_untracked_in(ctx).alloc_in(ctx, Counter { value }))
+}
+
+#[function(ctx)]
+pub fn maybe_counter_value<'cx>(
+    ctx: &mut Ctx<'cx, '_>,
+    counter: Option<AnvRef<'cx, Counter>>,
+) -> i64 {
+    counter.map_or(-1, |counter| counter.with_in(ctx, |counter| counter.value).unwrap())
+}
+
+#[function(ctx)]
 pub fn counter_result_value<'cx>(
     ctx: &mut Ctx<'cx, '_>,
     result: Result<AnvRef<'cx, Counter>, AnvString>,
@@ -86,6 +103,5 @@ pub fn counter_result_value<'cx>(
 
 anvyx_runtime::builtin_module! {
     name: "host",
-    source: "",
-    exports: [Counter, make_counter, make_owned_counter, maybe_owned_counter, result_owned_counter, counter_value, counter_result_value],
+    exports: [Counter, make_counter, make_owned_counter, maybe_owned_counter, result_owned_counter, counter_value, maybe_counter, maybe_counter_value, counter_result_value],
 }

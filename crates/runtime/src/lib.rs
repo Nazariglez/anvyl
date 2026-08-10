@@ -20,7 +20,7 @@ mod scoped_lambda;
 pub mod value;
 
 pub use anv_callback::AnvCallback;
-pub use anvyx_externs::{self, CALLBACK_WRAPPER_MAX_ARITY};
+pub use anvyx_externs::{self, CALLBACK_WRAPPER_MAX_ARITY, RustParamAdapter, RustReturnAdapter};
 pub use anvyx_heap::{
     AccessError, CollectOutcome, CycleStatus, ErasedHandle, Handle, Heap, HeapConfig, HeapStats,
     HeapType, HeapTypeId, LeakReport, LeakTypeReport, Trace, TraceDriver, TraceMode, Visitor,
@@ -60,14 +60,10 @@ pub use provider::{
     ExternFunctionKey, ExternInitDescriptor, ExternLayout, ExternMaterialization, ExternMemberKey,
     ExternMemberSelector, ExternMethodDescriptor, ExternModuleDescriptor, ExternOperator,
     ExternOperatorDescriptor, ExternParam, ExternRep, ExternSignature, ExternStaticDescriptor,
-    ExternTypeDescriptor, ExternTypeExpr, ExternTypeKey, FunctionExport,
-    INLINE_MATERIALIZER_SYMBOL, InlineMaterializationAttestation, ModuleExport, ModuleExportItem,
-    ModulePath, ParamFlow, ProviderDescriptor, ProviderId, ReceiverMode, RustAbiSupport,
-    RustExternAbi, RustExternBinding, RustLocalBinding, RustMaterializerBinding, RustMemberBinding,
-    RustModuleSupport, RustParamAbi, RustPath, RustProviderCargo, RustProviderSupport,
-    RustReturnAbi, RustTypeBinding, RustWrapperCtx, TypeExport, TypeMemberExport,
-    TypeMemberFragment, UnaryOp, merge_type_members, native_materializer_module,
-    validate_rust_provider_support,
+    ExternTypeDescriptor, ExternTypeExpr, ExternTypeKey, ModuleExport, ModulePath, ParamFlow,
+    ProviderDescriptor, ProviderId, RawProviderPackage, ReceiverMode, RustCallContext,
+    RustExternAbi, RustMemberBinding, TypeExport, TypeMemberExport, TypeMemberFragment, UnaryOp,
+    merge_type_members,
 };
 pub use resource::{AnvRef, AnvRefType};
 pub use runtime_owner::{RuntimeOwnerEntry, RuntimeOwnerHandle, RuntimeOwnerShutdownGuard};

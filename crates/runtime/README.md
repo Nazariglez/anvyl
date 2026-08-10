@@ -19,20 +19,18 @@ pub fn host_len(text: &str) -> i64 {
 
 anvyx_runtime::builtin_module! {
     name: "host",
-    source: "",
     exports: [host_add, host_len],
 }
 ```
 
-`builtin_module!` describes one native module. It generates the module-level
-helpers and the plural package-probe helpers used by Anvyx:
+`builtin_module!` describes one native module. It generates the sole provider
+package entrypoint used by Anvyx:
 
 ```rust
-provider_descriptor() -> ProviderDescriptor
-provider_descriptors() -> Vec<ProviderDescriptor>
-rust_module_support() -> RustModuleSupport
-rust_module_supports() -> Vec<RustModuleSupport>
+rust_providers() -> RawProviderPackage
 ```
+
+The package pairs each module descriptor with its Rust type and binding exports.
 
 Provider package `anvyx.toml`:
 
@@ -102,7 +100,6 @@ pub fn open_window() -> i64 {
 
 anvyx_runtime::builtin_module! {
     name: "window",
-    source: "",
     exports: [open_window],
 }
 ```
@@ -118,16 +115,15 @@ pub fn create_device() -> i64 {
 
 anvyx_runtime::builtin_module! {
     name: "gpu",
-    source: "",
     exports: [create_device],
 }
 ```
 
 The module list is explicit. Paths are crate-root-relative Rust module paths;
 there is no auto-discovery. Nested paths such as `platform::window` are allowed.
-`provider_package!` preserves each child provider id, aggregates child
-descriptors/supports, and retargets native wrapper/type paths so private Rust
-submodules can still be used by generated package users.
+`provider_package!` preserves each child provider id and constructs paired
+module exports with package-relative paths, so private Rust submodules remain
+available to generated package users.
 
 Dependents import the exposed modules with `pkg:`:
 
@@ -144,11 +140,10 @@ pub import ext:window;
 pub import ext:gpu;
 ```
 
-Anvyx probes provider crates through the plural package ABI:
+Anvyx probes provider crates through the paired package ABI:
 
 ```rust
-provider_descriptors() -> Vec<ProviderDescriptor>
-rust_module_supports() -> Vec<RustModuleSupport>
+rust_providers() -> RawProviderPackage
 ```
 
 Do not hand-write descriptor merging for multi-module packages; use
@@ -215,9 +210,9 @@ pub fn bump<'cx>(
 
 Use `MutPlace` only during the call. Access or mutate it through the provided
 short closures and do not store it. `#[methods] fn method(&mut self, ...)` stays
-a direct mutable receiver ABI; manual/final provider metadata may use
-`RustParamAbi::MutPlace(owner)` as receiver parameter 0 for place-aware receiver
-bindings.
+a direct mutable receiver ABI; generated metadata uses
+`RustParamAdapter::MutPlace` as receiver parameter 0 for place-aware receiver
+bindings, while its owner type remains descriptor-owned.
 
 `#[anvyx(init)]` parameters may use `AnvInitField<T>` when a provider-backed
 extern literal should distinguish a provided field from an omitted field:

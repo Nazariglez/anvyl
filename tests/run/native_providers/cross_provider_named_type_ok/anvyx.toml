@@ -1,0 +1,6 @@
+[project]
+name = "cross_provider_named_type"
+entry = "src/main.anv"
+
+[dependencies]
+host = { path = "provider" }

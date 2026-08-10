@@ -153,7 +153,6 @@ pub fn each(cb: ScopedLambda<'_, '_, (i64,), ()>) -> RuntimeResult<()> {
 
 anvyx_runtime::builtin_module! {
     name: "host",
-    source: "",
     exports: [
         retain, retain_second, fire, fire_second, close, close_second,
         fire_with_heap_borrow, close_with_heap_borrow,

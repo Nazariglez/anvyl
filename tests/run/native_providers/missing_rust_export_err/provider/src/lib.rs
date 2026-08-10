@@ -1,5 +1,3 @@
-use anvyx_runtime::RustModuleSupport;
-
 mod descriptor {
     use anvyx_runtime::function;
 
@@ -8,17 +6,14 @@ mod descriptor {
 
     anvyx_runtime::builtin_module! {
         name: "host",
-        source: "",
         exports: [missing_export],
     }
 }
 
-pub use descriptor::{missing_export, provider_descriptors};
+pub use descriptor::missing_export;
 
-pub fn rust_module_supports() -> Vec<RustModuleSupport> {
-    let mut supports = descriptor::rust_module_supports();
-    for support in &mut supports {
-        support.bindings.clear();
-    }
-    supports
+pub fn rust_providers() -> anvyx_runtime::RawProviderPackage {
+    let mut wire = serde_json::to_value(descriptor::rust_providers()).unwrap();
+    wire["exports"][0]["Rust"]["modules"][0]["bindings"] = serde_json::json!([]);
+    serde_json::from_value(wire).unwrap()
 }

@@ -15,25 +15,23 @@ pub fn source_bundle() -> Result<SourceBundle, String> {
 }
 
 fn core_package() -> Result<SystemPackageSource, String> {
-    SystemPackageSource::with_providers(
+    SystemPackageSource::new(
         source_text(anvyx_core::ROOT.code, anvyx_core::ROOT.label)?,
         anvyx_core::MODULES
             .iter()
             .map(|source| module_source(source.path, source.code, source.label))
             .collect::<Result<Vec<_>, _>>()?,
-        anvyx_core::provider_descriptors(),
     )
     .map_err(|error| error.to_string())
 }
 
 fn std_package() -> Result<SystemPackageSource, String> {
-    SystemPackageSource::with_providers(
+    SystemPackageSource::new(
         source_text(anvyx_stdlib::ROOT.code, anvyx_stdlib::ROOT.label)?,
         anvyx_stdlib::MODULES
             .iter()
             .map(|source| module_source(source.path, source.code, source.label))
             .collect::<Result<Vec<_>, _>>()?,
-        anvyx_stdlib::provider_descriptors(),
     )
     .map_err(|error| error.to_string())
 }

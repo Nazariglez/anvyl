@@ -7,6 +7,5 @@ pub fn ping() -> i64 {
 
 anvyx_runtime::builtin_module! {
     name: "colors_native",
-    source: "",
     exports: [ping],
 }

@@ -43,6 +43,5 @@ pub fn close<'cx>(ctx: &mut Ctx<'cx, '_>) -> RuntimeResult<bool> {
 
 anvyx_runtime::builtin_module! {
     name: "host",
-    source: "",
     exports: [retain, fire, close],
 }

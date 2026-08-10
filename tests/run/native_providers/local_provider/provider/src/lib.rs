@@ -36,6 +36,5 @@ pub fn host_each(f: ScopedLambda<'_, '_, (i64,), ()>) -> RuntimeResult<()> {
 
 anvyx_runtime::builtin_module! {
     name: "host",
-    source: "",
     exports: [host_add, host_len, host_bump, host_apply, host_call0, host_each],
 }

@@ -1,0 +1,10 @@
+// @mode: run
+// @expect: success
+// @contains: 42
+
+import pkg:host.calls { increment };
+import pkg:host.types { Token };
+
+fn main() {
+    println(increment(Token { value: 41 }));
+}

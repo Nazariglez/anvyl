@@ -26,6 +26,5 @@ pub fn window_width(config: WindowConfig) -> i64 {
 
 anvyx_runtime::builtin_module! {
     name: "window",
-    source: "",
-    exports: [open_window, window_width, WindowConfig],
-}
+    root: false,
+    exports: [open_window, window_width, WindowConfig],}

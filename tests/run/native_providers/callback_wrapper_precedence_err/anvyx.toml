@@ -1,0 +1,6 @@
+[project]
+name = "callback_wrapper_precedence"
+entry = "src/main.anv"
+
+[dependencies]
+host = { path = "provider" }

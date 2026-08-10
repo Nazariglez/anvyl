@@ -2017,10 +2017,19 @@ fn solve_generic_call_with(
     add_constraints(session.vars(), tc);
     let mut failed = tc.solve_constraints();
 
+    let expected_before_args = expected.as_ref().is_some_and(|expected| {
+        super::type_ops::contains_borrowed_slice_view(&tc.handle_type(expected))
+    });
+    if !inferred_ret && expected_before_args {
+        let ret_handle = tc
+            .solver
+            .instantiate_generic_type(&template_ret.ty(), session.vars());
+        failed |= constrain_expected_return(call_span, ret_handle, expected.clone(), tc).failed();
+    }
     let params = instantiate_call_params(template_params, session.vars(), tc);
     let args_check = check_source_args(args, &params, receiver_arg, tc);
     failed |= args_check.failed;
-    if !inferred_ret {
+    if !inferred_ret && !expected_before_args {
         let ret_handle = tc
             .solver
             .instantiate_generic_type(&template_ret.ty(), session.vars());

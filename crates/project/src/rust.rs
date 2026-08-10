@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeSet,
     fs,
     path::{Path, PathBuf},
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -14,12 +15,12 @@ use anvyx_backend::rust::{
         RustCargoPackageName, RustCargoSuccess, host_executable_name,
     },
 };
+use anvyx_externs::ProviderPackageKey;
 use anvyx_lang::{AirBuildError, AirBuildOutput, DiagnosticReport, FrontendConfig};
-use anvyx_runtime::{RustProviderSupport, validate_rust_provider_support};
 
 use crate::{
     cache,
-    check::{air_error_ref, build_air_path_typed, build_air_path_with_graph_typed},
+    check::{air_error_ref, package_check_input, standalone_check_input},
     rust_deps,
 };
 
@@ -169,7 +170,7 @@ pub fn build_batch(input: BatchInput) -> Result<BatchOutput, String> {
         .cache_root
         .unwrap_or_else(cache::default_rust_cache_root);
     let mut emitted_cases = vec![];
-    let mut native_providers = vec![];
+    let mut native_dependencies = vec![];
     let mut semantic_profile = None;
     for (index, case) in input.cases.into_iter().enumerate() {
         let profile = semantic_profile_name(case.frontend.context.profile);
@@ -183,14 +184,14 @@ pub fn build_batch(input: BatchInput) -> Result<BatchOutput, String> {
         let file = case.file;
         let native = native_provider_context_for_file(&file, &cache_root)
             .map_err(|error| error.to_string())?;
-        let emitted =
-            emit_source(&file, case.frontend, &native).map_err(|error| error.to_string())?;
-        native_providers.extend(emitted.native_providers);
+        let emitted = emit_source_with_events(&file, case.frontend, &native, &mut |_| {})
+            .map_err(|error| error.to_string())?;
+        native_dependencies.extend(emitted.dependencies);
         emitted_cases.push((index, file, profile, emitted.source));
     }
 
     let dependencies =
-        native_provider_dependencies(&native_providers).map_err(|error| error.to_string())?;
+        merge_native_dependencies(native_dependencies).map_err(|error| error.to_string())?;
     let mut files = std::collections::HashMap::new();
     let mut cases = vec![];
     for (index, file, profile, source) in emitted_cases {
@@ -280,7 +281,7 @@ fn execute(
     let native = native_provider_context_for_file(file, &cache_root)?;
     let metadata = cargo_metadata_for_file(file)?;
     let emitted = emit_source_with_events(file, frontend, &native, events)?;
-    let dependencies = native_provider_dependencies(&emitted.native_providers)?;
+    let dependencies = emitted.dependencies;
     let seed = stable_file_seed(file)?;
     let crate_identity = cargo_job::single_program_crate_identity(&RustCargoCrateIdentityInput {
         seed: &seed,
@@ -412,20 +413,12 @@ fn semantic_profile_name(profile: anvyx_lang::Profile) -> &'static str {
 
 struct EmittedRustSource {
     source: RustSource,
-    native_providers: Vec<RustProviderSupport>,
+    dependencies: Vec<RustCargoDependency>,
 }
 
-struct NativeProviderContext {
-    supports: Vec<RustProviderSupport>,
-    graph: Option<crate::manifest::PackageGraph>,
-}
-
-fn emit_source(
-    file: &Path,
-    frontend: FrontendConfig,
-    native: &NativeProviderContext,
-) -> Result<EmittedRustSource, Error> {
-    emit_source_with_events(file, frontend, native, &mut |_| {})
+enum NativeProviderContext {
+    Graph(crate::manifest::PackageGraph),
+    System(crate::manifest::ProviderWorld),
 }
 
 fn emit_source_with_events(
@@ -435,22 +428,34 @@ fn emit_source_with_events(
     events: &mut impl for<'a> FnMut(&Event<'a>),
 ) -> Result<EmittedRustSource, Error> {
     events(&Event::Checking { file });
-    let output = match &native.graph {
-        Some(graph) => build_air_path_with_graph_typed(file, frontend, graph),
-        None => build_air_path_typed(file, frontend),
+    let world = match native {
+        NativeProviderContext::Graph(graph) => graph.provider_world(),
+        NativeProviderContext::System(world) => world,
+    };
+    let output = match native {
+        NativeProviderContext::Graph(graph) => package_check_input(graph, file)
+            .map_err(|error| AirBuildError::Fatal(anvyx_lang::CheckError::InvalidInput(error)))
+            .and_then(|input| {
+                anvyx_lang::build_air_package(
+                    input.with_config(frontend),
+                    &graph.provider_world().catalog,
+                )
+            }),
+        NativeProviderContext::System(world) => standalone_check_input(file)
+            .map_err(|error| AirBuildError::Fatal(anvyx_lang::CheckError::InvalidInput(error)))
+            .and_then(|input| {
+                anvyx_lang::build_air_file(input.with_config(frontend), &world.catalog)
+            }),
     }
     .map_err(Error::Air)?;
     let AirBuildOutput { report, air } = output;
     events(&Event::Checked { report: &report });
     let sources = report.sources;
-    let native_providers = used_native_provider_supports(&air, &native.supports);
     events(&Event::GeneratingRust);
     let source = anvyx_backend::rust::generate(
         &air.as_verified(),
-        anvyx_backend::rust::RustPlanConfig {
-            native_providers: native_providers.clone(),
-            ..anvyx_backend::rust::RustPlanConfig::default()
-        },
+        anvyx_backend::rust::RustPlanConfig::default(),
+        &world.catalog,
     )
     .map_err(|error| match error {
         RustPlanError::TargetGaps(gaps) => {
@@ -464,103 +469,74 @@ fn emit_source_with_events(
     })?;
     Ok(EmittedRustSource {
         source,
-        native_providers,
+        dependencies: native_provider_dependencies(world, &used_provider_packages(&air))?,
     })
+}
+
+fn used_provider_packages(air: &anvyx_lang::OwnedVerifiedProgram) -> BTreeSet<ProviderPackageKey> {
+    air.program()
+        .externs
+        .iter()
+        .filter_map(|decl| decl.binding.as_ref().map(|binding| binding.package.clone()))
+        .chain(
+            air.program()
+                .extern_types
+                .iter()
+                .filter_map(|decl| decl.binding.as_ref().map(|binding| binding.package.clone())),
+        )
+        .collect()
 }
 
 fn native_provider_context_for_file(
     file: &Path,
     cache_root: &Path,
 ) -> Result<NativeProviderContext, Error> {
-    let mut supports = system_native_provider_supports()?;
-    let graph = load_provider_graph(file, cache_root)?;
-    if let Some(graph) = &graph {
-        supports.extend(graph.rust_provider_supports());
-    }
-    Ok(NativeProviderContext { supports, graph })
-}
-
-fn load_provider_graph(
-    file: &Path,
-    cache_root: &Path,
-) -> Result<Option<crate::manifest::PackageGraph>, Error> {
     let Some(manifest_path) =
         crate::manifest::find_nearest_manifest(file).map_err(Error::Dependency)?
     else {
-        return Ok(None);
+        return crate::manifest::system_provider_world()
+            .map(NativeProviderContext::System)
+            .map_err(Error::Dependency);
     };
     crate::manifest::load_package_graph_with_rust_cache(&manifest_path, cache_root.to_path_buf())
-        .map(Some)
+        .map(NativeProviderContext::Graph)
         .map_err(Error::Dependency)
 }
 
-fn system_native_provider_supports() -> Result<Vec<RustProviderSupport>, Error> {
-    let descriptors = anvyx_core::provider_descriptors()
-        .into_iter()
-        .chain(anvyx_stdlib::provider_descriptors())
-        .collect::<Vec<_>>();
-    let supports = anvyx_core::rust_provider_supports()
-        .into_iter()
-        .chain(anvyx_stdlib::rust_provider_supports())
-        .collect::<Vec<_>>();
-    validate_rust_provider_support(&descriptors, &supports).map_err(Error::Dependency)?;
-    Ok(supports)
-}
-
-fn used_native_provider_supports(
-    air: &anvyx_lang::OwnedVerifiedProgram,
-    supports: &[RustProviderSupport],
-) -> Vec<RustProviderSupport> {
-    let used = used_native_provider_keys(air);
-    supports
-        .iter()
-        .filter(|support| used.contains(&(support.package.clone(), support.provider.name.clone())))
-        .cloned()
-        .collect()
-}
-
-fn used_native_provider_keys(
-    air: &anvyx_lang::OwnedVerifiedProgram,
-) -> std::collections::BTreeSet<(String, String)> {
-    let program = air.program();
-    let mut keys = std::collections::BTreeSet::new();
-    for decl in &program.externs {
-        if let Some(binding) = &decl.binding {
-            keys.insert((binding.package.to_string(), binding.provider.name.clone()));
-        }
-    }
-    for decl in &program.extern_types {
-        if let Some(binding) = &decl.binding {
-            keys.insert((binding.package.to_string(), binding.provider.name.clone()));
-        }
-    }
-    keys
-}
-
 fn native_provider_dependencies(
-    supports: &[RustProviderSupport],
+    world: &crate::manifest::ProviderWorld,
+    packages: &BTreeSet<ProviderPackageKey>,
 ) -> Result<Vec<RustCargoDependency>, Error> {
     let mut dependencies = std::collections::BTreeMap::new();
     merge_dependency(&mut dependencies, rust_deps::runtime_dependency())?;
-    for support in supports {
-        let cargo = support.cargo.clone();
-        let source = cargo
-            .path
-            .unwrap_or_else(|| system_provider_path(&cargo.manifest_key));
+    for package in packages {
+        let cargo = world
+            .cargo
+            .get(package)
+            .expect("provider catalog and Cargo sidecars have matching packages");
         let dep = RustCargoDependency {
-            name: RustCargoName::parse(cargo.manifest_key.clone()).map_err(Error::Dependency)?,
-            package: cargo
-                .package
-                .map(RustCargoPackageName::parse)
-                .transpose()
-                .map_err(Error::Dependency)?,
-            source: RustCargoDependencySource::Path(source.display().to_string()),
-            features: cargo.features,
-            default_features: cargo.default_features,
+            name: RustCargoName::parse(cargo.crate_alias.clone()).map_err(Error::Dependency)?,
+            package: Some(
+                RustCargoPackageName::parse(cargo.cargo_package.clone())
+                    .map_err(Error::Dependency)?,
+            ),
+            source: RustCargoDependencySource::Path(cargo.crate_root.display().to_string()),
+            features: vec![],
+            default_features: true,
         };
         merge_dependency(&mut dependencies, dep)?;
     }
     Ok(dependencies.into_values().collect())
+}
+
+fn merge_native_dependencies(
+    dependencies: Vec<RustCargoDependency>,
+) -> Result<Vec<RustCargoDependency>, Error> {
+    let mut merged = std::collections::BTreeMap::new();
+    for dependency in dependencies {
+        merge_dependency(&mut merged, dependency)?;
+    }
+    Ok(merged.into_values().collect())
 }
 
 fn merge_dependency(
@@ -584,12 +560,4 @@ fn merge_dependency(
     existing.features.sort();
     existing.features.dedup();
     Ok(())
-}
-
-fn system_provider_path(manifest_key: &str) -> PathBuf {
-    match manifest_key {
-        "anvyx_core" => rust_deps::workspace_crate_path("core"),
-        "anvyx_stdlib" => rust_deps::workspace_crate_path("stdlib"),
-        _ => rust_deps::workspace_crate_path(manifest_key),
-    }
 }

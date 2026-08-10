@@ -45,6 +45,5 @@ pub fn make_win(value: i64) -> WWin {
 
 anvyx_runtime::builtin_module! {
     name: "win",
-    source: "",
-    exports: [WWin, make_win],
-}
+    root: false,
+    exports: [WWin, make_win],}

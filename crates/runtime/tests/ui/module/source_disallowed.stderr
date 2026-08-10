@@ -1,0 +1,5 @@
+error: expected one of `provider`, `name`, `root`, or `exports`
+ --> tests/ui/module/source_disallowed.rs:3:5
+  |
+3 |     source: "",
+  |     ^^^^^^

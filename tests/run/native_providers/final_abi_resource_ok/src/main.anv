@@ -12,6 +12,8 @@
 // 11
 // 13
 // missing
+// 17
+// -1
 // 20
 // 22
 // 21
@@ -20,7 +22,7 @@
 // 42
 // @match-end
 
-import pkg:host.host { Counter, make_counter, make_owned_counter, maybe_owned_counter, result_owned_counter, counter_value, counter_result_value };
+import pkg:host.host { Counter, make_counter, make_owned_counter, maybe_owned_counter, result_owned_counter, counter_value, maybe_counter, maybe_counter_value, counter_result_value };
 
 contract DynamicCounter {
     fn bump(ref self, delta: int);
@@ -82,6 +84,8 @@ fn main() {
     println(counter_value(maybe));
     println(counter_result_value(result_owned_counter(true, 13)));
     println(counter_result_value(result_owned_counter(false, 0)));
+    println(maybe_counter_value(maybe_counter(true, 17)));
+    println(maybe_counter_value(maybe_counter(false, 0)));
 
     var dynamic: dyn DynamicCounter + DuplicableCounter = make_counter(20);
     if let counter? = dynamic as? Counter { println(counter_value(counter)); }

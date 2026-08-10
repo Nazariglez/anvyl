@@ -1,10 +1,18 @@
 // @mode: run
 // @expect: success
-// @match: 1280
+// @match: 1920
 
-import pkg:host.host { make_config, config_width, WindowConfig };
+import pkg:host.host {
+    make_config,
+    config_width,
+    make_underscores,
+    underscores_width,
+    WindowConfig,
+    UnderscoreConfig,
+};
 
 fn main() {
     let config: WindowConfig = make_config(1280);
-    println(config_width(config));
+    let underscores: UnderscoreConfig = make_underscores(640);
+    println(config_width(config) + underscores_width(underscores));
 }

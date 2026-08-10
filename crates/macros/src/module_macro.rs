@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use proc_macro2::TokenStream;
 use quote::quote;
 use syn::{
-    Expr, Ident, LitStr, Path, Token,
+    Ident, LitStr, Path, Token,
     parse::{Parse, ParseStream},
     punctuated::Punctuated,
 };
@@ -17,7 +17,7 @@ struct ModuleArgs {
 struct BuiltinArgs {
     provider: Option<LitStr>,
     name: LitStr,
-    source: Expr,
+    root: bool,
     exports: Vec<Path>,
 }
 
@@ -32,7 +32,7 @@ impl Parse for ModuleArgs {
         let mut exports = None;
         while !input.is_empty() {
             let key: Ident = input.parse()?;
-            let _colon: Token![:] = input.parse()?;
+            let _: Token![:] = input.parse()?;
             match key.to_string().as_str() {
                 "root" => set_once(&mut root, &key, "module!", input.parse()?)?,
                 "modules" => set_list(&mut modules, &key, "module!", input)?,
@@ -45,7 +45,7 @@ impl Parse for ModuleArgs {
                 }
             }
             if !input.is_empty() {
-                let _comma: Token![,] = input.parse()?;
+                let _: Token![,] = input.parse()?;
             }
         }
         Ok(Self {
@@ -60,31 +60,36 @@ impl Parse for BuiltinArgs {
     fn parse(input: ParseStream) -> syn::Result<Self> {
         let mut provider = None;
         let mut name = None;
-        let mut source = None;
+        let mut root = None;
         let mut exports = None;
         while !input.is_empty() {
             let key: Ident = input.parse()?;
-            let _colon: Token![:] = input.parse()?;
+            let _: Token![:] = input.parse()?;
             match key.to_string().as_str() {
                 "provider" => set_once(&mut provider, &key, "builtin_module!", input.parse()?)?,
                 "name" => set_once(&mut name, &key, "builtin_module!", input.parse()?)?,
-                "source" => set_once(&mut source, &key, "builtin_module!", input.parse()?)?,
+                "root" => set_once(
+                    &mut root,
+                    &key,
+                    "builtin_module!",
+                    input.parse::<syn::LitBool>()?.value,
+                )?,
                 "exports" => set_list(&mut exports, &key, "builtin_module!", input)?,
                 _ => {
                     return Err(syn::Error::new_spanned(
                         key,
-                        "expected one of `provider`, `name`, `source`, or `exports`",
+                        "expected one of `provider`, `name`, `root`, or `exports`",
                     ));
                 }
             }
             if !input.is_empty() {
-                let _comma: Token![,] = input.parse()?;
+                let _: Token![,] = input.parse()?;
             }
         }
         Ok(Self {
             provider,
             name: name.ok_or_else(|| missing("builtin_module!", "name"))?,
-            source: source.ok_or_else(|| missing("builtin_module!", "source"))?,
+            root: root.unwrap_or(true),
             exports: exports.unwrap_or_default(),
         })
     }
@@ -95,7 +100,7 @@ impl Parse for ProviderPackageArgs {
         let mut modules = None;
         while !input.is_empty() {
             let key: Ident = input.parse()?;
-            let _colon: Token![:] = input.parse()?;
+            let _: Token![:] = input.parse()?;
             match key.to_string().as_str() {
                 "modules" => set_provider_modules(&mut modules, &key, input)?,
                 _ => {
@@ -106,7 +111,7 @@ impl Parse for ProviderPackageArgs {
                 }
             }
             if !input.is_empty() {
-                let _comma: Token![,] = input.parse()?;
+                let _: Token![,] = input.parse()?;
             }
         }
         let modules = modules.ok_or_else(|| missing("provider_package!", "modules"))?;
@@ -121,87 +126,42 @@ impl Parse for ProviderPackageArgs {
 }
 
 pub fn expand_module(input: TokenStream) -> TokenStream {
-    match expand_module_inner(input) {
-        Ok(tokens) => tokens,
-        Err(err) => err.to_compile_error(),
-    }
+    expand_module_inner(input).unwrap_or_else(|error| error.to_compile_error())
 }
 
 pub fn expand_builtin(input: TokenStream) -> TokenStream {
-    match expand_builtin_inner(input) {
-        Ok(tokens) => tokens,
-        Err(err) => err.to_compile_error(),
-    }
+    expand_builtin_inner(input).unwrap_or_else(|error| error.to_compile_error())
 }
 
 pub fn expand_provider_package(input: TokenStream) -> TokenStream {
-    match expand_provider_package_inner(input) {
-        Ok(tokens) => tokens,
-        Err(err) => err.to_compile_error(),
-    }
+    expand_provider_package_inner(input).unwrap_or_else(|error| error.to_compile_error())
 }
 
 fn expand_module_inner(input: TokenStream) -> syn::Result<TokenStream> {
     let args: ModuleArgs = syn::parse2(input)?;
-    let export_descriptors = export_descriptor_tokens(&args.exports)?;
+    let exports = export_tokens(&args.exports)?;
     let native_exports = native_exports(&args.exports)?;
     let native_children = native_child_modules(&args.modules)?;
-    let descriptor_children = descriptor_child_tokens(&args.modules);
-    let support_bindings = support_binding_tokens(&args.exports)?;
-    let support_children = support_child_tokens(&args.modules);
+    let child_exports = child_module_exports(&args.modules);
     let root = args.root.as_ref().map(root_tokens);
 
     Ok(quote! {
-        #[doc(hidden)]
-        pub fn __anvyx_module_descriptor() -> anvyx_runtime::ExternModuleDescriptor {
-            let exports = #export_descriptors;
-            anvyx_runtime::ExternModuleDescriptor {
-                path: anvyx_runtime::ModulePath { segments: vec![] },
-                types: exports.types.into_iter().map(|export| export.descriptor).collect(),
-                functions: exports.functions.into_iter().map(|export| export.descriptor).collect(),
-            }
-        }
-
-        #[doc(hidden)]
-        pub fn __anvyx_module_descriptors(
+        pub(crate) fn __anvyx_module_exports(
+            package: &mut anvyx_runtime::RawProviderPackage,
+            provider: anvyx_runtime::ProviderId,
             module_path: anvyx_runtime::ModulePath,
-        ) -> Vec<anvyx_runtime::ExternModuleDescriptor> {
-            let mut module = __anvyx_module_descriptor();
-            module.path = module_path.clone();
-            let mut modules = vec![module];
-            #(#descriptor_children)*
-            modules
-        }
-
-        #[doc(hidden)]
-        pub fn __anvyx_module_support(
-            module_path: anvyx_runtime::ModulePath,
-            crate_name: &str,
-            native_prefix: Vec<String>,
-        ) -> anvyx_runtime::RustModuleSupport {
-            let mut types = vec![];
-            let mut bindings = vec![];
-            #(#support_bindings)*
-            anvyx_runtime::RustModuleSupport {
-                module: module_path,
-                types,
-                bindings,
-            }
-        }
-
-        #[doc(hidden)]
-        pub fn __anvyx_module_supports(
-            module_path: anvyx_runtime::ModulePath,
-            crate_name: &str,
-            native_prefix: Vec<String>,
-        ) -> Vec<anvyx_runtime::RustModuleSupport> {
-            let mut supports = vec![__anvyx_module_support(
+            function_prefix: Vec<String>,
+            type_prefix: Option<Vec<String>>,
+        ) {
+            let exports = #exports;
+            exports.finalize(
+                package,
+                provider.clone(),
                 module_path.clone(),
-                crate_name,
-                native_prefix.clone(),
-            )];
-            #(#support_children)*
-            supports
+                &function_prefix,
+                type_prefix.as_deref(),
+            );
+            #(#child_exports)*
         }
 
         pub mod __anvyx_native {
@@ -216,60 +176,51 @@ fn expand_module_inner(input: TokenStream) -> syn::Result<TokenStream> {
 fn expand_builtin_inner(input: TokenStream) -> syn::Result<TokenStream> {
     let args: BuiltinArgs = syn::parse2(input)?;
     let name = args.name.value();
-    let provider_lit = args.provider.unwrap_or_else(|| args.name.clone());
-    let _source = args.source;
-    let export_descriptors = export_descriptor_tokens(&args.exports)?;
+    let provider = args.provider.unwrap_or_else(|| args.name.clone());
+    let exports = export_tokens(&args.exports)?;
     let native_exports = native_exports(&args.exports)?;
-    let module_path = module_path_tokens(&name);
-    let bindings = binding_tokens(&name, &args.exports)?;
+    let path = module_path_tokens(&name);
+    let root_export = args.root.then(|| {
+        quote! {
+            pub fn rust_providers() -> anvyx_runtime::RawProviderPackage {
+                let mut package = anvyx_runtime::RawProviderPackage::default();
+                __anvyx_provider_export(
+                    &mut package,
+                    vec!["__anvyx_native".to_string()],
+                    None,
+                );
+                package
+            }
+        }
+    });
 
     Ok(quote! {
-        #[doc(hidden)]
-        pub fn __anvyx_module_descriptor() -> anvyx_runtime::ExternModuleDescriptor {
-            let exports = #export_descriptors;
-            anvyx_runtime::ExternModuleDescriptor {
-                path: #module_path,
-                types: exports.types.into_iter().map(|export| export.descriptor).collect(),
-                functions: exports.functions.into_iter().map(|export| export.descriptor).collect(),
-            }
+        pub(crate) fn __anvyx_provider_export(
+            package: &mut anvyx_runtime::RawProviderPackage,
+            function_prefix: Vec<String>,
+            type_prefix: Option<Vec<String>>,
+        ) {
+            let exports = #exports;
+            exports.finalize(
+                package,
+                anvyx_runtime::ProviderId { name: #provider.to_string() },
+                #path,
+                &function_prefix,
+                type_prefix.as_deref(),
+            );
         }
 
         pub mod __anvyx_native {
             #(#native_exports)*
         }
 
-        pub fn provider_descriptor() -> anvyx_runtime::ProviderDescriptor {
-            anvyx_runtime::ProviderDescriptor {
-                provider: anvyx_runtime::ProviderId { name: #provider_lit.to_string() },
-                modules: vec![__anvyx_module_descriptor()],
-            }
-        }
-
-        pub fn rust_module_support() -> anvyx_runtime::RustModuleSupport {
-            let mut types = vec![];
-            let mut bindings = vec![];
-            #(#bindings)*
-            anvyx_runtime::RustModuleSupport {
-                module: #module_path,
-                types,
-                bindings,
-            }
-        }
-
-        pub fn provider_descriptors() -> Vec<anvyx_runtime::ProviderDescriptor> {
-            vec![provider_descriptor()]
-        }
-
-        pub fn rust_module_supports() -> Vec<anvyx_runtime::RustModuleSupport> {
-            vec![rust_module_support()]
-        }
+        #root_export
     })
 }
 
 fn expand_provider_package_inner(input: TokenStream) -> syn::Result<TokenStream> {
     let args: ProviderPackageArgs = syn::parse2(input)?;
-    let descriptor_children = provider_package_descriptor_tokens(&args.modules);
-    let support_children = provider_package_support_tokens(&args.modules);
+    let children = provider_package_exports(&args.modules);
     let native_children = provider_package_native_tokens(&args.modules);
 
     Ok(quote! {
@@ -277,32 +228,26 @@ fn expand_provider_package_inner(input: TokenStream) -> syn::Result<TokenStream>
             #(#native_children)*
         }
 
-        pub fn provider_descriptors() -> Vec<anvyx_runtime::ProviderDescriptor> {
-            let mut descriptors = vec![];
-            #(#descriptor_children)*
-            descriptors
-        }
-
-        pub fn rust_module_supports() -> Vec<anvyx_runtime::RustModuleSupport> {
+        pub fn rust_providers() -> anvyx_runtime::RawProviderPackage {
             let package_root = module_path!()
                 .split("::")
                 .skip(1)
                 .map(str::to_string)
                 .collect::<Vec<_>>();
-            let mut supports = vec![];
-            #(#support_children)*
-            supports
+            let mut package = anvyx_runtime::RawProviderPackage::default();
+            #(#children)*
+            package
         }
     })
 }
 
-fn export_descriptor_tokens(exports: &[Path]) -> syn::Result<TokenStream> {
+fn export_tokens(exports: &[Path]) -> syn::Result<TokenStream> {
     let mut pushes = vec![];
     for export in exports {
         validate_plain_path(export)?;
         let companion = companion_path(export)?;
         pushes.push(quote! {
-            anvyx_runtime::ModuleExportItem::push_descriptor(#companion(), &mut exports);
+            exports.extend(#companion());
         });
     }
     Ok(quote! {{
@@ -338,64 +283,46 @@ fn native_child_modules(modules: &[Path]) -> syn::Result<Vec<TokenStream>> {
         .collect()
 }
 
-fn descriptor_child_tokens(modules: &[Path]) -> Vec<TokenStream> {
+fn child_module_exports(modules: &[Path]) -> Vec<TokenStream> {
     modules
         .iter()
         .map(|module| {
-            let segments = path_segment_tokens(module);
+            let module_segments = path_segment_tokens(module, false);
+            let rust_segments = path_segment_tokens(module, true);
             quote! {
                 let mut child_path = module_path.clone();
-                child_path.segments.extend([#(#segments.to_string()),*]);
-                modules.extend(#module::__anvyx_module_descriptors(child_path));
+                child_path.segments.extend([#(#module_segments.to_string()),*]);
+                let mut child_functions = function_prefix.clone();
+                child_functions.extend([#(#rust_segments.to_string()),*]);
+                let child_types = type_prefix.as_ref().map(|prefix| {
+                    let mut prefix = prefix.clone();
+                    prefix.extend([#(#rust_segments.to_string()),*]);
+                    prefix
+                });
+                #module::__anvyx_module_exports(
+                    package,
+                    provider.clone(),
+                    child_path,
+                    child_functions,
+                    child_types,
+                );
             }
         })
         .collect()
 }
 
-fn support_child_tokens(modules: &[Path]) -> Vec<TokenStream> {
+fn provider_package_exports(modules: &[Path]) -> Vec<TokenStream> {
     modules
         .iter()
         .map(|module| {
-            let segments = path_segment_tokens(module);
+            let rust_segments = path_segment_tokens(module, true);
             quote! {
-                let mut child_path = module_path.clone();
-                child_path.segments.extend([#(#segments.to_string()),*]);
-                let mut child_prefix = native_prefix.clone();
-                child_prefix.extend([#(#segments.to_string()),*]);
-                supports.extend(#module::__anvyx_module_supports(child_path, crate_name, child_prefix));
-            }
-        })
-        .collect()
-}
-
-fn provider_package_descriptor_tokens(modules: &[Path]) -> Vec<TokenStream> {
-    modules
-        .iter()
-        .map(|module| quote! { descriptors.extend(#module::provider_descriptors()); })
-        .collect()
-}
-
-fn provider_package_support_tokens(modules: &[Path]) -> Vec<TokenStream> {
-    modules
-        .iter()
-        .map(|module| {
-            let segments = path_segment_tokens(module);
-            quote! {
-                let mut module_root = package_root.clone();
-                module_root.extend([#(#segments.to_string()),*]);
-                let mut native_root = package_root.clone();
-                native_root.push("__anvyx_native_package".to_string());
-                native_root.extend([#(#segments.to_string()),*]);
-                let mut child_supports = #module::rust_module_supports();
-                for support in &mut child_supports {
-                    for ty in &mut support.types {
-                        ty.retarget_prefix(&module_root, &native_root);
-                    }
-                    for binding in &mut support.bindings {
-                        binding.path.retarget_native_root(&native_root);
-                    }
-                }
-                supports.extend(child_supports);
+                let mut prefix = package_root.clone();
+                prefix.push("__anvyx_native_package".to_string());
+                prefix.extend([#(#rust_segments.to_string()),*]);
+                let mut function_prefix = prefix.clone();
+                function_prefix.push("__anvyx_native".to_string());
+                #module::__anvyx_provider_export(&mut package, function_prefix, Some(prefix));
             }
         })
         .collect()
@@ -442,88 +369,32 @@ fn provider_package_native_tokens(modules: &[Path]) -> Vec<TokenStream> {
 
 fn provider_package_native_tree_token(branch: &NativeBranch, depth: usize) -> TokenStream {
     let ident = &branch.ident;
-    let node = &branch.tree;
-    let reexport = node.target.as_ref().map(|module| {
+    let reexport = branch.tree.target.as_ref().map(|module| {
         let parents = (0..=depth).map(|_| Ident::new("super", proc_macro2::Span::call_site()));
         quote! { pub use #(#parents)::*::#module::*; }
     });
-    let children = node
+    let children = branch
+        .tree
         .children
         .values()
-        .map(|branch| provider_package_native_tree_token(branch, depth + 1));
+        .map(|child| provider_package_native_tree_token(child, depth + 1));
     quote! { pub mod #ident { #reexport #(#children)* } }
-}
-
-fn binding_tokens(module: &str, exports: &[Path]) -> syn::Result<Vec<TokenStream>> {
-    exports
-        .iter()
-        .map(|export| {
-            let companion = companion_path(export)?;
-            let module_path = module_path_tokens(module);
-            Ok(quote! {
-                let export = #companion();
-                types.extend(anvyx_runtime::ModuleExportItem::rust_type_bindings(
-                    export.clone(),
-                    #module_path.clone(),
-                    "crate",
-                ));
-                bindings.extend(anvyx_runtime::ModuleExportItem::rust_bindings(
-                    export,
-                    #module_path,
-                    "crate",
-                ));
-            })
-        })
-        .collect()
-}
-
-fn support_binding_tokens(exports: &[Path]) -> syn::Result<Vec<TokenStream>> {
-    exports
-        .iter()
-        .map(|export| {
-            let companion = companion_path(export)?;
-            Ok(quote! {
-                let export = #companion();
-                types.extend(anvyx_runtime::ModuleExportItem::rust_type_bindings(
-                    export.clone(),
-                    module_path.clone(),
-                    crate_name,
-                ));
-                let mut export_bindings = anvyx_runtime::ModuleExportItem::rust_bindings(
-                    export,
-                    module_path.clone(),
-                    crate_name,
-                );
-                for binding in &mut export_bindings {
-                    binding.path.prefix_native(&native_prefix);
-                }
-                bindings.extend(export_bindings);
-            })
-        })
-        .collect()
 }
 
 fn root_tokens(root: &Ident) -> TokenStream {
     let root_name = root.to_string();
-    let module_path = module_path_tokens(&root_name);
+    let path = module_path_tokens(&root_name);
     quote! {
-        pub fn provider_descriptor() -> anvyx_runtime::ProviderDescriptor {
-            anvyx_runtime::ProviderDescriptor {
-                provider: anvyx_runtime::ProviderId { name: #root_name.to_string() },
-                modules: __anvyx_module_descriptors(#module_path),
-            }
-        }
-
-        pub fn provider_descriptors() -> Vec<anvyx_runtime::ProviderDescriptor> {
-            vec![provider_descriptor()]
-        }
-
-        pub fn rust_module_support() -> anvyx_runtime::RustModuleSupport {
-            __anvyx_module_support(#module_path, "crate", vec![])
-        }
-
-        pub fn rust_module_supports() -> Vec<anvyx_runtime::RustModuleSupport> {
-            __anvyx_module_supports(#module_path, "crate", vec![])
+        pub fn rust_providers() -> anvyx_runtime::RawProviderPackage {
+            let mut package = anvyx_runtime::RawProviderPackage::default();
+            __anvyx_module_exports(
+                &mut package,
+                anvyx_runtime::ProviderId { name: #root_name.to_string() },
+                #path,
+                vec!["__anvyx_native".to_string()],
+                None,
+            );
+            package
         }
     }
 }
@@ -548,19 +419,23 @@ fn native_path(path: &Path) -> syn::Result<Path> {
     Ok(path)
 }
 
-fn path_segment_tokens(path: &Path) -> Vec<String> {
+fn path_segment_tokens(path: &Path, preserve_raw: bool) -> Vec<String> {
     path.segments
         .iter()
-        .map(|segment| ident_text(&segment.ident))
+        .map(|segment| {
+            let text = segment.ident.to_string();
+            if preserve_raw {
+                text
+            } else {
+                text.strip_prefix("r#").unwrap_or(&text).to_string()
+            }
+        })
         .collect()
 }
 
 fn ident_text(ident: &Ident) -> String {
     let text = ident.to_string();
-    match text.strip_prefix("r#") {
-        Some(unraw) => unraw.to_string(),
-        None => text,
-    }
+    text.strip_prefix("r#").unwrap_or(&text).to_string()
 }
 
 fn module_path_tokens(module: &str) -> TokenStream {
@@ -593,8 +468,8 @@ fn set_list(
     }
     let content;
     syn::bracketed!(content in input);
-    let parsed: Punctuated<Path, Token![,]> = Punctuated::parse_terminated(&content)?;
-    let items = parsed.into_iter().collect::<Vec<_>>();
+    let items = Punctuated::<Path, Token![,]>::parse_terminated(&content)
+        .map(|items| items.into_iter().collect::<Vec<_>>())?;
     for path in &items {
         validate_plain_path(path)?;
     }
@@ -615,12 +490,12 @@ fn set_provider_modules(
     }
     let content;
     syn::bracketed!(content in input);
-    let parsed: Punctuated<Path, Token![,]> = Punctuated::parse_terminated(&content)?;
-    let items = parsed.into_iter().collect::<Vec<_>>();
+    let items = Punctuated::<Path, Token![,]>::parse_terminated(&content)
+        .map(|items| items.into_iter().collect::<Vec<_>>())?;
     let mut seen = BTreeSet::new();
     for path in &items {
         validate_provider_module_path(path)?;
-        let normalized = path_segment_tokens(path).join("::");
+        let normalized = path_segment_tokens(path, false).join("::");
         if !seen.insert(normalized.clone()) {
             return Err(syn::Error::new_spanned(
                 path,

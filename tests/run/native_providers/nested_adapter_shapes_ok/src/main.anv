@@ -1,0 +1,23 @@
+// @mode: run
+// @expect: success
+// @match-begin
+// 2
+// -1
+// 3
+// -3
+// 2
+// -1
+// -2
+// @match-end
+
+import pkg:host.host { nested, option_slice, result_slice };
+
+fn main() {
+    println(option_slice([4, 5]));
+    println(option_slice(nil));
+    println(result_slice(Result.Ok([6, 7, 8])));
+    println(result_slice(Result.Err("bad")));
+    println(nested(Option.Some(Result.Ok([9, 10]))));
+    println(nested(nil));
+    println(nested(Option.Some(Result.Err("no"))));
+}

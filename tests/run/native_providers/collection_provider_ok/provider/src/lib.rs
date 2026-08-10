@@ -43,7 +43,6 @@ pub fn host_slice_first<'cx>(
 
 anvyx_runtime::builtin_module! {
     name: "host",
-    source: "",
     exports: [
         host_direct_first, host_direct_make, host_direct_lookup, host_direct_map, host_slice_first,
     ],

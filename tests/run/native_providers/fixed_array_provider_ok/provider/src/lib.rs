@@ -22,6 +22,5 @@ pub fn add_present(values: [Option<i64>; 2]) -> i64 {
 
 anvyx_runtime::builtin_module! {
     name: "host",
-    source: "",
     exports: [pair, sum, maybe, add_present],
 }

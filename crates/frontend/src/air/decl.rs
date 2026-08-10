@@ -1,5 +1,7 @@
 // exports body type used in Function
-use anvyx_externs::{ExternBindingKey, ExternEffects, ExternTypeExpr, ExternTypeKey, ProviderId};
+use anvyx_externs::{
+    ExternBindingKey, ExternEffects, ExternTypeExpr, ExternTypeKey, ProviderId, ProviderPackageKey,
+};
 
 pub use super::body::AirBody;
 use super::{
@@ -468,14 +470,14 @@ impl Default for ExternAbi {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExternBindingDecl {
-    pub package: crate::resolve::PackageId,
+    pub package: ProviderPackageKey,
     pub provider: ProviderId,
     pub key: ExternBindingKey,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExternTypeBindingDecl {
-    pub package: crate::resolve::PackageId,
+    pub package: ProviderPackageKey,
     pub provider: ProviderId,
     pub key: ExternTypeKey,
 }

@@ -119,11 +119,8 @@ fn expand_inner(input: TokenStream, kind: TypeDeriveKind) -> syn::Result<TokenSt
     let materializer_fn = crate::naming::materializer_fn_ident();
     let doc = crate::util::extract_doc(&item.attrs)
         .map_or_else(|| quote! { None }, |doc| quote! { Some(#doc.to_string()) });
-    let rust_type_path = if item.generics.params.is_empty() {
-        quote! { concat!(module_path!(), "::", stringify!(#ident)) }
-    } else {
-        quote! { concat!(module_path!(), "::", stringify!(#ident), "<'cx>") }
-    };
+    let rust_type_path = quote! { concat!(module_path!(), "::", stringify!(#ident)) };
+    let context_lifetime = !item.generics.params.is_empty();
     let marker_trait = kind.marker_trait();
     let rep = kind.rep();
     let trace_assert = (owns_heap_edges && !matches!(kind, TypeDeriveKind::Ref)).then(|| {
@@ -169,6 +166,9 @@ fn expand_inner(input: TokenStream, kind: TypeDeriveKind) -> syn::Result<TokenSt
         TypeDeriveKind::Enum => {
             quote! { anvyx_runtime::TypeExport::enumeration::<#ident #ty_generics> }
         }
+        TypeDeriveKind::Ref if context_lifetime => {
+            quote! { anvyx_runtime::TypeExport::shared_context_lifetime::<#ident #ty_generics> }
+        }
         TypeDeriveKind::Ref => {
             quote! { anvyx_runtime::TypeExport::shared::<#ident #ty_generics> }
         }
@@ -191,11 +191,11 @@ fn expand_inner(input: TokenStream, kind: TypeDeriveKind) -> syn::Result<TokenSt
         #marker_impl
 
         #[doc(hidden)]
-        pub fn #companion #impl_generics() -> anvyx_runtime::TypeExport #where_clause {
+        pub fn #companion #impl_generics() -> anvyx_runtime::ModuleExport #where_clause {
             fn __anvyx_assert_type<T: #marker_trait>() {}
             __anvyx_assert_type::<#ident #ty_generics>();
             #trace_assert
-            anvyx_runtime::merge_type_members(#export_ctor(
+            anvyx_runtime::ModuleExport::ty(anvyx_runtime::merge_type_members(#export_ctor(
                 #rust_type_path,
                 anvyx_runtime::ExternTypeDescriptor {
                     name: #export_name.to_string(),
@@ -212,7 +212,7 @@ fn expand_inner(input: TokenStream, kind: TypeDeriveKind) -> syn::Result<TokenSt
                     operators: vec![],
                 },
                 vec![],
-            ))
+            )))
         }
 
         #[doc(hidden)]

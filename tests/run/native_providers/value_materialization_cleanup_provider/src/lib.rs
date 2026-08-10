@@ -39,6 +39,5 @@ pub fn probe_id(probe: Probe) -> i64 {
 
 anvyx_runtime::builtin_module! {
     name: "cleanup",
-    source: "",
     exports: [Probe, make_probe, probe_id],
 }

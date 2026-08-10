@@ -1,12 +1,11 @@
 use std::{collections::HashSet, error::Error, fmt};
 
+use anvyx_externs::{
+    ExternMaterialization, ExternTypeKey, RustCallContext, RustMaterializerBinding, RustPath,
+};
 use anvyx_frontend::{
     air,
     ast::{BinaryOp, FormatKind, FormatSign, FormatSpec, ScalarKind, UnaryOp},
-};
-use anvyx_runtime::{
-    CallbackEscape, CallbackThread, ExternCallbackSignature, ExternTypeExpr, ExternTypeKey,
-    RustParamAbi, RustPath, RustTypeBinding, RustWrapperCtx,
 };
 
 use super::{
@@ -204,7 +203,7 @@ pub enum RirMaterializerAction {
     IdentityShare,
     CallableShare,
     ProviderMaterialize {
-        binding: anvyx_runtime::RustMaterializerBinding,
+        binding: RustMaterializerBinding,
     },
     Struct {
         fields: Vec<RirMaterializerId>,
@@ -578,12 +577,38 @@ pub struct RirGlobal {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RirNativeType {
+    pub key: ExternTypeKey,
+    pub path: RustPath,
+    pub materializer: Option<RustMaterializerBinding>,
+}
+
+impl RirNativeType {
+    fn validated_materializer(
+        &self,
+        mode: ExternMaterialization,
+    ) -> Option<&RustMaterializerBinding> {
+        let materializer = self.materializer.as_ref()?;
+        if materializer.mode != mode || materializer.rust_type != self.path {
+            return None;
+        }
+        let native_type = self.path.segments.last()?;
+        let mut expected = self.path.segments[..self.path.segments.len() - 1].to_vec();
+        expected.push(anvyx_externs::native_materializer_module(native_type));
+        expected.push(anvyx_externs::INLINE_MATERIALIZER_SYMBOL.to_string());
+        (materializer.path.crate_name == self.path.crate_name
+            && materializer.path.segments == expected)
+            .then_some(materializer)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RirStruct {
     pub id: RirStructId,
     pub role: RirStructRole,
     pub symbol: RirSymbol,
     pub display: RirSymbol,
-    pub native: Option<RustTypeBinding>,
+    pub native: Option<RirNativeType>,
     pub native_layout: Option<RirDynLayout>,
     pub native_ref: bool,
     pub fields: Vec<RirField>,
@@ -641,7 +666,7 @@ impl RirDataRef {
 pub struct RirEnum {
     pub id: RirEnumId,
     pub role: RirEnumRole,
-    pub native: Option<RustTypeBinding>,
+    pub native: Option<RirNativeType>,
     pub native_layout: Option<RirDynLayout>,
     pub core: Option<RirCoreEnumKind>,
     pub repr: RirEnumRepr,
@@ -1674,6 +1699,7 @@ pub enum RirOwnedOperand {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RirOwnedSource {
+    Direct,
     Reuse(RirMaterializerId),
     Transfer { local: RirLocalId },
 }
@@ -2410,11 +2436,29 @@ pub enum RirConstValue {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RirNativeParam {
+    Value,
+    SharedNamed,
+    OwnedNamed,
+    Borrow,
+    MutBorrow,
+    MutPlace,
+    ScopedLambda,
+    EscapingLambda,
+    AnvCallback,
+    InitField(Box<RirNativeParam>),
+    Option(Box<RirNativeParam>),
+    Result(Box<RirNativeParam>, Box<RirNativeParam>),
+    Array(Box<RirNativeParam>),
+    Slice(Box<RirNativeParam>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RirNativeReturn {
     Void,
-    Value(ExternTypeExpr),
+    Value,
+    SharedNamed,
     OwnedNamed {
-        ty: ExternTypeExpr,
         adopt: bool,
     },
     Option {
@@ -2427,6 +2471,10 @@ pub enum RirNativeReturn {
         err_ty: RirTypeId,
         err: Box<RirNativeReturn>,
     },
+    Array {
+        elem_ty: RirTypeId,
+        elem: Box<RirNativeReturn>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -2437,7 +2485,7 @@ pub struct RirExtern {
     pub ret: RirTypeId,
     pub ret_plan: RirNativeReturn,
     pub callback_receiver: Option<usize>,
-    pub ctx: RustWrapperCtx,
+    pub ctx: RustCallContext,
     pub fallible: bool,
     pub suspends_runtime_entry: bool,
 }
@@ -2468,7 +2516,7 @@ pub struct RirExternParam {
     pub ty: RirTypeId,
     pub mode: RirPassMode,
     pub escape: RirParamEscape,
-    pub abi: RustParamAbi,
+    pub plan: RirNativeParam,
     pub(super) action: native_call::NativeArgAction,
 }
 
@@ -3424,6 +3472,28 @@ fn cell_ref_id(cell: RirCellRef) -> RirCellId {
     }
 }
 
+fn type_has_value_materializer(
+    program: &RirProgram,
+    ty: RirTypeId,
+    visiting: &mut HashSet<RirTypeId>,
+) -> bool {
+    if !visiting.insert(ty) {
+        return false;
+    }
+    let supported = match program.types.get(ty.index()) {
+        Some(RirType::Void | RirType::Slice(_)) | None => false,
+        Some(RirType::Option(inner)) => type_has_value_materializer(program, *inner, visiting),
+        Some(RirType::Enum(id)) => program.enums[id.index()]
+            .variants
+            .iter()
+            .flat_map(|variant| &variant.fields)
+            .all(|field| type_has_value_materializer(program, field.ty, visiting)),
+        Some(_) => true,
+    };
+    visiting.remove(&ty);
+    supported
+}
+
 fn native_extern_signature_ok(
     program: &RirProgram,
     ext: &RirExtern,
@@ -3433,83 +3503,214 @@ fn native_extern_signature_ok(
         && !ext.path.segments.is_empty()
         && ext.path.segments.iter().all(|segment| !segment.is_empty())
         && ext.params.iter().all(|param| {
-            let (mode, escape) = native_call::classify_param(&param.abi);
+            let Some(ty) = program.types.get(param.ty.index()) else {
+                return false;
+            };
+            let (mode, escape) = native_call::classify_param(&param.plan);
             let native_ref = native_ty_is_resource_ref(program, param.ty);
             param.mode == mode
                 && param.escape == escape
                 && param.action
                     == native_call::classify_arg_action(
-                        &param.abi,
+                        &param.plan,
                         mode,
                         native_ref,
                         ext.suspends_runtime_entry,
+                        ty,
                     )
-                && rir_type_matches_rust_param(program, param.ty, &param.abi)
+                && rir_native_param_valid(program, param.ty, &param.plan)
         })
         && rir_native_return_valid(program, ext.ret, &ext.ret_plan)
         && ext.suspends_runtime_entry == retained_callbacks
+        && native_context_ok(ext)
         && native_callback_receiver_ok(program, ext)
         && native_hidden_ctx_borrows_ok(program, ext)
 }
 
-fn rir_type_matches_rust_param(program: &RirProgram, ty: RirTypeId, abi: &RustParamAbi) -> bool {
-    match abi {
-        RustParamAbi::Value(expected)
-        | RustParamAbi::OwnedNamed(expected)
-        | RustParamAbi::Borrow(expected)
-        | RustParamAbi::MutBorrow(expected)
-        | RustParamAbi::MutPlace(expected) => rir_type_matches_extern(program, ty, expected),
-        RustParamAbi::ScopedLambda(callback)
-        | RustParamAbi::EscapingLambda(callback)
-        | RustParamAbi::AnvCallback(callback) => rir_type_matches_callback(program, ty, callback),
-        RustParamAbi::InitField(inner) => rir_type_matches_rust_param(program, ty, inner),
-        RustParamAbi::Option(inner) => {
-            matches!(program.types.get(ty.index()), Some(RirType::Option(payload))
-                if rir_type_matches_rust_param(program, *payload, inner))
+fn rir_native_param_valid(program: &RirProgram, ty: RirTypeId, plan: &RirNativeParam) -> bool {
+    match plan {
+        RirNativeParam::Value => rir_native_value_valid(program, ty),
+        RirNativeParam::SharedNamed => native_ty_is_resource_ref(program, ty),
+        RirNativeParam::OwnedNamed => rir_native_inline_named(program, ty),
+        RirNativeParam::Borrow | RirNativeParam::MutBorrow | RirNativeParam::MutPlace => {
+            rir_native_borrow_valid(program, ty)
         }
-        RustParamAbi::Slice(inner) => {
-            matches!(program.types.get(ty.index()), Some(RirType::Slice(elem))
-                if rir_type_matches_rust_param(program, *elem, inner))
+        RirNativeParam::ScopedLambda
+        | RirNativeParam::EscapingLambda
+        | RirNativeParam::AnvCallback => {
+            matches!(program.types.get(ty.index()), Some(RirType::Lambda(_)))
         }
-        RustParamAbi::Result(ok, err) => {
-            let Some(RirType::Enum(id)) = program.types.get(ty.index()) else {
-                return false;
-            };
-            let enm = &program.enums[id.index()];
-            let [ok_variant, err_variant] = enm.variants.as_slice() else {
-                return false;
-            };
-            enm.core == Some(RirCoreEnumKind::Result)
-                && rir_rust_param_variant_matches(program, ok_variant, "Ok", ok)
-                && rir_rust_param_variant_matches(program, err_variant, "Err", err)
+        RirNativeParam::InitField(inner) => rir_native_param_valid(program, ty, inner),
+        RirNativeParam::Option(inner) => {
+            matches!(program.types.get(ty.index()), Some(RirType::Option(payload)) if rir_native_param_valid(program, *payload, inner))
         }
+        RirNativeParam::Slice(inner) => {
+            matches!(program.types.get(ty.index()), Some(RirType::Slice(elem)) if rir_native_param_valid(program, *elem, inner))
+        }
+        RirNativeParam::Array(inner) => {
+            matches!(program.types.get(ty.index()), Some(RirType::Array { elem, .. }) if rir_native_param_valid(program, *elem, inner))
+        }
+        RirNativeParam::Result(ok, err) => rir_native_result_valid(program, ty, ok, err),
     }
 }
 
-fn rir_rust_param_variant_matches(
+fn rir_native_value_valid(program: &RirProgram, ty: RirTypeId) -> bool {
+    rir_native_value_shape_valid(program, ty, false, &mut HashSet::new())
+}
+
+fn rir_native_value_shape_valid(
+    program: &RirProgram,
+    ty: RirTypeId,
+    nested: bool,
+    visiting: &mut HashSet<RirTypeId>,
+) -> bool {
+    if !visiting.insert(ty) {
+        return false;
+    }
+    let valid = match program.types.get(ty.index()) {
+        Some(RirType::Int | RirType::Float | RirType::Bool | RirType::String | RirType::Char) => {
+            true
+        }
+        Some(RirType::Enum(id))
+            if program
+                .enums
+                .get(id.index())
+                .is_some_and(|enm| enm.core == Some(RirCoreEnumKind::Result)) =>
+        {
+            nested && rir_native_value_result_valid(program, ty, visiting)
+        }
+        Some(RirType::Struct(_) | RirType::Enum(_)) => rir_native_inline_named(program, ty),
+        Some(RirType::Tuple(tuple)) => program.tuples.get(tuple.index()).is_some_and(|tuple| {
+            tuple
+                .fields
+                .iter()
+                .all(|field| rir_native_value_shape_valid(program, field.ty, true, visiting))
+        }),
+        Some(RirType::Array { elem, .. } | RirType::List(elem)) => {
+            rir_native_value_shape_valid(program, *elem, true, visiting)
+        }
+        Some(RirType::Map { key, value }) => {
+            rir_native_value_shape_valid(program, *key, true, visiting)
+                && rir_native_value_shape_valid(program, *value, true, visiting)
+        }
+        Some(RirType::Option(inner)) => {
+            nested && rir_native_value_shape_valid(program, *inner, true, visiting)
+        }
+        Some(
+            RirType::Void
+            | RirType::DataRef(_)
+            | RirType::Flag(_)
+            | RirType::Slice(_)
+            | RirType::Lambda(_),
+        )
+        | None => false,
+    };
+    visiting.remove(&ty);
+    valid
+}
+
+fn rir_native_value_result_valid(
+    program: &RirProgram,
+    ty: RirTypeId,
+    visiting: &mut HashSet<RirTypeId>,
+) -> bool {
+    rir_result_variants_valid(program, ty, |variant, name| {
+        rir_native_value_result_variant_valid(program, variant, name, visiting)
+    })
+}
+
+fn rir_result_variants_valid(
+    program: &RirProgram,
+    ty: RirTypeId,
+    mut valid: impl FnMut(&RirVariant, &str) -> bool,
+) -> bool {
+    let Some(RirType::Enum(id)) = program.types.get(ty.index()) else {
+        return false;
+    };
+    let Some(enm) = program.enums.get(id.index()) else {
+        return false;
+    };
+    let [ok, err] = enm.variants.as_slice() else {
+        return false;
+    };
+    enm.core == Some(RirCoreEnumKind::Result) && valid(ok, "Ok") && valid(err, "Err")
+}
+
+fn rir_native_value_result_variant_valid(
     program: &RirProgram,
     variant: &RirVariant,
     name: &str,
-    abi: &RustParamAbi,
+    visiting: &mut HashSet<RirTypeId>,
 ) -> bool {
     variant.symbol.as_str() == name
         && variant.kind == RirVariantKind::Tuple
         && matches!(variant.fields.as_slice(), [field]
-            if rir_type_matches_rust_param(program, field.ty, abi))
+            if rir_native_value_shape_valid(program, field.ty, true, visiting))
+}
+
+fn rir_native_inline_named(program: &RirProgram, ty: RirTypeId) -> bool {
+    match program.types.get(ty.index()) {
+        Some(RirType::Struct(id)) => program.structs.get(id.index()).is_some_and(|strukt| {
+            strukt.role == RirStructRole::Extern && strukt.native.is_some() && !strukt.native_ref
+        }),
+        Some(RirType::Enum(id)) => program
+            .enums
+            .get(id.index())
+            .is_some_and(|enm| enm.role == RirEnumRole::Extern && enm.native.is_some()),
+        _ => false,
+    }
+}
+
+fn rir_native_named(program: &RirProgram, ty: RirTypeId) -> bool {
+    match program.types.get(ty.index()) {
+        Some(RirType::Struct(id)) => program
+            .structs
+            .get(id.index())
+            .is_some_and(|strukt| strukt.role == RirStructRole::Extern && strukt.native.is_some()),
+        Some(RirType::Enum(id)) => program
+            .enums
+            .get(id.index())
+            .is_some_and(|enm| enm.role == RirEnumRole::Extern && enm.native.is_some()),
+        _ => false,
+    }
+}
+
+fn rir_native_borrow_valid(program: &RirProgram, ty: RirTypeId) -> bool {
+    !matches!(
+        program.types.get(ty.index()),
+        Some(RirType::Void | RirType::Lambda(_)) | None
+    )
+}
+
+fn rir_native_result_valid(
+    program: &RirProgram,
+    ty: RirTypeId,
+    ok: &RirNativeParam,
+    err: &RirNativeParam,
+) -> bool {
+    rir_result_variants_valid(program, ty, |variant, name| {
+        rir_native_param_variant_valid(program, variant, name, if name == "Ok" { ok } else { err })
+    })
+}
+
+fn rir_native_param_variant_valid(
+    program: &RirProgram,
+    variant: &RirVariant,
+    name: &str,
+    plan: &RirNativeParam,
+) -> bool {
+    variant.symbol.as_str() == name
+        && variant.kind == RirVariantKind::Tuple
+        && matches!(variant.fields.as_slice(), [field] if rir_native_param_valid(program, field.ty, plan))
 }
 
 fn rir_native_return_valid(program: &RirProgram, ty: RirTypeId, plan: &RirNativeReturn) -> bool {
     match plan {
-        RirNativeReturn::Void => {
-            matches!(program.types.get(ty.index()), Some(RirType::Void))
-        }
-        RirNativeReturn::Value(expected) => rir_type_matches_extern(program, ty, expected),
-        RirNativeReturn::OwnedNamed {
-            ty: expected,
-            adopt,
-        } => {
-            *adopt == native_ty_is_resource_ref(program, ty)
-                && rir_type_matches_extern(program, ty, expected)
+        RirNativeReturn::Void => matches!(program.types.get(ty.index()), Some(RirType::Void)),
+        RirNativeReturn::Value => rir_native_value_valid(program, ty),
+        RirNativeReturn::SharedNamed => native_ty_is_resource_ref(program, ty),
+        RirNativeReturn::OwnedNamed { adopt } => {
+            rir_native_named(program, ty) && *adopt == native_ty_is_resource_ref(program, ty)
         }
         RirNativeReturn::Option {
             payload_ty,
@@ -3527,13 +3728,19 @@ fn rir_native_return_valid(program: &RirProgram, ty: RirTypeId, plan: &RirNative
             let Some(RirType::Enum(id)) = program.types.get(ty.index()) else {
                 return false;
             };
-            let enm = &program.enums[id.index()];
+            let Some(enm) = program.enums.get(id.index()) else {
+                return false;
+            };
             let [ok_variant, err_variant] = enm.variants.as_slice() else {
                 return false;
             };
             enm.core == Some(RirCoreEnumKind::Result)
                 && rir_native_return_variant_valid(program, ok_variant, "Ok", *ok_ty, ok)
                 && rir_native_return_variant_valid(program, err_variant, "Err", *err_ty, err)
+        }
+        RirNativeReturn::Array { elem_ty, elem } => {
+            matches!(program.types.get(ty.index()), Some(RirType::Array { elem: expected, .. }) if expected == elem_ty)
+                && rir_native_return_valid(program, *elem_ty, elem)
         }
     }
 }
@@ -3551,11 +3758,45 @@ fn rir_native_return_variant_valid(
         && rir_native_return_valid(program, ty, plan)
 }
 
+fn native_context_ok(ext: &RirExtern) -> bool {
+    let (callbacks, scoped_callbacks, hidden_runtime) = ext
+        .params
+        .iter()
+        .map(|param| native_param_facts(&param.plan))
+        .fold((false, false, false), |facts, param| {
+            (facts.0 || param.0, facts.1 || param.1, facts.2 || param.2)
+        });
+    (!scoped_callbacks || ext.ctx == RustCallContext::None)
+        && (callbacks || ext.ctx != RustCallContext::None || !hidden_runtime)
+}
+
+fn native_param_facts(plan: &RirNativeParam) -> (bool, bool, bool) {
+    match plan {
+        RirNativeParam::ScopedLambda | RirNativeParam::EscapingLambda => (true, true, false),
+        RirNativeParam::AnvCallback => (true, false, false),
+        RirNativeParam::MutPlace => (false, false, true),
+        RirNativeParam::InitField(inner)
+        | RirNativeParam::Option(inner)
+        | RirNativeParam::Array(inner)
+        | RirNativeParam::Slice(inner) => native_param_facts(inner),
+        RirNativeParam::Result(ok, err) => {
+            let ok = native_param_facts(ok);
+            let err = native_param_facts(err);
+            (ok.0 || err.0, ok.1 || err.1, ok.2 || err.2)
+        }
+        RirNativeParam::Value
+        | RirNativeParam::SharedNamed
+        | RirNativeParam::OwnedNamed
+        | RirNativeParam::Borrow
+        | RirNativeParam::MutBorrow => (false, false, false),
+    }
+}
+
 fn native_callback_receiver_ok(program: &RirProgram, ext: &RirExtern) -> bool {
     if !ext
         .params
         .iter()
-        .any(|param| param.abi.is_callback_wrapper())
+        .any(|param| native_param_facts(&param.plan).0)
     {
         return true;
     }
@@ -3564,171 +3805,29 @@ fn native_callback_receiver_ok(program: &RirProgram, ext: &RirExtern) -> bool {
     };
     ext.params.get(receiver).is_some_and(|param| {
         matches!(
-            param.abi,
-            RustParamAbi::Borrow(_) | RustParamAbi::MutBorrow(_)
+            param.plan,
+            RirNativeParam::Borrow | RirNativeParam::MutBorrow
         ) && native_ty_is_resource_ref(program, param.ty)
     })
 }
 
 fn native_hidden_ctx_borrows_ok(program: &RirProgram, ext: &RirExtern) -> bool {
-    ext.ctx != RustWrapperCtx::HiddenRuntime
+    ext.ctx != RustCallContext::HiddenRuntime
         || ext.params.iter().all(|param| {
             !matches!(
-                param.abi,
-                RustParamAbi::Borrow(_) | RustParamAbi::MutBorrow(_)
+                param.plan,
+                RirNativeParam::Borrow | RirNativeParam::MutBorrow
             ) || !native_ty_is_resource_ref(program, param.ty)
         })
 }
 
 pub(super) fn native_ty_is_resource_ref(program: &RirProgram, ty: RirTypeId) -> bool {
-    matches!(
-        program.types[ty.index()],
-        RirType::Struct(id) if program.structs[id.index()].native_ref
-    )
-}
-
-fn rir_type_matches_callback(
-    program: &RirProgram,
-    ty: RirTypeId,
-    callback: &ExternCallbackSignature,
-) -> bool {
-    if callback.policy.thread != CallbackThread::SameThread
-        || !callback.callback_wrapper_signature_supported()
-    {
-        return false;
-    }
-    let Some(RirType::Lambda(sig)) = program.types.get(ty.index()) else {
+    let Some(RirType::Struct(id)) = program.types.get(ty.index()) else {
         return false;
     };
-    let sig = &program.lambda_sigs[sig.index()];
-    sig.params.len() == callback.params.len()
-        && sig
-            .params
-            .iter()
-            .zip(&callback.params)
-            .all(|(param, callback)| {
-                param.escape == RirParamEscape::NonEscaping
-                    && callback.escape == CallbackEscape::NonEscaping
-                    && rir_type_matches_extern(program, param.ty, &callback.ty)
-            })
-        && rir_type_matches_extern(program, sig.ret, &callback.ret)
-}
-
-fn native_key_matches(
-    key: Option<&ExternTypeKey>,
-    module: Option<&anvyx_runtime::ModulePath>,
-    name: &str,
-) -> bool {
-    key.is_some_and(|key| module.is_none_or(|module| key.module == *module) && key.name == name)
-}
-
-fn rir_type_matches_result(
-    program: &RirProgram,
-    id: RirEnumId,
-    ok: &ExternTypeExpr,
-    err: &ExternTypeExpr,
-) -> bool {
-    let enm = &program.enums[id.index()];
-    if enm.core != Some(RirCoreEnumKind::Result) {
-        return false;
-    }
-    let [ok_variant, err_variant] = enm.variants.as_slice() else {
-        return false;
-    };
-    rir_result_variant_matches(program, ok_variant, "Ok", ok)
-        && rir_result_variant_matches(program, err_variant, "Err", err)
-}
-
-fn rir_result_variant_matches(
-    program: &RirProgram,
-    variant: &RirVariant,
-    name: &str,
-    expected: &ExternTypeExpr,
-) -> bool {
-    let [field] = variant.fields.as_slice() else {
-        return false;
-    };
-    variant.display.as_str() == name
-        && variant.kind == RirVariantKind::Tuple
-        && rir_type_matches_extern(program, field.ty, expected)
-}
-
-fn rir_type_matches_extern(program: &RirProgram, id: RirTypeId, expected: &ExternTypeExpr) -> bool {
-    let Some(found) = program.types.get(id.index()) else {
-        return false;
-    };
-    match (found, expected) {
-        (RirType::Void, ExternTypeExpr::Void)
-        | (RirType::Bool, ExternTypeExpr::Bool)
-        | (RirType::Int, ExternTypeExpr::Int)
-        | (RirType::Float, ExternTypeExpr::Float)
-        | (RirType::String, ExternTypeExpr::String)
-        | (RirType::Char, ExternTypeExpr::Char) => true,
-        (RirType::Tuple(tuple), ExternTypeExpr::Unit) => {
-            program.tuples[tuple.index()].fields.is_empty()
-        }
-        (RirType::Struct(struct_id), ExternTypeExpr::Named { module, name, args }) => {
-            args.is_empty()
-                && native_key_matches(
-                    program.structs[struct_id.index()]
-                        .native
-                        .as_ref()
-                        .map(|native| &native.key),
-                    module.as_ref(),
-                    name,
-                )
-        }
-        (RirType::DataRef(dataref_id), ExternTypeExpr::Named { module, name, args }) => {
-            args.is_empty()
-                && native_key_matches(
-                    program.datarefs[dataref_id.index()].native_key.as_ref(),
-                    module.as_ref(),
-                    name,
-                )
-        }
-        (RirType::Enum(enum_id), ExternTypeExpr::Named { module, name, args }) => {
-            args.is_empty()
-                && native_key_matches(
-                    program.enums[enum_id.index()]
-                        .native
-                        .as_ref()
-                        .map(|native| &native.key),
-                    module.as_ref(),
-                    name,
-                )
-        }
-        (RirType::Enum(enum_id), ExternTypeExpr::Result(ok, err)) => {
-            rir_type_matches_result(program, *enum_id, ok, err)
-        }
-        (RirType::List(elem), ExternTypeExpr::List(expected))
-        | (RirType::Option(elem), ExternTypeExpr::Option(expected))
-        | (RirType::Slice(elem), ExternTypeExpr::Slice(expected)) => {
-            rir_type_matches_extern(program, *elem, expected)
-        }
-        (
-            RirType::Array { elem, len },
-            ExternTypeExpr::Array {
-                elem: expected,
-                len: expected_len,
-            },
-        ) => len == expected_len && rir_type_matches_extern(program, *elem, expected),
-        (RirType::Map { key, value }, ExternTypeExpr::Map(expected_key, expected_value)) => {
-            rir_type_matches_extern(program, *key, expected_key)
-                && rir_type_matches_extern(program, *value, expected_value)
-        }
-        (RirType::Lambda(_), ExternTypeExpr::Callback(callback)) => {
-            rir_type_matches_callback(program, id, callback)
-        }
-        (RirType::Tuple(tuple), ExternTypeExpr::Tuple(expected)) => {
-            let fields = &program.tuples[tuple.index()].fields;
-            fields.len() == expected.len()
-                && fields
-                    .iter()
-                    .zip(expected)
-                    .all(|(field, expected)| rir_type_matches_extern(program, field.ty, expected))
-        }
-        _ => false,
-    }
+    program.structs.get(id.index()).is_some_and(|strukt| {
+        strukt.role == RirStructRole::Extern && strukt.native.is_some() && strukt.native_ref
+    })
 }
 
 impl VerifyCx<'_> {
@@ -3992,12 +4091,12 @@ impl VerifyCx<'_> {
         for (index, materializer) in self.program.value_materializers.iter().enumerate() {
             let ty = RirTypeId::from_index(index);
             let required = match self.program.types.get(index) {
-                Some(RirType::Void | RirType::Slice(_)) | None => false,
                 Some(RirType::Lambda(sig)) => {
                     let policy = RirRustRepPolicy::new(self.program);
                     policy.lambda_sig_copyable(*sig) || policy.lambda_sig_cloneable(*sig)
                 }
-                Some(_) => true,
+                Some(_) => type_has_value_materializer(self.program, ty, &mut HashSet::new()),
+                None => false,
             };
             if materializer.is_some() != required
                 || materializer.is_some_and(|materializer| {
@@ -4203,7 +4302,7 @@ impl VerifyCx<'_> {
                     !strukt.native_ref
                         && strukt.native.as_ref().is_some_and(|native| {
                             native
-                                .validated_materializer(anvyx_runtime::ExternMaterialization::Copy)
+                                .validated_materializer(ExternMaterialization::Copy)
                                 .is_some()
                         })
                 })
@@ -4215,7 +4314,7 @@ impl VerifyCx<'_> {
                 .and_then(|enm| enm.native.as_ref())
                 .is_some_and(|native| {
                     native
-                        .validated_materializer(anvyx_runtime::ExternMaterialization::Copy)
+                        .validated_materializer(ExternMaterialization::Copy)
                         .is_some()
                 }),
             (Some(RirCopyEvidence::Struct { family, fields }), Some(RirType::Struct(id))) => {
@@ -4324,38 +4423,24 @@ impl VerifyCx<'_> {
                     if RirRustRepPolicy::new(self.program).lambda_sig_cloneable(*sig)
             ),
             RirMaterializerAction::ProviderMaterialize { binding } => {
-                if binding.mode != anvyx_runtime::ExternMaterialization::Materialize {
-                    return false;
-                }
-                let native_matches = match ty {
-                    Some(RirType::Struct(id)) => {
-                        self.program.structs.get(id.index()).is_some_and(|strukt| {
-                            !strukt.native_ref
-                                && strukt
-                                    .native
-                                    .as_ref()
-                                    .is_some_and(|native| native.path == binding.rust_type)
-                        })
-                    }
-                    Some(RirType::Enum(id)) => {
-                        self.program.enums.get(id.index()).is_some_and(|enm| {
-                            enm.native
-                                .as_ref()
-                                .is_some_and(|native| native.path == binding.rust_type)
-                        })
-                    }
-                    _ => false,
+                let native = match ty {
+                    Some(RirType::Struct(id)) => self
+                        .program
+                        .structs
+                        .get(id.index())
+                        .filter(|strukt| !strukt.native_ref)
+                        .and_then(|strukt| strukt.native.as_ref()),
+                    Some(RirType::Enum(id)) => self
+                        .program
+                        .enums
+                        .get(id.index())
+                        .and_then(|enm| enm.native.as_ref()),
+                    _ => None,
                 };
-                let Some(native_type) = binding.rust_type.segments.last() else {
-                    return false;
-                };
-                let mut expected =
-                    binding.rust_type.segments[..binding.rust_type.segments.len() - 1].to_vec();
-                expected.push(anvyx_runtime::native_materializer_module(native_type));
-                expected.push(anvyx_runtime::INLINE_MATERIALIZER_SYMBOL.to_string());
-                native_matches
-                    && binding.path.crate_name == binding.rust_type.crate_name
-                    && binding.path.segments == expected
+                native.is_some_and(|native| {
+                    native.validated_materializer(ExternMaterialization::Materialize)
+                        == Some(binding)
+                })
             }
             RirMaterializerAction::Struct { fields } => {
                 let Some(RirType::Struct(id)) = ty else {
@@ -4549,7 +4634,10 @@ impl VerifyCx<'_> {
         family: LambdaStorageFamily,
     ) {
         self.check_type_id(site, ty);
-        if self.ty(ty).is_none() {
+        if self.ty(ty).is_none()
+            || (family == LambdaStorageFamily::EnumPayload
+                && matches!(self.ty(ty), Some(RirType::Slice(_))))
+        {
             return;
         }
         let position = RustRecipePosition::StoredPayload(family);
@@ -9077,6 +9165,19 @@ impl VerifyCx<'_> {
         position: RustRecipePosition,
     ) -> Option<RirTypeId> {
         match owned.source {
+            RirOwnedSource::Direct => match &owned.value {
+                RirOwnedOperand::Value(RirOperand::Const(id)) => self
+                    .program
+                    .consts
+                    .get(id.index())
+                    .map(|constant| constant.ty),
+                RirOwnedOperand::Value(_)
+                | RirOwnedOperand::Access(_)
+                | RirOwnedOperand::DynBorrow(_) => {
+                    self.push(site, RirVerifyErrorKind::UnsupportedRValueType);
+                    None
+                }
+            },
             RirOwnedSource::Reuse(materializer) => {
                 let found = match &owned.value {
                     RirOwnedOperand::Value(value) => self.value_operand_ty(site, function, value),
@@ -9179,7 +9280,7 @@ impl VerifyCx<'_> {
                 );
                 let payload_matches = match value.source {
                     RirOwnedSource::Reuse(materializer) => materializer == decl.payload,
-                    RirOwnedSource::Transfer { .. } => true,
+                    RirOwnedSource::Direct | RirOwnedSource::Transfer { .. } => true,
                 };
                 if carrier.storage_ty != *ty || !payload_matches || found != Some(decl.concrete_ty)
                 {
@@ -10329,7 +10430,7 @@ impl VerifyCx<'_> {
                         let init_fields = ext
                             .params
                             .iter()
-                            .map(|param| matches!(param.abi, RustParamAbi::InitField(_)))
+                            .map(|param| matches!(param.plan, RirNativeParam::InitField(_)))
                             .collect();
                         (
                             ext.params

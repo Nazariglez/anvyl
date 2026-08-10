@@ -1,0 +1,5 @@
+error: #[anvyx(init)] must return Self
+ --> tests/ui/methods/init_missing_return.rs:8:9
+  |
+8 |     pub fn new() {}
+  |         ^^^^^^^^

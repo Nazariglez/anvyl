@@ -1,0 +1,6 @@
+[project]
+name = "empty_provider_package"
+entry = "src/main.anv"
+
+[dependencies]
+host = { path = "provider" }
